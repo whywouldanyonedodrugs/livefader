@@ -1,0 +1,58 @@
+# config.yaml
+# Anything omitted here falls back to config.py.
+# Values below reproduce the sample you posted and add a few overrides for testing.
+
+# ── risk sizing ------------------------------------------------------------
+RISK_MODE:        FIXED
+FIXED_RISK_USDT:  10
+RISK_PCT:         0.005
+
+# ── stops / targets --------------------------------------------------------
+SL_ATR_MULT:      3.0
+FINAL_TP_ENABLED: true
+FINAL_TP_ATR_MULT: 1.0
+PARTIAL_TP_ENABLED: false
+PARTIAL_TP_PCT:   0.7
+PARTIAL_TP_ATR_MULT: 1.0
+TRAIL_ENABLED:    false
+TRAIL_START_ATR_MULT: 1
+TRAIL_DISTANCE_ATR_MULT: 1.0
+
+# ── filters ---------------------------------------------------------------
+RSI_RANGE: [30, 80]
+ATR_RANGE: [0, 1.0]
+
+# ── portfolio guards ------------------------------------------------------
+MAX_LOSS_STREAK:       5
+KILL_EQUITY_LEVEL:     90
+MAX_OPEN:              5          # tighter while testing
+MIN_STOP_DIST_USD:     0.1
+MIN_STOP_DIST_PCT:     0.0005
+MIN_NOTIONAL:          0.01
+MAX_LEVERAGE:          10
+
+# ── BTC / ALT trend veto ---------------------------------------------------
+BTC_FAST_FILTER_ENABLED: false
+BTC_FAST_EMA_PERIOD:    20
+BTC_SLOW_FILTER_ENABLED: false
+BTC_SLOW_EMA_PERIOD:    120
+
+ALT_SYMBOL: "ETHUSDT"
+ALT_FAST_FILTER_ENABLED: false
+ALT_FAST_EMA_PERIOD: 20
+ALT_SLOW_FILTER_ENABLED: false
+
+# ── Boom‑Volume rule -------------------------------------------------------
+BV_RULE_ENABLED: false
+BV_MIN_VOL_SPIKE: [1.5, 1.7, 1.8, 2.0, 2.5]
+BV_MAX_VOL_SPIKE: [5.0, 4.0, 3.0, 2.5, 2.0]
+
+# ── Open‑interest confirmation -------------------------------------------
+OI_FILTER_ENABLED: false
+OI_LOOKBACK_PERIOD_BARS: 12
+OI_MIN_CHANGE_PCT: -4.0
+OI_MAX_CHANGE_PCT: 8.0
+
+# ── runtime ---------------------------------------------------------------
+SCAN_INTERVAL_SEC: 45
+ENTRY_ORDER_TYPE:  "MARKET"
