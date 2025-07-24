@@ -280,7 +280,7 @@ class LiveTrader:
     def _reload_symbols(self):
         self.symbols = self._load_symbols()
         LOG.info("Symbols reloaded – %d symbols", len(self.symbols))
-
+       
     async def _ensure_leverage(self, symbol: str):
         try:
             await self.exchange.set_margin_mode("CROSSED", symbol)
@@ -288,6 +288,32 @@ class LiveTrader:
         except Exception as e:  # noqa: BLE001
             LOG.warning("leverage setup failed %s", e)
 
+    @staticmethod
+    def _load_listing_dates() -> Dict[str, datetime.date]:
+        """
+        Returns {symbol: first‑trade‑date}. Tries listing_dates.json first;
+        otherwise queries exchange once and caches.
+        """
+        if LISTING_PATH.exists():
+            import json, datetime as _dt
+            raw = json.loads(LISTING_PATH.read_text())
+            return {s: _dt.date.fromisoformat(ts) for s, ts in raw.items()}
+
+        ex = ccxt.bybit()
+        out = {}
+        for sym in SYMBOLS_PATH.read_text().split():
+            try:
+                candles = ex.fetch_ohlcv(sym, timeframe="1d", limit=1, since=0)
+                if candles:
+                    out[sym] = datetime.utcfromtimestamp(candles[0][0] / 1000).date()
+            except Exception:
+                continue
+        LISTING_PATH.write_text(
+            json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2)
+        )
+        return out
+
+   
     # ---------------- POSITION SIZING ---------------
     async def _risk_amount(self, free_usdt: float) -> float:
         mode = self.cfg.get("RISK_MODE", "PERCENT").upper()
