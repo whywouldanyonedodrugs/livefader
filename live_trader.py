@@ -249,6 +249,8 @@ class LiveTrader:
         self.exchange = self._init_ccxt()
 
         self.symbols = self._load_symbols()
+        for sym, d in self._load_listing_dates().items():
+            self.filter_rt.set_listing_date(sym, d)       
         self.open_positions: Dict[int, Dict[str, Any]] = {}  # pid -> row dict
 
         # hot‑reload on file edit
@@ -293,6 +295,26 @@ class LiveTrader:
             return free_usdt * self.cfg["RISK_PCT"]
         return float(self.cfg["FIXED_RISK_USDT"])
 
+    _atr_cache: Dict[str, Tuple[float, float]] = {}  # symbol → (atr, monotonic_ts)
+
+    async def _fresh_atr(self, symbol: str) -> Optional[float]:
+        """Return ATR(14, 1h). Re‑uses a 2‑minute cache to spare API calls."""
+        now = asyncio.get_running_loop().time()
+        if symbol in self._atr_cache and now - self._atr_cache[symbol][1] < 120:
+            return self._atr_cache[symbol][0]
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, "1h", limit=15)
+            if len(ohlcv) < 2:
+                return None
+            import pandas as _pd, indicators as ta
+            df = _pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+            atr_v = float(ta.atr(df)["atr"].iloc[-1])
+            self._atr_cache[symbol] = (atr_v, now)
+            return atr_v
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("ATR fetch failed for %s: %s", symbol, e)
+            return None
+   
     # ---------------- ORDER TAGS ------------------
     @staticmethod
     def _cid(pid: int, tag: str) -> str:
@@ -308,9 +330,19 @@ class LiveTrader:
         risk_amt = await self._risk_amount(free_usdt)
 
         entry = sig.entry
-        atr = sig.atr
+        atr = await self._fresh_atr(sig.symbol) or sig.atr
+
         stop = entry + self.cfg["SL_ATR_MULT"] * atr
-        size = risk_amt / abs(entry - stop)
+        stop_dist = abs(entry - stop)
+
+        if (
+            stop_dist < self.cfg["MIN_STOP_DIST_USD"]
+            or (stop_dist / entry) < self.cfg["MIN_STOP_DIST_PCT"]
+        ):
+            LOG.info("EXEC_ATR veto on %s (stop %.4f too tight)", sig.symbol, stop_dist)
+            return
+
+        size = risk_amt / stop_dist
 
         now = datetime.now(timezone.utc)
         pid = await self.db.insert_position({
