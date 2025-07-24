@@ -39,6 +39,8 @@ from watchdog.observers import Observer
 import scout  # async def scan_symbol(sym:str, cfg:dict) -> Optional[Signal]
 # -------------------------------------------------------------------------
 
+LISTING_PATH = Path("listing_dates.json")
+
 ###############################################################################
 # 0 ▸ LOGGING #################################################################
 ###############################################################################
@@ -101,6 +103,7 @@ CREATE TABLE IF NOT EXISTS positions (
     atr NUMERIC,
     status TEXT,
     opened_at TIMESTAMPTZ,
+    exit_deadline TIMESTAMPTZ,
     closed_at TIMESTAMPTZ,
     pnl NUMERIC
 );
@@ -117,6 +120,7 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     equity NUMERIC
 );
 """
+
 
 class DB:
     def __init__(self, dsn: str):
@@ -253,6 +257,9 @@ class LiveTrader:
             self.filter_rt.set_listing_date(sym, d)       
         self.open_positions: Dict[int, Dict[str, Any]] = {}  # pid -> row dict
 
+        # keeps last‑exit timestamps {symbol: utc_datetime}
+        self.last_exit: Dict[str, datetime] = {}
+       
         # hot‑reload on file edit
         _Watcher(CONFIG_PATH, self._reload_cfg)
         _Watcher(SYMBOLS_PATH, self._reload_symbols)
@@ -323,9 +330,14 @@ class LiveTrader:
 
     _atr_cache: Dict[str, Tuple[float, float]] = {}  # symbol → (atr, monotonic_ts)
 
+   
+    # ────────────────────────────────────────────────────────────────────────
+    #   Quick ATR(14, 1h) helper with 2‑minute cache
+    # ────────────────────────────────────────────────────────────────────────
+    _atr_cache: Dict[str, Tuple[float, float]] = {}      # sym → (atr, monotonic_ts)
+
     async def _fresh_atr(self, symbol: str) -> Optional[float]:
-        """Return ATR(14, 1h). Re‑uses a 2‑minute cache to spare API calls."""
-        now = asyncio.get_running_loop().time()
+        now = asyncio.get_event_loop().time()
         if symbol in self._atr_cache and now - self._atr_cache[symbol][1] < 120:
             return self._atr_cache[symbol][0]
         try:
@@ -333,13 +345,16 @@ class LiveTrader:
             if len(ohlcv) < 2:
                 return None
             import pandas as _pd, indicators as ta
-            df = _pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-            atr_v = float(ta.atr(df)["atr"].iloc[-1])
-            self._atr_cache[symbol] = (atr_v, now)
-            return atr_v
+            df = _pd.DataFrame(
+                ohlcv, columns=["ts", "open", "high", "low", "close", "vol"]
+            )
+            atr_val = float(ta.atr(df)["atr"].iloc[-1])
+            self._atr_cache[symbol] = (atr_val, now)
+            return atr_val
         except Exception as e:  # noqa: BLE001
             LOG.warning("ATR fetch failed for %s: %s", symbol, e)
             return None
+
    
     # ---------------- ORDER TAGS ------------------
     @staticmethod
@@ -348,28 +363,43 @@ class LiveTrader:
 
     # ---------------- PLACE NEW POSITION ----------
     async def _open_position(self, sig: Signal):
+        # skip if already in trade or cooling‑down
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
-            return  # already have one
+            return
+        cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
+        last_x = self.last_exit.get(sig.symbol)
+        if last_x and datetime.utcnow() - last_x < timedelta(hours=cd_h):
+            LOG.debug("Cool‑down veto on %s (%.1f h left)", sig.symbol,
+                      (timedelta(hours=cd_h) - (datetime.utcnow() - last_x)).total_seconds() / 3600)
+            return
 
         bal = await self.exchange.fetch_balance()
         free_usdt = bal["USDT"]["free"]
         risk_amt = await self._risk_amount(free_usdt)
 
         entry = sig.entry
-        atr = await self._fresh_atr(sig.symbol) or sig.atr
+        atr   = await self._fresh_atr(sig.symbol) or sig.atr
 
         stop = entry + self.cfg["SL_ATR_MULT"] * atr
         stop_dist = abs(entry - stop)
 
+        # EXEC‑ATR veto (same limits as back‑tester)
         if (
             stop_dist < self.cfg["MIN_STOP_DIST_USD"]
             or (stop_dist / entry) < self.cfg["MIN_STOP_DIST_PCT"]
         ):
-            LOG.info("EXEC_ATR veto on %s (stop %.4f too tight)", sig.symbol, stop_dist)
+            LOG.info("EXEC_ATR veto %s – stop %.4f < min dist", sig.symbol, stop_dist)
             return
 
         size = risk_amt / stop_dist
 
+        # time‑based exit deadline
+        exit_deadline = (
+            datetime.utcnow() + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", cfg.TIME_EXIT_DAYS))
+            if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED)
+            else None
+        )
+       
         now = datetime.now(timezone.utc)
         pid = await self.db.insert_position({
             "symbol": sig.symbol,
@@ -381,6 +411,7 @@ class LiveTrader:
             "atr": atr,
             "status": "PENDING",
             "opened_at": now,
+            "exit_deadline": exit_deadline,
         })
 
         try:
@@ -403,7 +434,7 @@ class LiveTrader:
                     params={"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1")}
                 )
             await self.db.update_position(pid, status="OPEN")
-            row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)  # type: ignore[index]
+            row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
             await self.tg.send(f"🚀 Opened {sig.symbol} short {size:.3f} @ {entry:.4f}")
         except Exception as e:  # noqa: BLE001
@@ -429,6 +460,14 @@ class LiveTrader:
         orders = await self.exchange.fetch_open_orders(symbol)
         open_cids = {o.get("clientOrderId") for o in orders}
 
+        # ── TIME‑BASED HARD EXIT ──────────────────────────────────────────
+        if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
+            ddl = pos.get("exit_deadline")
+            if ddl and datetime.utcnow() >= ddl:
+                LOG.info("Time‑exit firing on %s (pid %d)", symbol, pid)
+                await self._force_close_position(pid, pos, tag="TIME_EXIT")
+                return
+       
         # Detect partial TP fill ------------------------------------------------
         if (not pos["trailing_active"]) and self._cid(pid, "TP1") not in open_cids:
             # TP1 gone ⇒ filled
@@ -548,6 +587,28 @@ class LiveTrader:
         del self.open_positions[pid]
         await self.tg.send(f"✅ {symbol} position closed. PnL ≈ {pnl:.2f} USDT")
 
+    async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
+        """Market‑closes the remaining leg, cancels all orders, finalises DB."""
+        symbol = pos["symbol"]
+        try:
+            await self.exchange.cancel_all_orders(symbol)
+            await self.exchange.create_market_order(symbol, "buy", pos["size"])
+        except Exception as e:
+            LOG.warning("Force‑close order issue on %s: %s", symbol, e)
+
+        last_price = (await self.exchange.fetch_ticker(symbol))["last"]
+        pnl = (pos["entry_price"] - last_price) * pos["size"]
+        await self.db.update_position(
+            pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl
+        )
+        await self.db.add_fill(pid, tag, last_price, pos["size"])
+        await self.risk.on_trade_close(pnl, self.tg)
+        self.last_exit[symbol] = datetime.utcnow()
+        del self.open_positions[pid]
+        await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
+
+
+   
     # ---------------- SIGNAL LOOP -----------------
      async def _signal_loop(self):
          while True:
@@ -686,8 +747,17 @@ class LiveTrader:
         for r in rows:
             self.open_positions[r["id"]] = dict(r)
             LOG.info("Resumed open position %s", r["symbol"])
+        # load last‑exit timestamps within cool‑down window
+        cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
+        rows = await self.db.pool.fetch(
+            "SELECT symbol, closed_at FROM positions "
+            "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
+            f"{cd_h} hours",
+        )
+        for r in rows:
+            self.last_exit[r["symbol"]] = r["closed_at"].replace(tzinfo=None)
 
-    # ---------------- RUN -----------------------
+# ---------------- RUN -----------------------
     async def run(self):
         await self.db.init()
         await self._resume()
