@@ -19,6 +19,7 @@ PARTIAL_TP_ATR_MULT     = 1.0
 TRAIL_ENABLED           = False
 TRAIL_START_ATR_MULT    = 1.0
 TRAIL_DISTANCE_ATR_MULT = 1.0
+TIME_EXIT_ENABLED       = True     # set False to disable
 TIME_EXIT_DAYS          = 10         # close runner after N days
 
 # ── basic signal filters ──────────────────────────────────────────────────
@@ -79,3 +80,6 @@ OI_MAX_CHANGE_PCT        = 10.0
 # ── runtime / misc ────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 60
 ENTRY_ORDER_TYPE  = "MARKET"        # or "MARKET"
+
+# ─── Re‑entry cool‑down per symbol ──────────────────────────────────────────
+SYMBOL_COOLDOWN_HOURS = 4    # skip new signals for the same symbol during X h
