@@ -34,6 +34,24 @@ TRAIL_DISTANCE_ATR_MULT = 1.0
 TIME_EXIT_ENABLED       = True     # set False to disable
 TIME_EXIT_DAYS          = 10         # close runner after N days
 
+# --- Structural Trend Filter (Long-Term) ---
+STRUCTURAL_TREND_DAYS    = 30
+STRUCTURAL_TREND_RET_PCT = 0.01
+
+# --- Sideways "Gap" Filter (Pre-Entry Consolidation) ---
+GAP_VWAP_HOURS  = 2
+GAP_MAX_DEV_PCT = 0.01
+GAP_MIN_BARS    = 3
+
+# --- Volume Filter (Applied during Scouting) ---
+VOL_FILTER_ENABLED  = False
+MIN_VOL_USD         = 10000    # Min 4-hour USD volume
+MAX_VOL_USD         = 5000000000  # Max 4-hour USD volume
+
+# --- Volatility Filter (Applied during Scouting) ---
+VOLATILITY_FILTER_ENABLED = False
+MIN_ATR_PCT               = 0.005 # Min ATR as a percentage of price
+
 # ── basic signal filters ──────────────────────────────────────────────────
 RSI_RANGE       = (30, 80)
 ATR_RANGE       = (0.0, 1.0)
