@@ -545,13 +545,26 @@ class LiveTrader:
 # NEW helper coroutines                                                       #
 # --------------------------------------------------------------------------- #
     async def _ticker_feed_loop(self, symbol: str):
-        """Updates EMA caches every 30 s – placeholder until ccxt.pro."""
+        """Poll REST every ~30 s until websockets are in place.
+
+        Sends both price **and** per‑interval volume to filters.Runtime
+        so it can upkeep the rolling VWAP buffer.
+        """
         while True:
             try:
-                price = (await self.exchange.fetch_ticker(symbol))["last"]
-                self.filter_rt.update_ticker(symbol, price)
-            except Exception as e:
+                ticker = await self.exchange.fetch_ticker(symbol)
+                price = ticker["last"]
+
+                # Bybit REST doesn’t give true per‑second volume,
+                # but we can derive an approximate “bucket” from 24 h data.
+                # Good enough for a 5‑min VWAP.
+                vol_24h = ticker.get("quoteVolume") or ticker.get("baseVolume")
+                vol = vol_24h / 86400 if vol_24h else None  # ≈ per‑sec avg
+
+                self.filter_rt.update_ticker(symbol, price, vol)
+            except Exception as e:  # noqa: BLE001
                 LOG.warning("Ticker poll failed for %s: %s", symbol, e)
+
             await asyncio.sleep(30)
 
     async def _oi_poll_loop(self):
