@@ -42,6 +42,7 @@ PARTIAL_TP_ATR_MULT     = 1.0
 TRAIL_ENABLED           = False
 TRAIL_START_ATR_MULT    = 1.0
 TRAIL_DISTANCE_ATR_MULT = 1.0
+TRAIL_MIN_MOVE_PCT      = 0.001
 TIME_EXIT_ENABLED       = True     # set False to disable
 TIME_EXIT_DAYS          = 10         # close runner after N days
 
@@ -63,20 +64,6 @@ MAX_VOL_USD         = 5000000000  # Max 4-hour USD volume
 VOLATILITY_FILTER_ENABLED = False
 MIN_ATR_PCT               = 0.005 # Min ATR as a percentage of price
 
-# ── basic signal filters ──────────────────────────────────────────────────
-RSI_RANGE       = (30, 70)
-ATR_RANGE       = (0.0, 1.0)
-REGIME_MA_PERIOD        = 100        # Long-term moving average period for trend
-REGIME_ATR_PERIOD       = 20         # ATR period for Keltner Channel
-REGIME_ATR_MULT         = 1.5        # ATR multiplier for Keltner Channel
-REGIME_FILTER_ENABLED = False
-ALLOWED_REGIMES = [
-    "BULL_LOW_VOL",
-    "BULL_HIGH_VOL",
-    "BEAR_LOW_VOL",
-    "BEAR_HIGH_VOL",
-]
-
 # ── portfolio / kill‑switches ─────────────────────────────────────────────
 MAX_OPEN            = 30          # max concurrent positions
 MAX_LOSS_STREAK     = 5
@@ -87,8 +74,11 @@ MIN_STOP_DIST_USD   = 0.1
 MIN_STOP_DIST_PCT   = 0.0008      # 0.08 %
 
 # draw‑down pause
-DD_COOLDOWN_PCT     = 50.0        # % from equity peak
+DD_PAUSE_ENABLED    = True     # set False to disable drawdown protection  # <--- ADD THIS
+DD_MAX_PCT          = 50.0     # Pause trading if equity drops 10% from peak # <--- ADD THIS
+DD_COOLDOWN_PCT     = 50.0     # % from equity peak
 DD_COOLDOWN_DURATION_H = 12
+
 
 # ── BTC / ALT EMA trend veto ──────────────────────────────────────────────
 BTC_FAST_FILTER_ENABLED = False

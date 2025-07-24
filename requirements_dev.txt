@@ -1,0 +1,12 @@
+# requirements_dev.txt
+# Dependencies for DEVELOPMENT and BACKTESTING
+
+# First, include all live requirements
+-r requirements_live.txt
+
+# Now, add the heavy libraries for analysis
+pandas
+pyarrow
+tqdm
+statsmodels
+# ta-lib-binary or pandas_ta if you use them for backtesting

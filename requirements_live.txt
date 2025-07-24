@@ -1,0 +1,11 @@
+# requirements_live.txt
+# Dependencies for the LIVE trading bot
+
+aiohttp
+asyncpg
+ccxt
+ccxt-pro
+pyyaml
+watchdog
+pydantic
+tenacity
