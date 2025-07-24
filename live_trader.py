@@ -609,25 +609,25 @@ class LiveTrader:
 
 
    
-    # ---------------- SIGNAL LOOP -----------------
-     async def _signal_loop(self):
+      # ---------------- SIGNAL LOOP -----------------
+      async def _signal_loop(self):
          while True:
              try:
                  if self.paused or not self.risk.can_trade():
                      await asyncio.sleep(2)
                      continue
-
+      
                 # fresh account equity for notional / MIN_NOTIONAL checks
                 bal = await self.exchange.fetch_balance()
                 equity = bal["total"]["USDT"]
-
+      
                 for sym in list(self.symbols):
                      if any(row["symbol"] == sym for row in self.open_positions.values()):
                          continue  # skip; already in trade
                      sig_raw = await scout.scan_symbol(sym, self.cfg)
                     if not sig_raw:
                         continue
-
+      
                     ok, vetoes = filters.evaluate(
                         sig_raw,
                         self.filter_rt,
@@ -638,10 +638,10 @@ class LiveTrader:
                         LOG.info("scout %s -> %s", sym, " | ".join(vetoes))
                         # optional: store veto audit once you add `events` table
                         continue
-
+      
                         await self._open_position(sig_raw)
                 await asyncio.sleep(self.cfg["SCAN_INTERVAL_SEC"])
-
+      
          self.tasks = [
              asyncio.create_task(self._signal_loop()),
              asyncio.create_task(self._manage_positions_loop()),
