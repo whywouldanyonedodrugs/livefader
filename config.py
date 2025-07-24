@@ -5,7 +5,8 @@ Edit in Git – for one‑off tweaks use config.yaml or Telegram `/set KEY value
 """
 
 SYMBOLS_FILE = "symbols.txt"
-
+START_DATE = "2022-01-01"
+END_DATE = "2026-01-01"
 # ── risk sizing ────────────────────────────────────────────────────────────
 RISK_MODE          = "FIXED"     # or "FIXED"
 FIXED_RISK_USDT    = 10.0
