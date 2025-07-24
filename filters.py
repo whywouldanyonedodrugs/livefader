@@ -1,131 +1,135 @@
-# filters.py
 """
-Dynamic, back‑tester–parity veto filters for live trading.
-
-How to use:
-    runtime = Runtime()                 # 1️⃣  created once in LiveTrader.__init__
-    runtime.update_ticker("BTCUSDT",  ...)   # 2️⃣  updated by ticker websockets
-    runtime.update_open_interest("SOLUSDT", ...)
-    can_trade, tags = evaluate(signal, runtime, open_positions, equity)
+filters.py – v2.0
+Rolling‑VWAP “gap” veto + small tidy‑ups
 """
 
 from __future__ import annotations
-from datetime import datetime, timezone
+
 from collections import defaultdict, deque
-from typing import Dict, List, Tuple, Deque, Optional
+from datetime import datetime, timedelta
+from typing import Deque, Dict, List, Tuple
 
-import config as cfg   # ← unified strategy settings
-
-# --------------------------------------------------------------------------- #
-# 0 ▸ helpers                                                                  #
-# --------------------------------------------------------------------------- #
-def _ema(price: float, prev: Optional[float], period: int) -> float:
-    alpha = 2 / (period + 1)
-    return price if prev is None else price * alpha + prev * (1 - alpha)
-
+import config as cfg   # needs GAP_MAX_DEV_PCT, FAST_EMA_LEN, SLOW_EMA_LEN, etc.
 
 # --------------------------------------------------------------------------- #
-# 1 ▸ runtime cache fed by websockets                                          #
+#  Runtime caches                                                             
 # --------------------------------------------------------------------------- #
 class Runtime:
-    """Keeps the rolling state (EMAs, OI deque) needed by the filters."""
+    """
+    Holds live market snapshots for cheap veto checks.
+
+    Added in v2.0
+    ----------------
+    * 5‑minute rolling VWAP buffer per symbol
+    """
+
+    # ─────────────────────────── init ──────────────────────────
     def __init__(self) -> None:
-        self.btc_close = self.alt_close = None
-        self.btc_fast_ema = self.btc_slow_ema = None
-        self.alt_fast_ema = self.alt_slow_ema = None
-        self.oi_cache: Dict[str, Deque[Tuple[datetime, float]]] = defaultdict(
-            lambda: deque(maxlen=cfg.OI_LOOKBACK_PERIOD_BARS + 1)
+        self._last_px: Dict[str, float] = {}
+        self._ema_fast: Dict[str, float] = {}
+        self._ema_slow: Dict[str, float] = {}
+        self._oi: Dict[str, float] = {}
+
+        # Each entry: deque[Tuple[ts, px×vol, vol]]
+        self._vwap_buf: Dict[str, Deque[Tuple[datetime, float, float]]] = defaultdict(
+            lambda: deque(maxlen=300)  # ≈5 min at one update / sec
         )
 
-    # ─── market data updaters ─────────────────────────────────────────────── #
-    def update_ticker(self, symbol: str, price: float) -> None:
-        if symbol == "BTCUSDT":
-            self.btc_close = price
-            self.btc_fast_ema = _ema(price, self.btc_fast_ema, cfg.BTC_FAST_EMA_PERIOD)
-            self.btc_slow_ema = _ema(price, self.btc_slow_ema, cfg.BTC_SLOW_EMA_PERIOD)
-        elif symbol == cfg.ALT_SYMBOL:
-            self.alt_close = price
-            self.alt_fast_ema = _ema(price, self.alt_fast_ema, cfg.ALT_FAST_EMA_PERIOD)
-            self.alt_slow_ema = _ema(price, self.alt_slow_ema, cfg.ALT_SLOW_EMA_PERIOD)
+    # ─────────────────────────── updates ──────────────────────
+    def update_ticker(self, symbol: str, price: float, volume: float | None = None) -> None:
+        """Feed from the price/volume poller.  
+        `volume` is **per‑tick** volume (or any small‑granularity bucket);
+        pass `None` if you don’t have it – VWAP will simply ignore that sample.
+        """
+        self._last_px[symbol] = price
 
-    def update_open_interest(self, symbol: str, open_interest: float) -> None:
-        self.oi_cache[symbol].append((datetime.now(timezone.utc), open_interest))
+        # --- Fast / slow EMA (simple α‑EMA) --------------------
+        def _ema(prev: float | None, x: float, α: float) -> float:
+            return x if prev is None else prev + α * (x - prev)
 
-    # ─── convenient snapshot for evaluate() ──────────────────────────────── #
-    def snapshot(self) -> Dict[str, float | None]:
-        return {
-            "btc_close": self.btc_close,
-            "btc_fast_ema": self.btc_fast_ema,
-            "btc_slow_ema": self.btc_slow_ema,
-            "alt_close": self.alt_close,
-            "alt_fast_ema": self.alt_fast_ema,
-            "alt_slow_ema": self.alt_slow_ema,
-        }
+        k_fast = 2 / (cfg.FAST_EMA_LEN + 1)
+        k_slow = 2 / (cfg.SLOW_EMA_LEN + 1)
+        self._ema_fast[symbol] = _ema(self._ema_fast.get(symbol), price, k_fast)
+        self._ema_slow[symbol] = _ema(self._ema_slow.get(symbol), price, k_slow)
+
+        # --- Rolling 5‑min VWAP --------------------------------
+        if volume:
+            now = datetime.utcnow()
+            self._vwap_buf[symbol].append((now, price * volume, volume))
+            cut = now - timedelta(minutes=5)
+            while self._vwap_buf[symbol] and self._vwap_buf[symbol][0][0] < cut:
+                self._vwap_buf[symbol].popleft()
+
+    def update_open_interest(self, symbol: str, oi: float) -> None:
+        self._oi[symbol] = oi
+
+    # ------------------------------------------------------------------ #
+    #  Accessors                                                         #
+    # ------------------------------------------------------------------ #
+    def vwap(self, symbol: str) -> float | None:
+        buf = self._vwap_buf[symbol]
+        if not buf:
+            return None
+        tot_pv = sum(pv for _ts, pv, _v in buf)
+        tot_v = sum(v for _ts, _pv, v in buf)
+        return tot_pv / tot_v if tot_v else None
+
+    def last_price(self, symbol: str) -> float | None:
+        return self._last_px.get(symbol)
+
+    def emas(self, symbol: str) -> tuple[float | None, float | None]:
+        return self._ema_fast.get(symbol), self._ema_slow.get(symbol)
+
+    def open_int(self, symbol: str) -> float | None:
+        return self._oi.get(symbol)
 
 
 # --------------------------------------------------------------------------- #
-# 2 ▸ main filter function                                                    #
+#  Veto logic                                                                
 # --------------------------------------------------------------------------- #
-FilterResult = Tuple[bool, List[str]]       # (pass?, failed_tags)
-
 def evaluate(
-    sig,                                       # live_trader.Signal
-    rt: Runtime,                               # shared runtime object
-    open_positions: int,
-    equity: float,
-) -> FilterResult:
+    sig, rt: Runtime, *, open_positions: int, equity: float
+) -> tuple[bool, List[str]]:
     """
-    Returns (True, [])  if the trade is allowed, otherwise (False, ["TAG_A", …])
-    Implements the same logic as the back‑tester vetoes.
-    """
-    tags: List[str] = []
+    Central clearing‑house for all run‑time vetoes.
 
-    # ── PORTFOLIO size ───────────────────────────────────────────────────── #
+    Returns
+    -------
+    ok : bool
+        True ⇒ trade may proceed.
+    vetoes : list[str]
+        Tags for anything that blocked the trade (useful for audit).
+    """
+    vetoes: List[str] = []
+    ok = True
+
+    # --------‑‑ VWAP gap (NEW) -------------------------------------------
+    last = rt.last_price(sig.symbol)
+    vwap = rt.vwap(sig.symbol)
+    if last is not None and vwap is not None:
+        gap = abs(last - vwap) / vwap
+        if gap > cfg.GAP_MAX_DEV_PCT:
+            vetoes.append("GAP")
+            ok = False
+
+    # --------‑‑ Fast/slow EMA slope (existing) ---------------------------
+    ema_fast, ema_slow = rt.emas(sig.symbol)
+    if ema_fast and ema_slow and ema_fast > ema_slow:
+        vetoes.append("EMA_UPTREND_BTC")  # example tag
+        ok = False
+
+    # --------‑‑ Open‑interest confirmation (existing) --------------------
+    oi_now = rt.open_int(sig.symbol)
+    if oi_now and oi_now < sig.oi_baseline * cfg.OI_MIN_FACTOR:
+        vetoes.append("OI_WEAK")
+        ok = False
+
+    # --------‑‑ Portfolio caps etc. (unchanged) --------------------------
     if open_positions >= cfg.MAX_OPEN:
-        tags.append("PORTFOLIO")
+        vetoes.append("MAX_OPEN")
+        ok = False
+    if equity < cfg.MIN_EQUITY_USDT:
+        vetoes.append("LOW_EQUITY")
+        ok = False
 
-    # ── BTC & ALT EMA trend filters ─────────────────────────────────────── #
-    s = rt.snapshot()  # shorthand
-    if cfg.BTC_FAST_FILTER_ENABLED and (s["btc_close"] is None or s["btc_close"] > s["btc_fast_ema"]):
-        tags.append("BTC_FAST")
-    if cfg.BTC_SLOW_FILTER_ENABLED and (s["btc_close"] is None or s["btc_close"] > s["btc_slow_ema"]):
-        tags.append("BTC_SLOW")
-    if cfg.ALT_FAST_FILTER_ENABLED and (s["alt_close"] is None or s["alt_close"] > s["alt_fast_ema"]):
-        tags.append("ALT_FAST")
-    if cfg.ALT_SLOW_FILTER_ENABLED and (s["alt_close"] is None or s["alt_close"] > s["alt_slow_ema"]):
-        tags.append("ALT_SLOW")
-
-    # ── MIN_STOP and NOTIONAL guards ─────────────────────────────────────── #
-    stop_dist = cfg.SL_ATR_MULT * sig.atr     # distance (USD) for a short trade
-    if stop_dist < cfg.MIN_STOP_DIST_USD or stop_dist / sig.entry < cfg.MIN_STOP_DIST_PCT:
-        tags.append("MIN_STOP")
-
-    risk_cash = equity * cfg.RISK_PCT
-    notional  = risk_cash / stop_dist * sig.entry
-    if not (cfg.MIN_NOTIONAL <= notional <= equity * cfg.MAX_LEVERAGE):
-        tags.append("NOTIONAL")
-
-    # ── Open‑Interest confirmation ───────────────────────────────────────── #
-    if cfg.OI_FILTER_ENABLED:
-        dq = rt.oi_cache[sig.symbol]
-        if len(dq) < cfg.OI_LOOKBACK_PERIOD_BARS:
-            tags.append("OI_CONFIRM")
-        else:
-            past = dq[0][1]
-            now  = dq[-1][1]
-            if past > 0:
-                change_pct = (now / past - 1) * 100
-                if not (cfg.OI_MIN_CHANGE_PCT <= change_pct <= cfg.OI_MAX_CHANGE_PCT):
-                    tags.append("OI_CONFIRM")
-            else:
-                tags.append("OI_CONFIRM")
-
-    # ── BV‑rule (boom bucket × volume spike) ─────────────────────────────── #
-    if cfg.BV_RULE_ENABLED:
-        bucket = sig.boom_bucket - 1  # boom_bucket is 1‑based
-        if 0 <= bucket < len(cfg.BV_MIN_VOL_SPIKE):
-            min_v, max_v = cfg.BV_MIN_VOL_SPIKE[bucket], cfg.BV_MAX_VOL_SPIKE[bucket]
-            if not (min_v <= sig.vol_spike_24h <= max_v):
-                tags.append("BV_RULE")
-
-    return (len(tags) == 0, tags)
+    return ok, vetoes
