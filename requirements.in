@@ -1,13 +1,13 @@
 # requirements.in
-aiohttp
-asyncpg
-ccxt                   # Bybit & other exchanges
-PyYAML
-pydantic<2.0           # v1.x because your code uses BaseSettings here
-watchdog
-pandas
-python-dotenv          # loads .env for pydantic
-tqdm
-pandas_ta              # pure‑Python TA indicators (no native build)
-numpy<2              # Arrow & SciPy ecosystem still expect 1.x
-pyarrow<16           # 15.0.2 today; anything <16 follows the NumPy cap
+aiohttp                 # async HTTP client
+asyncpg                 # Postgres driver
+ccxt                    # Bybit & other exchanges
+numpy<2                 # Arrow & SciPy ecosystem still expect 1.x
+pandas                  # DataFrames
+pandas_ta               # pure‑Python TA indicators (fallback when TA‑Lib absent)
+pyarrow<16              # PyArrow 15.x caps NumPy<2
+pydantic<2.0            # v1.x because BaseSettings lives here
+python-dotenv           # loads .env for pydantic
+PyYAML                  # YAML loader
+tqdm                    # progress bars
+watchdog                # hot‑reload file watcher
