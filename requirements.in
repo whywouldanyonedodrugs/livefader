@@ -1,0 +1,11 @@
+# requirements.in
+aiohttp
+asyncpg
+ccxt                   # Bybit & other exchanges
+PyYAML
+pydantic<2.0           # v1.x because your code uses BaseSettings here
+watchdog
+pandas
+python-dotenv          # loads .env for pydantic
+tqdm
+pandas_ta              # pure‑Python TA indicators (no native build)
