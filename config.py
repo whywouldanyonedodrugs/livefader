@@ -4,6 +4,8 @@ Strategy & risk defaults.
 Edit in Git – for one‑off tweaks use config.yaml or Telegram `/set KEY value`.
 """
 
+SYMBOLS_FILE = "symbols.txt"
+
 # ── risk sizing ────────────────────────────────────────────────────────────
 RISK_MODE          = "FIXED"     # or "FIXED"
 FIXED_RISK_USDT    = 10.0
