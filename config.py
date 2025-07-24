@@ -4,6 +4,14 @@ Strategy & risk defaults.
 Edit in Git – for one‑off tweaks use config.yaml or Telegram `/set KEY value`.
 """
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+RAW_CSV_DIR  = PROJECT_ROOT / "raw_csv"
+PARQUET_DIR  = PROJECT_ROOT / "parquet"
+SIGNALS_DIR  = PROJECT_ROOT / "signals"
+RESULTS_DIR  = PROJECT_ROOT / "results"
+SYMBOLS_FILE = PROJECT_ROOT / "symbols.txt"
+MERGED_CSV_DIR = PROJECT_ROOT / "data_merged"
+
 SYMBOLS_FILE = "symbols.txt"
 START_DATE = "2022-01-01"
 END_DATE = "2026-01-01"
