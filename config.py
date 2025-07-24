@@ -7,6 +7,15 @@ Edit in Git – for one‑off tweaks use config.yaml or Telegram `/set KEY value
 SYMBOLS_FILE = "symbols.txt"
 START_DATE = "2022-01-01"
 END_DATE = "2026-01-01"
+
+EMA_FAST = 20   # For 4h EMA cross
+EMA_SLOW = 200  # For 4h EMA cross
+
+PRICE_BOOM_PERIOD_H = 24
+PRICE_BOOM_PCT      = 0.15
+PRICE_SLOWDOWN_PERIOD_H = 4
+PRICE_SLOWDOWN_PCT      = 0.01
+
 # ── risk sizing ────────────────────────────────────────────────────────────
 RISK_MODE          = "FIXED"     # or "FIXED"
 FIXED_RISK_USDT    = 10.0
