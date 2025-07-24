@@ -9,3 +9,5 @@ pandas
 python-dotenv          # loads .env for pydantic
 tqdm
 pandas_ta              # pure‑Python TA indicators (no native build)
+numpy<2              # Arrow & SciPy ecosystem still expect 1.x
+pyarrow<16           # 15.0.2 today; anything <16 follows the NumPy cap
