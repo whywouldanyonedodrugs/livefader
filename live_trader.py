@@ -365,7 +365,7 @@ class LiveTrader:
             raw = json.loads(LISTING_PATH.read_text())
             return {s: _dt.date.fromisoformat(ts) for s, ts in raw.items()}
 
-        ex = ccxt.bybit()
+        ex = ccxt_sync.bybit()
         out = {}
         for sym in SYMBOLS_PATH.read_text().split():
             try:
@@ -794,11 +794,12 @@ class LiveTrader:
             self.open_positions[r["id"]] = dict(r)
             LOG.info("Resumed open position %s", r["symbol"])
         # load last‑exit timestamps within cool‑down window
-        cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
+        cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS",
+                        cfg.SYMBOL_COOLDOWN_HOURS))
         rows = await self.db.pool.fetch(
             "SELECT symbol, closed_at FROM positions "
             "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
-            f"{cd_h} hours",
+            timedelta(hours=cd_h),
         )
         for r in rows:
             self.last_exit[r["symbol"]] = r["closed_at"].replace(tzinfo=None)
