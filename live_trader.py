@@ -733,17 +733,32 @@ class LiveTrader:
             await asyncio.sleep(30)
 
     async def _oi_poll_loop(self):
-        """Rudimentary OI snapshot loop (poll REST every 5 min)."""
+        """Rudimentary OI snapshot loop (poll REST every 5 min)."""
         while True:
             try:
                 for sym in self.symbols:
-                    oi = (await self.exchange.fetch_open_interest(sym))[
-                        "openInterest"
-                    ]
-                    self.filter_rt.update_open_interest(sym, oi)
+                    data = await self.exchange.fetch_open_interest(sym)
+
+                    # Bybit REST / CCXT versions use one of these keys:
+                    #   * "openInterest"         – older REST v2
+                    #   * "openInterestValue"    – REST v5
+                    #   * "open_interest"        – some CCXT snake‑case
+                    oi = (
+                        data.get("openInterest")
+                        or data.get("openInterestValue")
+                        or data.get("open_interest")
+                    )
+
+                    if oi is not None:
+                        self.filter_rt.update_open_interest(sym, oi)
+                    else:
+                        LOG.debug("No OI key found in response for %s: %s", sym, data)
+
             except Exception as e:
                 LOG.warning("OI poll failed: %s", e)
+
             await asyncio.sleep(300)
+
 
     # ---------------- EQUITY SNAPSHOT ----------
     async def _equity_loop(self):
@@ -848,6 +863,24 @@ async def async_main():
 
 if __name__ == "__main__":
     asyncio.run(async_main())
+
+# ----------------------------------------------------------------------
+# Backward‑compat shim for live_trader.py
+# ----------------------------------------------------------------------
+try:
+    from .scanner import scan_single   # if you moved it
+except ImportError:
+    scan_single = None  # type: ignore
+
+async def scan_symbol(sym: str, cfg: dict):
+    """
+    Legacy wrapper so live_trader still calls `scout.scan_symbol`.
+    Delegates to `scan_single()` if present.
+    """
+    if scan_single is None:
+        raise NotImplementedError("scan_single() not found in scout module")
+    return await scan_single(sym, cfg)
+
 
 ###############################################################################
 # TODO – WebSocket order‑stream implementation (ccxt.pro) for instant fills ###
