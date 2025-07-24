@@ -37,9 +37,11 @@ import ccxt.async_support as ccxt
 import yaml
 import config as cfg   # <‑‑ your static defaults
 import filters
-from pydantic import BaseSettings, Field, ValidationError
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+
+from pydantic_settings import BaseSettings
+from pydantic import Field, ValidationError
 
 # ---------------------------  YOUR MODULES  ------------------------------
 import scout  # async def scan_symbol(sym: str, cfg: dict) -> Optional[Signal]
