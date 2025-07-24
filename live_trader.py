@@ -635,8 +635,8 @@ class LiveTrader:
                         equity=equity,
                     )
                     if not ok:
+                        LOG.info("scout %s -> %s", sym, " | ".join(vetoes))
                         # optional: store veto audit once you add `events` table
-                        # await self.db.add_event({...})
                         continue
 
                         await self._open_position(sig_raw)
