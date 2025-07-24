@@ -567,6 +567,8 @@ class LiveTrader:
 
             await asyncio.sleep(30)
 
+            await asyncio.sleep(30)
+
     async def _oi_poll_loop(self):
         """Rudimentary OI snapshot loop (poll REST every 5 min)."""
         while True:
