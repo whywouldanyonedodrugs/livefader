@@ -40,8 +40,7 @@ import filters
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from pydantic_settings import BaseSettings
-from pydantic import Field, ValidationError
+from pydantic import BaseSettings, Field, ValidationError
 
 # ---------------------------  YOUR MODULES  ------------------------------
 import scout  # async def scan_symbol(sym: str, cfg: dict) -> Optional[Signal]
