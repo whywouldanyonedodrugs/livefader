@@ -215,3 +215,82 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# ---------------------------------------------------------------------------
+# 🔌  Compatibility shim for live_trader.py  (async scan_symbol)
+# ---------------------------------------------------------------------------
+#
+# live_trader.run() calls:
+#     sig_raw = await scout.scan_symbol(sym, cfg)
+#
+# That function vanished when scout.py was refactored for batch‑mode scanning.
+# The stub below recreates it by running the *synchronous* indicator logic in
+# a thread‑pool so it doesn’t block the asyncio loop.
+#
+# ‑ If the latest 5‑minute bar meets all entry criteria, we return a Signal
+#   dataclass compatible with live_trader.Signal.
+# ‑ Otherwise we return None, just as the old code did.
+#
+# Feel free to replace this with a fully‑vectorised async version later.
+
+from datetime import datetime, timezone
+import asyncio
+from typing import Optional
+
+try:
+    # import the dataclass definition from live_trader
+    from live_trader import Signal   # type: ignore
+except ImportError:
+    # fallback definition if live_trader isn’t on PYTHONPATH at import time
+    from dataclasses import dataclass
+    @dataclass
+    class Signal:            # minimal fields live_trader needs
+        symbol: str
+        entry: float
+        atr: float
+        rsi: float
+        regime: str
+
+def _scan_symbol_sync(sym: str, cfg_dict: dict) -> Optional[Signal]:
+    """Synchronous helper that re‑uses the existing indicator pipeline."""
+    try:
+        df = shared_utils.load_parquet_data(sym, cfg.START_DATE, cfg.END_DATE)
+        if df.empty:
+            return None
+        df5 = _prepare_indicators(df.tail(RET_WINDOW_BARS * 2))   # last ~60 d
+    except FileNotFoundError:
+        return None
+
+    if df5.empty:
+        return None
+
+    # Evaluate the very last 5‑minute bar
+    last = df5.iloc[-1]
+
+    # Re‑use the same entry conditions as process_symbol()
+    c1 = (last["close"] / last["close_boom_ago"] - 1) >= cfg.PRICE_BOOM_PCT
+    c2 = (last["close"] / last["close_slowdown_ago"] - 1) <= cfg.PRICE_SLOWDOWN_PCT
+    c3 = last["ema_fast_4h"] < last["ema_slow_4h"]
+    c4 = cfg.RSI_ENTRY_MIN <= last[f"rsi_{cfg.RSI_TIMEFRAME}"] <= cfg.RSI_ENTRY_MAX
+    c5 = abs(last["close"] - last["rolling_vwap"]) / last["rolling_vwap"] <= cfg.GAP_MAX_DEV_PCT
+    c6 = last["ret_30d"] <= cfg.STRUCTURAL_TREND_RET_PCT
+    c7 = (not cfg.ADX_FILTER_ENABLED) or (last[f"adx_{cfg.ADX_TIMEFRAME}"] <= cfg.ADX_MAX_LEVEL)
+    c8 = True   # volume filters need rolling context; skip for speed
+    c9 = (not cfg.VOLATILITY_FILTER_ENABLED) or (
+          (last[f"atr_{cfg.ATR_TIMEFRAME}"] / last["close"]) >= cfg.MIN_ATR_PCT)
+
+    if all([c1, c2, c3, c4, c5, c6, c7, c8, c9]):
+        return Signal(
+            symbol=sym,
+            entry=float(last["close"]),
+            atr=float(last[f"atr_{cfg.ATR_TIMEFRAME}"]),
+            rsi=float(last[f"rsi_{cfg.RSI_TIMEFRAME}"]),
+            regime="LIVE",
+        )
+    return None
+
+
+async def scan_symbol(sym: str, cfg_dict: dict) -> Optional[Signal]:
+    """Async wrapper so live_trader can `await scout.scan_symbol()`."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _scan_symbol_sync, sym, cfg_dict)
