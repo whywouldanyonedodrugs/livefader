@@ -33,7 +33,7 @@ FIXED_RISK_USDT    = 10.0
 RISK_PCT           = 0.005         # 0.5 %
 
 # ── stop / targets ─────────────────────────────────────────────────────────
-SL_ATR_MULT             = 3.0
+SL_ATR_MULT             = 2.5
 FINAL_TP_ENABLED        = True
 FINAL_TP_ATR_MULT       = 1.0
 PARTIAL_TP_ENABLED      = False
@@ -64,7 +64,7 @@ VOLATILITY_FILTER_ENABLED = False
 MIN_ATR_PCT               = 0.005 # Min ATR as a percentage of price
 
 # ── basic signal filters ──────────────────────────────────────────────────
-RSI_RANGE       = (30, 80)
+RSI_RANGE       = (30, 70)
 ATR_RANGE       = (0.0, 1.0)
 REGIME_MA_PERIOD        = 100        # Long-term moving average period for trend
 REGIME_ATR_PERIOD       = 20         # ATR period for Keltner Channel
