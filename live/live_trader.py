@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False      # you can leave it False now
-        extra = Extra.ignore        # silently drop any stray keys
+        extra = 'ignore'        # silently drop any stray keys
 
 
 ###############################################################################
