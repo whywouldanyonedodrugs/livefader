@@ -13,9 +13,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from .. import config as cfg             # CORRECT (Double-dot relative)
-from .. import indicators as ta          # CORRECT (Double-dot relative)
-from ..shared_utils import is_blacklisted  # CORRECT (Double-dot relative)
+import config as cfg
+import indicators as ta
+from shared_utils import is_blacklisted
 
 # --- Environment Variable Overrides ---
 cfg.START_DATE = os.getenv("DATA_START", os.getenv("SLICE_START", cfg.START_DATE))
