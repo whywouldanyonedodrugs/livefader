@@ -58,25 +58,24 @@ logging.basicConfig(
 # 1 ▸ SETTINGS pulled from ENV (.env) #########################################
 ###############################################################################
 
-
 class Settings(BaseSettings):
     """Secrets & env flags."""
 
-    bybit_api_key: str = Field(..., env="BYBIT_API_KEY")
-    bybit_api_secret: str = Field(..., env="BYBIT_API_SECRET")
-    bybit_testnet: bool = Field(False, env="BYBIT_TESTNET")
+    bybit_api_key: str = Field(..., validation_alias="BYBIT_API_KEY")
+    bybit_api_secret: str = Field(..., validation_alias="BYBIT_API_SECRET")
+    bybit_testnet: bool = Field(False, validation_alias="BYBIT_TESTNET")
 
-    tg_bot_token: str = Field(..., env="TG_BOT_TOKEN")
-    tg_chat_id: str = Field(..., env="TG_CHAT_ID")
+    tg_bot_token: str = Field(..., validation_alias="TG_BOT_TOKEN")
+    tg_chat_id: str = Field(..., validation_alias="TG_CHAT_ID")
 
-    pg_dsn: str = Field(..., env="DATABASE_URL")
+    pg_dsn: str = Field(..., validation_alias="DATABASE_URL")
 
     default_leverage: int = 10
 
     class Config:
         env_file = ".env"
-        case_sensitive = False      # you can leave it False now
-        extra = 'ignore'        # silently drop any stray keys
+        case_sensitive = False
+        extra = 'ignore' # Use modern string syntax
 
 
 ###############################################################################
