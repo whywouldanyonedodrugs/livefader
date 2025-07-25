@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 import config as cfg
-import indicators as ta
+from live import indicators as ta
 from shared_utils import is_blacklisted
 
 # --- Environment Variable Overrides ---
