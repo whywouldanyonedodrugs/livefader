@@ -17,8 +17,8 @@ BYBIT_ACCOUNT_TYPE    = "UNIFIED"  # or "STANDARD"
 START_DATE = "2022-01-01"
 END_DATE = "2026-01-01"
 
-EMA_FAST_PERIOD = 20   # For 4h EMA cross
-EMA_SLOW_PERIOD = 200  # For 4h EMA cross
+EMA_FAST_PERIOD = 480   # 20
+EMA_SLOW_PERIOD = 4000  # 200
 VWAP_LEN = 15
 
 PRICE_BOOM_PERIOD_H = 24
@@ -115,7 +115,7 @@ OI_MAX_CHANGE_PCT        = 10.0
 
 # ── runtime / misc ────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 60
-TIMEFRAME = '4h' 
+TIMEFRAME = '5m' 
 ENTRY_ORDER_TYPE  = "MARKET"        # or "MARKET"
 
 # ─── Re‑entry cool‑down per symbol ──────────────────────────────────────────

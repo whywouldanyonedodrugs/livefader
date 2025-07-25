@@ -36,8 +36,8 @@ def _get_hours_from_timeframe(tf: str) -> float:
 
 class SignalGenerator:
 
-    RSI_PERIOD = 14
-    ATR_PERIOD = 14
+    RSI_PERIOD = 672
+    ATR_PERIOD = 672
 
     def __init__(self, symbol: str, exchange):
         self.symbol = symbol
