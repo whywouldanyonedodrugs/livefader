@@ -5,7 +5,7 @@ from collections import deque
 import config as cfg
 import logging
 import re
-from . import live_indicators as ta
+from live import live_indicators as ta
 
 LOG = logging.getLogger(__name__)
 
