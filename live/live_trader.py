@@ -34,7 +34,7 @@ from .database import DB
 from .telegram import TelegramBot
 
 
-from pydantic import Field, Extra
+from pydantic import Field, Extra, ValidationError
 from pydantic_settings import BaseSettings
 
 # ---------------------------  YOUR MODULES  ------------------------------
