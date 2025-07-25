@@ -707,12 +707,27 @@ class LiveTrader:
                     await asyncio.sleep(5)
                     continue
 
-                tasks = [self._fetch_and_process_symbol(sym) for sym in self.symbols]
-                await asyncio.gather(*tasks)
+                LOG.info("Starting new scan cycle for %d symbols...", len(self.symbols))
+
+                # Process symbols one by one instead of all at once
+                for sym in self.symbols:
+                    if self.paused or not self.risk.can_trade():
+                        LOG.info("Scan cycle interrupted by pause/kill-switch.")
+                        break # Exit the inner for-loop
+                    try:
+                        # We no longer need to create a list of tasks, just call the worker
+                        await self._fetch_and_process_symbol(sym)
+                    except Exception as e:
+                        LOG.error("Error processing symbol %s during scan: %s", sym, e)
+                    # Add a tiny sleep to prevent hitting rate limits and keep the loop responsive
+                    await asyncio.sleep(0.2)
+
+                LOG.info("Scan cycle complete. Waiting for next interval.")
 
             except Exception as e:
-                LOG.error("Error in main signal loop: %s", e)
+                LOG.error("Critical error in main signal loop: %s", e)
 
+            # Wait for a configurable interval before the next full scan.
             await asyncio.sleep(self.cfg.get("SCAN_INTERVAL_SEC", 60))
 
     # ---------------- EQUITY SNAPSHOT ----------
