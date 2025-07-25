@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 import config as cfg
 from live import indicators as ta
-from shared_utils import is_blacklisted
+from backtest.shared_utils import is_blacklisted
 
 # --- Environment Variable Overrides ---
 cfg.START_DATE = os.getenv("DATA_START", os.getenv("SLICE_START", cfg.START_DATE))
