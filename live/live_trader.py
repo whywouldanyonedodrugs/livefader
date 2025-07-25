@@ -28,6 +28,8 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from .signal_generator import SignalGenerator, Signal
 from .exchange_proxy import ExchangeProxy
+from .database import DB
+from .telegram import TelegramBot
 
 from pydantic import BaseSettings, Field, ValidationError
 
@@ -87,183 +89,7 @@ def load_yaml(p: Path) -> Dict[str, Any]:
 
 
 ###############################################################################
-# 3 ▸ DB LAYER ################################################################
-###############################################################################
-
-TABLES_SQL = """
-CREATE TABLE IF NOT EXISTS positions (
-    id SERIAL PRIMARY KEY,
-    symbol TEXT,
-    side TEXT,
-    size NUMERIC,
-    entry_price NUMERIC,
-    stop_price NUMERIC,
-    trailing_active BOOLEAN DEFAULT FALSE,
-    atr NUMERIC,
-    status TEXT,
-    opened_at TIMESTAMPTZ,
-    exit_deadline TIMESTAMPTZ,
-    closed_at TIMESTAMPTZ,
-    pnl NUMERIC
-);
-CREATE TABLE IF NOT EXISTS fills (
-    id SERIAL PRIMARY KEY,
-    position_id INT REFERENCES positions(id),
-    fill_type TEXT,
-    price NUMERIC,
-    qty NUMERIC,
-    ts TIMESTAMPTZ
-);
-CREATE TABLE IF NOT EXISTS equity_snapshots (
-    ts TIMESTAMPTZ PRIMARY KEY,
-    equity NUMERIC
-);
-
--- New indexes for performance
-CREATE INDEX IF NOT EXISTS idx_positions_symbol_status ON positions (symbol, status);
-CREATE INDEX IF NOT EXISTS idx_positions_closed_at ON positions (closed_at);
-"""
-DB_RETRYABLE_EXCEPTIONS = (
-    asyncpg.exceptions.InterfaceError,       # Connection errors
-    asyncpg.exceptions.DeadlockDetectedError,  # Deadlocks
-    asyncpg.exceptions.SerializationError,     # Transaction conflicts
-)
-
-# Create a retry decorator for database operations
-db_retry = retry(
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    stop=stop_after_attempt(5),
-    retry=retry_if_exception_type(DB_RETRYABLE_EXCEPTIONS),
-    before_sleep=lambda state: LOG.warning(
-        "Retrying DB call %s due to %s. Attempt #%d",
-        state.fn.__name__, state.outcome.exception(), state.attempt_number
-    )
-)
-
-class DB:
-    def __init__(self, dsn: str):
-        self._dsn = dsn
-        self.pool: Optional[asyncpg.Pool] = None
-
-    @db_retry
-    async def init(self):
-        self.pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        async with self.pool.acquire() as conn:
-            await conn.execute(TABLES_SQL)
-
-    # ---------- helper wrappers ------------------------------------------
-    @db_retry
-    async def insert_position(self, data: Dict[str, Any]) -> int:
-        q = """INSERT INTO positions(symbol,side,size,entry_price,stop_price,
-                 trailing_active,atr,status,opened_at)
-               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id"""
-        return await self.pool.fetchval(
-            q,
-            data["symbol"],
-            data["side"],
-            data["size"],
-            data["entry_price"],
-            data["stop_price"],
-            data["trailing_active"],
-            data["atr"],
-            data["status"],
-            data["opened_at"],
-        )
-
-    @db_retry
-    async def update_position(self, pid: int, **fields):
-        sets = ",".join(f"{k}=${i+2}" for i, k in enumerate(fields))
-        await self.pool.execute(
-            f"UPDATE positions SET {sets} WHERE id=$1", pid, *fields.values()
-        )
-
-    @db_retry
-    async def add_fill(self, pid: int, fill_type: str, price: Optional[float], qty: float):
-        await self.pool.execute(
-            "INSERT INTO fills(position_id,fill_type,price,qty,ts) VALUES($1,$2,$3,$4,$5)",
-            pid,
-            fill_type,
-            price,
-            qty,
-            datetime.now(timezone.utc),
-        )
-
-    @db_retry
-    async def fetch_open_positions(self) -> List[asyncpg.Record]:
-        return await self.pool.fetch("SELECT * FROM positions WHERE status='OPEN'")
-
-    @db_retry
-    async def latest_equity(self) -> Optional[float]:
-        return await self.pool.fetchval(
-            "SELECT equity FROM equity_snapshots ORDER BY ts DESC LIMIT 1"
-        )
-
-    @db_retry
-    async def snapshot_equity(self, equity: float):
-        await self.pool.execute(
-            "INSERT INTO equity_snapshots VALUES($1,$2) ON CONFLICT DO NOTHING",
-            datetime.now(timezone.utc),
-            equity,
-        )
-
-    @db_retry
-    async def batch_insert_fills(self, fills_data: list[tuple]):
-        """
-        Inserts multiple fill records in a single database transaction.
-        This is much more efficient than inserting one by one.
-        
-        Args:
-            fills_data: A list of tuples, where each tuple matches the fills table:
-                        (position_id, fill_type, price, qty, timestamp).
-        """
-        # Do nothing if the list is empty
-        if not fills_data:
-            return
-            
-        # The SQL query with placeholders for one row
-        q = "INSERT INTO fills(position_id, fill_type, price, qty, ts) VALUES($1, $2, $3, $4, $5)"
-
-        try:
-            # executemany sends the query and the entire list of data
-            # to the database in a single network round-trip.
-            await self.pool.executemany(q, fills_data)
-            LOG.info("Successfully batch-inserted %d fill records.", len(fills_data))
-        except Exception as e:
-            LOG.error("Failed to batch-insert fills: %s", e)
-
-
-
-
-###############################################################################
-# 4 ▸ TELEGRAM ###############################################################
-###############################################################################
-
-class TelegramBot:
-    def __init__(self, token: str, chat_id: str):
-        self.chat_id = chat_id
-        self.base = f"https://api.telegram.org/bot{token}"
-        self._sess: Optional[aiohttp.ClientSession] = None
-        self.offset: Optional[int] = None
-
-    async def _req(self, method: str, **params):
-        if self._sess is None:
-            self._sess = aiohttp.ClientSession()
-        async with self._sess.post(f"{self.base}/{method}", json=params) as r:
-            return await r.json()
-
-    async def send(self, text: str):
-        await self._req("sendMessage", chat_id=self.chat_id, text=text)
-
-    async def poll_cmds(self):
-        data = await self._req("getUpdates", offset=self.offset, timeout=0, limit=20)
-        for upd in data.get("result", []):
-            self.offset = upd["update_id"] + 1
-            if (m := upd.get("message")) and (txt := m.get("text")):
-                yield txt.strip()
-
-
-###############################################################################
-# 5 ▸ HOT‑RELOAD WATCHER ######################################################
+# 3 ▸ HOT‑RELOAD WATCHER ######################################################
 ###############################################################################
 
 
@@ -280,18 +106,9 @@ class _Watcher(FileSystemEventHandler):
         if Path(e.src_path).resolve() == self.path:
             self.cb()
 
-
 ###############################################################################
-# 6 ▸ DATA CLASSES ###########################################################
+# 4 ▸ RISK MANAGER ###########################################################
 ###############################################################################
-
-# MAYBE WILL BE USED LATER
-
-###############################################################################
-# 7 ▸ RISK MANAGER ###########################################################
-###############################################################################
-
-
 class RiskManager:
     def __init__(self, cfg_dict: Dict[str, Any]):
         self.cfg = cfg_dict
@@ -312,7 +129,7 @@ class RiskManager:
 
 
 ###############################################################################
-# 8 ▸ MAIN TRADER ###########################################################
+# 5 ▸ MAIN TRADER ###########################################################
 ###############################################################################
 
 
@@ -479,91 +296,87 @@ class LiveTrader:
         atr   = sig.atr
 
         stop = entry + self.cfg["SL_ATR_MULT"] * atr
-        stop_dist = abs(entry - stop)
 
-        # EXEC‑ATR veto (same limits as back‑tester)
-        if (
-            stop_dist < self.cfg["MIN_STOP_DIST_USD"]
-            or (stop_dist / entry) < self.cfg["MIN_STOP_DIST_PCT"]
-        ):
-            LOG.info("EXEC_ATR veto %s – stop %.4f < min dist", sig.symbol, stop_dist)
+        slippage_buffer = entry * self.cfg.get("SLIPPAGE_BUFFER_PCT", 0.0)
+        # For a short, a worse entry price is higher.
+        effective_entry_price = entry + slippage_buffer
+        stop_dist = abs(effective_entry_price - stop)
+        
+        if stop_dist == 0:
+            LOG.warning("VETO: Stop distance is zero for %s. Skipping.", sig.symbol)
             return
 
         size = risk_amt / stop_dist
 
-        # --- NEW: Round size to exchange precision and check min cost ---
+        if (stop_dist < self.cfg["MIN_STOP_DIST_USD"] or (stop_dist / entry) < self.cfg["MIN_STOP_DIST_PCT"]):
+            LOG.info("EXEC_ATR veto %s – stop %.4f < min dist", sig.symbol, stop_dist)
+            return
+
         try:
             market = self.exchange.markets[sig.symbol]
-            
-            # 1. Round the amount to the exchange's required precision (step size)
             size = self.exchange.amount_to_precision(sig.symbol, size)
-            
-            # 2. Check if the order meets the minimum cost (minNotional)
             min_cost = market.get('limits', {}).get('cost', {}).get('min', 0.01)
-            order_cost = size * entry
-            
-            if order_cost < min_cost:
-                LOG.warning(
-                    "VETO: Order for %s of size %s costs %.4f USDT, "
-                    "but exchange requires at least %.4f USDT. Skipping.",
-                    sig.symbol, size, order_cost, min_cost
-                )
+            if (size * entry) < min_cost:
+                LOG.warning("VETO: Order for %s size %s costs less than exchange minimum.", sig.symbol, size)
                 return
-
         except Exception as e:
             LOG.error("Error during size validation for %s: %s", sig.symbol, e)
             return
-        # --- END OF NEW LOGIC ---
 
-        # time‑based exit deadline
         exit_deadline = (
-            datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", cfg.TIME_EXIT_DAYS)) # MODIFIED
-            if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED)
-            else None
+            datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
+            if self.cfg.get("TIME_EXIT_ENABLED", True) else None
         )
 
-        now = datetime.now(timezone.utc)
+        # --- RESTRUCTURED ORDER PLACEMENT ---
         pid = await self.db.insert_position({
-            "symbol": sig.symbol,
-            "side": "short",
-            "size": size,
-            "entry_price": entry,
-            "stop_price": stop,
-            "trailing_active": False,
-            "atr": atr,
-            "status": "PENDING",
-            "opened_at": now,
+            "symbol": sig.symbol, "side": "short", "size": size,
+            "entry_price": entry, "stop_price": stop, "trailing_active": False,
+            "atr": atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
             "exit_deadline": exit_deadline,
         })
 
+        # 1. Place entry order first
         try:
             await self._ensure_leverage(sig.symbol)
-            await self.exchange.create_market_order(
-                sig.symbol, "sell", size,
-                params={"clientOrderId": self._cid(pid, "ENTRY")}
+            entry_order = await self.exchange.create_market_order(
+                sig.symbol, "sell", size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
-            # initial SL
+            # Basic check if order was accepted. More robust checks could follow.
+            if not entry_order or entry_order.get('status') == 'rejected':
+                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} rejected.")
+
+        except Exception as e:
+            LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
+            await self.db.update_position(pid, status="ERROR_ENTRY")
+            return # IMPORTANT: Exit here, no naked position created
+
+        # 2. If entry succeeds, place SL and TP orders
+        try:
             await self.exchange.create_order(
                 sig.symbol, "STOP_MARKET", "buy", size,
                 params={"stopPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True}
             )
-            # partial TP
             if self.cfg.get("PARTIAL_TP_ENABLED", True):
                 tp1 = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
+                qty = self.exchange.amount_to_precision(sig.symbol, qty)
                 await self.exchange.create_order(
                     sig.symbol, "TAKE_PROFIT_MARKET", "buy", qty,
                     params={"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True}
                 )
+            
+            # All orders placed, finalize position state
             await self.db.update_position(pid, status="OPEN")
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
             await self.tg.send(f"🚀 Opened {sig.symbol} short {size:.3f} @ {entry:.4f}")
+
         except Exception as e:
-            LOG.error("Order placement failed for %s (pid %d): %s. Attempting to close.", sig.symbol, pid, e)
-            await self.db.update_position(pid, status="ERROR")
+            # This block is CRITICAL. Entry order succeeded, but SL/TP failed.
+            LOG.critical("NAKED POSITION: SL/TP placement failed for %s (pid %d): %s", sig.symbol, pid, e)
+            await self.db.update_position(pid, status="ERROR_NAKED")
             try:
-                # Attempt to close the position immediately to prevent a naked position
                 await self.exchange.create_market_order(
                     sig.symbol, 'buy', size, params={'reduceOnly': True}
                 )
@@ -571,7 +384,7 @@ class LiveTrader:
                 LOG.warning(msg)
                 await self.tg.send(msg)
             except Exception as close_e:
-                msg = f"🚨 !!! CRITICAL: NAKED POSITION for {sig.gbol}. Manual intervention required IMMEDIATELY. Error: {close_e}"
+                msg = f"🚨 !!! NAKED POSITION for {sig.symbol}. Manual intervention REQUIRED. Close error: {close_e}"
                 LOG.critical(msg)
                 await self.tg.send(msg)
 
@@ -819,42 +632,45 @@ class LiveTrader:
     async def _fetch_and_process_symbol(self, sym: str):
         """
         A concurrent worker to fetch data and process signals for one symbol.
-        Uses the class semaphore to limit concurrent exchange requests.
+        It fetches all candles since the last processed one to avoid missing signals.
         """
         generator = self.signal_generators.get(sym)
         if not generator or not generator.is_warmed_up:
-            return # Skip if not ready
+            return
 
         try:
+            # Fetch all candles since the last one we processed
             async with self.api_semaphore:
-                # Fetch the most recent 2 candles
-                ohlcvs = await self.exchange.fetch_ohlcv(sym, '4h', limit=2)
+                # Add 1ms to `since` to avoid fetching the same candle again
+                ohlcvs = await self.exchange.fetch_ohlcv(
+                    sym, cfg.TIMEFRAME, since=generator.last_processed_timestamp + 1, limit=200
+                )
             
-            if not ohlcvs or len(ohlcvs) < 2:
+            if not ohlcvs:
                 return
 
-            last_closed_candle = ohlcvs[-1]
+            # Process each new candle in sequence
+            for candle in ohlcvs:
+                close_price = candle[4]
+                volume = candle[5]
+                self.filter_rt.update_ticker(sym, close_price, volume)
 
-            close_price = last_closed_candle[4]
-            volume = last_closed_candle[5]
-            self.filter_rt.update_ticker(sym, close_price, volume)
+                signal = generator.update_and_check(candle)
 
-            # Let the generator process it and check for a signal
-            signal = generator.update_and_check(last_closed_candle)
-
-            if signal:
-                # We have a signal, now run it through the existing filters
-                equity = await self.db.latest_equity() or 0.0
-                ok, vetoes = filters.evaluate(
-                    signal,
-                    self.filter_rt,
-                    open_positions=len(self.open_positions),
-                    equity=equity,
-                )
-                if ok:
-                    await self._open_position(signal)
-                else:
-                    LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
+                if signal:
+                    equity = await self.db.latest_equity() or 0.0
+                    ok, vetoes = filters.evaluate(
+                        signal,
+                        self.filter_rt,
+                        open_positions=len(self.open_positions),
+                        equity=equity,
+                    )
+                    if ok:
+                        # Prevent re-entrant signals from the same batch of candles
+                        if not any(p["symbol"] == sym for p in self.open_positions.values()):
+                            await self._open_position(signal)
+                    else:
+                        LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
 
         except Exception as e:
             LOG.error("Error processing symbol %s: %s", sym, e)
@@ -870,7 +686,7 @@ class LiveTrader:
             gen = SignalGenerator(sym, self.exchange)
             self.signal_generators[sym] = gen
             asyncio.create_task(gen.warm_up())
-        
+
         await asyncio.sleep(15)
         LOG.info("All signal generators warmed up. Starting main scan loop.")
 
@@ -1104,12 +920,14 @@ class LiveTrader:
         finally:
             # This block runs on normal exit or on cancellation.
             await self.exchange.close()
-            await self.db.pool.close()
+            if self.db.pool:
+                await self.db.pool.close()
+            await self.tg.close() # <-- ADD THIS LINE
             LOG.info("Bot shut down cleanly.")
 
 
 ###############################################################################
-# 9 ▸ ENTRYPOINT ##############################################################
+# 6 ▸ ENTRYPOINT ##############################################################
 ###############################################################################
 
 

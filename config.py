@@ -30,6 +30,7 @@ PRICE_SLOWDOWN_PCT      = 0.01
 RISK_MODE          = "FIXED"     # or "FIXED"
 FIXED_RISK_USDT    = 10.0
 RISK_PCT           = 0.005         # 0.5 %
+SLIPPAGE_BUFFER_PCT = 0.0005
 
 # ── stop / targets ─────────────────────────────────────────────────────────
 SL_ATR_MULT             = 2.5
@@ -109,6 +110,7 @@ OI_MAX_CHANGE_PCT        = 10.0
 
 # ── runtime / misc ────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 60
+TIMEFRAME = '4h' 
 ENTRY_ORDER_TYPE  = "MARKET"        # or "MARKET"
 
 # ─── Re‑entry cool‑down per symbol ──────────────────────────────────────────

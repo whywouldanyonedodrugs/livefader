@@ -4,6 +4,7 @@ from typing import Optional, Deque
 from collections import deque
 import config as cfg
 import logging
+import re
 from . import live_indicators as ta
 
 LOG = logging.getLogger(__name__)
@@ -15,6 +16,24 @@ class Signal:
     atr: float
     rsi: float
 
+def _get_hours_from_timeframe(tf: str) -> float:
+    """Converts timeframe string like '1h', '4h', '1d' to hours."""
+    match = re.match(r"(\d+)(\w)", tf)
+    if not match:
+        return 1.0 # Default to 1 hour if format is unexpected
+    
+    val, unit = int(match.group(1)), match.group(2).lower()
+    
+    if unit == 'm':
+        return val / 60
+    if unit == 'h':
+        return float(val)
+    if unit == 'd':
+        return float(val * 24)
+    if unit == 'w':
+        return float(val * 24 * 7)
+    return 1.0
+
 class SignalGenerator:
 
     RSI_PERIOD = 14
@@ -25,20 +44,21 @@ class SignalGenerator:
         self.exchange = exchange
         self.last_processed_timestamp = 0
 
-        # State for indicators (can be simple values or deques)
+        # State for indicators
         self.ema_fast = 0.0
         self.ema_slow = 0.0
         self.atr = 0.0
         self.rsi = 50.0
+        # --- NEW: State for smoothed RSI ---
+        self.avg_gain = 0.0
+        self.avg_loss = 0.0
 
-        # --- NEW: Deque for historical price data ---
-        # We need enough data for the longest lookback (PRICE_BOOM_PERIOD_H)
-        # The 4h timeframe means we need (PRICE_BOOM_PERIOD_H / 4) candles.
-        boom_candles = int(cfg.PRICE_BOOM_PERIOD_H / 4)
-        self.price_history: Deque[float] = deque(maxlen=boom_candles + 5) # Add buffer
+        hours_per_candle = _get_hours_from_timeframe(cfg.TIMEFRAME)
+        boom_candles = int(cfg.PRICE_BOOM_PERIOD_H / hours_per_candle)
+        
+        self.price_history: Deque[float] = deque(maxlen=boom_candles + 5)
 
-        # For ATR and RSI calculations
-        indicator_deque_len = max(self.RSI_PERIOD, self.ATR_PERIOD) + 1
+        indicator_deque_len = max(self.RSI_PERIOD, self.ATR_PERIOD) + 2 # Need prev_close
         self.highs: Deque[float] = deque(maxlen=indicator_deque_len)
         self.lows: Deque[float] = deque(maxlen=indicator_deque_len)
         self.closes: Deque[float] = deque(maxlen=indicator_deque_len)
@@ -49,25 +69,28 @@ class SignalGenerator:
         """Fetch initial historical data to calculate baseline indicators."""
         LOG.info("Warming up indicators for %s...", self.symbol)
         try:
-            # Fetch enough data for all lookback periods
-            limit = max(cfg.EMA_SLOW + 1, self.price_history.maxlen, self.closes.maxlen)
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, '4h', limit=limit)
+            limit = max(cfg.EMA_SLOW_PERIOD + 1, self.price_history.maxlen, self.closes.maxlen)
+            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, cfg.TIMEFRAME, limit=limit)
 
-            if len(ohlcv) < cfg.EMA_SLOW + 1:
+            if len(ohlcv) < cfg.EMA_SLOW_PERIOD + 1:
                 LOG.warning("Not enough historical data to warm up %s. Disabling.", self.symbol)
                 return
 
-            # Populate all deques and calculate initial indicator values
             all_closes = [c[4] for c in ohlcv]
+            all_highs = [c[2] for c in ohlcv]
+            all_lows = [c[3] for c in ohlcv]
+
             self.price_history.extend(all_closes)
-            self.highs.extend([c[2] for c in ohlcv])
-            self.lows.extend([c[3] for c in ohlcv])
+            self.highs.extend(all_highs)
+            self.lows.extend(all_lows)
             self.closes.extend(all_closes)
 
             self.ema_fast = ta.ema_from_list(all_closes, cfg.EMA_FAST_PERIOD)
             self.ema_slow = ta.ema_from_list(all_closes, cfg.EMA_SLOW_PERIOD)
-            self.atr = ta.atr_from_deques(self.highs, self.lows, self.closes, self.ATR_PERIOD)
-            self.rsi = ta.rsi_from_deque(self.closes, self.RSI_PERIOD)
+            
+            # Use initial calculation methods and store state
+            self.atr = ta.initial_atr(all_highs, all_lows, all_closes, self.ATR_PERIOD)
+            self.rsi, self.avg_gain, self.avg_loss = ta.initial_rsi(all_closes, self.RSI_PERIOD)
 
             self.last_processed_timestamp = ohlcv[-1][0]
             self.is_warmed_up = True
@@ -78,47 +101,46 @@ class SignalGenerator:
     def update_and_check(self, candle: list) -> Optional[Signal]:
         """
         Updates indicators with a new closed candle and checks for a signal.
-        This is the core logic.
         """
         if not self.is_warmed_up or not candle:
             return None
 
         timestamp, _, high, low, close, _ = candle
 
-        # Avoid processing the same candle twice
         if timestamp <= self.last_processed_timestamp:
             return None
 
-        # --- Update deques with new data ---
+        prev_close = self.closes[-1] if self.closes else close
+
         self.price_history.append(close)
         self.highs.append(high)
         self.lows.append(low)
         self.closes.append(close)
 
-        # --- Incrementally or fully update indicators ---
+        # Incrementally update indicators using previous state
         self.ema_fast = ta.next_ema(close, self.ema_fast, cfg.EMA_FAST_PERIOD)
         self.ema_slow = ta.next_ema(close, self.ema_slow, cfg.EMA_SLOW_PERIOD)
-        self.atr = ta.atr_from_deques(self.highs, self.lows, self.closes, self.ATR_PERIOD)
-        self.rsi = ta.rsi_from_deque(self.closes, self.RSI_PERIOD)
+        self.atr = ta.next_atr(self.atr, high, low, close, prev_close, self.ATR_PERIOD)
+        self.rsi, self.avg_gain, self.avg_loss = ta.next_rsi(
+            close, prev_close, self.avg_gain, self.avg_loss, self.RSI_PERIOD
+        )
 
         self.last_processed_timestamp = timestamp
 
-        # --- Check Entry Conditions (from your original scout.py) ---
-        # C1: Price "Boom" Condition
-        boom_periods = int(cfg.PRICE_BOOM_PERIOD_H / 4)
+        # Check Entry Conditions
+        hours_per_candle = _get_hours_from_timeframe(cfg.TIMEFRAME)
+        boom_periods = int(cfg.PRICE_BOOM_PERIOD_H / hours_per_candle)
         if len(self.price_history) < boom_periods + 1:
             return None
         price_then = self.price_history[-boom_periods - 1]
         price_boom = (close / price_then - 1) > cfg.PRICE_BOOM_PCT if price_then > 0 else False
 
-        # C2: Price "Slowdown" Condition
-        slowdown_periods = int(cfg.PRICE_SLOWDOWN_PERIOD_H / 4)
+        slowdown_periods = int(cfg.PRICE_SLOWDOWN_PERIOD_H / hours_per_candle)
         if len(self.price_history) < slowdown_periods + 1:
             return None
         price_recent = self.price_history[-slowdown_periods - 1]
         price_slowdown = abs(close / price_recent - 1) < cfg.PRICE_SLOWDOWN_PCT if price_recent > 0 else False
 
-        # C3: EMA cross condition
         c3_ema_down = self.ema_fast < self.ema_slow
 
         LOG.debug(
