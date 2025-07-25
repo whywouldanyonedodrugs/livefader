@@ -721,7 +721,7 @@ class LiveTrader:
             try:
                 bal = await self._fetch_platform_balance()
                 current_equity = bal["total"]["USDT"]
-                await self.db.snapshot_equity(current_equity)
+                await self.db.snapshot_equity(current_equity, datetime.now(timezone.utc))
 
                 if current_equity > self.peak_equity:
                     self.peak_equity = current_equity
