@@ -31,7 +31,9 @@ from .exchange_proxy import ExchangeProxy
 from .database import DB
 from .telegram import TelegramBot
 
-from pydantic import BaseSettings, Field, ValidationError
+
+from pydantic import Field, ValidationError
+from pydantic_settings import BaseSettings
 
 # ---------------------------  YOUR MODULES  ------------------------------
 import backtest.scout as scout  # async def scan_symbol(sym: str, cfg: dict) -> Optional[Signal]
