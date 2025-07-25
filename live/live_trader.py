@@ -789,35 +789,33 @@ class LiveTrader:
         On startup, load state from DB and reconcile with actual
         exchange positions to detect and handle orphans.
         """
-        LOG.info("Resuming state and reconciling positions...")
-    
+        LOG.info("--> Entering _resume() function...")
+
+        LOG.info("Step 1: Fetching peak equity from DB...")
         peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
         self.peak_equity = float(peak) if peak is not None else 0.0
-        LOG.info("Initial peak equity loaded: $%.2f", self.peak_equity)
+        LOG.info("...Initial peak equity loaded: $%.2f", self.peak_equity)
 
         # 1. Fetch all open positions from the exchange
+        LOG.info("Step 2: Fetching open positions from the EXCHANGE...")
         try:
             exchange_positions = await self.exchange.fetch_positions()
-            # Filter for positions with a non-zero size
             open_exchange_positions = {
                 p['info']['symbol']: p for p in exchange_positions if float(p['info']['size']) > 0
             }
+            LOG.info("...Success! Found %d positions on the exchange.", len(open_exchange_positions))
         except Exception as e:
             LOG.error("Could not fetch exchange positions on startup: %s. Exiting.", e)
-            # This is critical, so we should probably not continue.
             sys.exit(1)
 
         # 2. Fetch all 'OPEN' positions from our database
+        LOG.info("Step 3: Fetching 'OPEN' positions from the DATABASE...")
         db_positions = {r["symbol"]: dict(r) for r in await self.db.fetch_open_positions()}
+        LOG.info("...Success! Found %d 'OPEN' positions in the database.", len(db_positions))
         
         # 3. Reconcile
-        LOG.info(
-            "Found %d positions on exchange and %d 'OPEN' positions in DB.",
-            len(open_exchange_positions), len(db_positions)
-        )
-
+        LOG.info("Step 4: Reconciling DB and exchange positions...")
         # Case A: Position exists on exchange but NOT in our DB (Orphan)
-        # This is the most dangerous case. Close it immediately.
         for symbol, pos_data in open_exchange_positions.items():
             if symbol not in db_positions:
                 msg = (
@@ -827,7 +825,6 @@ class LiveTrader:
                 LOG.warning(msg)
                 await self.tg.send(msg)
                 try:
-                    # Create a market order to close the position
                     side = 'buy' if pos_data['side'] == 'short' else 'sell'
                     size = float(pos_data['info']['size'])
                     await self.exchange.create_market_order(symbol, side, size, params={'reduceOnly': True})
@@ -835,7 +832,6 @@ class LiveTrader:
                     LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
 
         # Case B: Position exists in our DB but NOT on the exchange
-        # This means it was closed while the bot was offline. Mark it as closed.
         for symbol, pos_row in db_positions.items():
             if symbol not in open_exchange_positions:
                 pid = pos_row["id"]
@@ -855,7 +851,6 @@ class LiveTrader:
                 db_size = float(db_pos['size'])
                 ex_size = float(ex_pos['info']['size'])
                 
-                # Use a small tolerance for float comparison
                 if abs(db_size - ex_size) > 1e-9:
                     pid = db_pos["id"]
                     msg = (
@@ -865,18 +860,20 @@ class LiveTrader:
                     )
                     LOG.critical(msg)
                     await self.tg.send(msg)
-                    # Mark in DB and do NOT load into memory for trading
                     await self.db.update_position(pid, status="SIZE_MISMATCH")
-                    # Remove from the list of positions to be loaded
                     del db_positions[symbol]
 
+        LOG.info("...Reconciliation complete.")
+
         # 4. Load the correctly reconciled positions into memory
+        LOG.info("Step 5: Loading final reconciled positions into memory...")
         final_open_rows = await self.db.fetch_open_positions()
         for r in final_open_rows:
             self.open_positions[r["id"]] = dict(r)
-            LOG.info("Successfully resumed and verified open position for %s (ID: %d)", r["symbol"], r["id"])
+            LOG.info("...Successfully resumed and verified open position for %s (ID: %d)", r["symbol"], r["id"])
 
         # load last‑exit timestamps within cool‑down window
+        LOG.info("Step 6: Loading recent exit timestamps for cooldowns...")
         cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS",
                         cfg.SYMBOL_COOLDOWN_HOURS))
         rows = await self.db.pool.fetch(
@@ -885,7 +882,9 @@ class LiveTrader:
             timedelta(hours=cd_h),
         )
         for r in rows:
-            self.last_exit[r["symbol"]] = r["closed_at"] 
+            self.last_exit[r["symbol"]] = r["closed_at"]
+        
+        LOG.info("<-- Exiting _resume() function successfully.")
 
     # ---------------- RUN -----------------------
     async def run(self):
