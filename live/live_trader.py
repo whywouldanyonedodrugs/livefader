@@ -22,8 +22,10 @@ import asyncpg
 import ccxt.async_support as ccxt
 import yaml
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import config as cfg   # <‑‑ your static defaults
+from .. import config as cfg
+from . import indicators as ta
 from . import filters
+from . shared_utils import is_blacklisted
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from .signal_generator import SignalGenerator, Signal
