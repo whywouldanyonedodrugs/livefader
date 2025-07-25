@@ -285,15 +285,7 @@ class _Watcher(FileSystemEventHandler):
 # 6 ▸ DATA CLASSES ###########################################################
 ###############################################################################
 
-
-@dataclasses.dataclass
-class Signal:
-    symbol: str
-    entry: float
-    atr: float
-    rsi: float
-    regime: str
-
+# MAYBE WILL BE USED LATER
 
 ###############################################################################
 # 7 ▸ RISK MANAGER ###########################################################
@@ -344,6 +336,8 @@ class LiveTrader:
         self.open_positions: Dict[int, Dict[str, Any]] = {}  # pid → row dict
         self.signal_generators: Dict[str, SignalGenerator] = {}
         
+        self.peak_equity: float = 0.0
+
         # keeps last‑exit timestamps {symbol: utc_datetime}
         self.last_exit: Dict[str, datetime] = {}
 
@@ -478,7 +472,7 @@ class LiveTrader:
             return
 
         bal = await self._fetch_platform_balance()
-        free_usdt = bal["USDT"]["free"]
+        free_usdt = bal["free"]["USDT"]
         risk_amt = await self._risk_amount(free_usdt)
 
         entry = sig.entry
@@ -565,9 +559,21 @@ class LiveTrader:
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
             await self.tg.send(f"🚀 Opened {sig.symbol} short {size:.3f} @ {entry:.4f}")
-        except Exception as e:  # noqa: BLE001
-            LOG.error("order placement failed %s", e)
+        except Exception as e:
+            LOG.error("Order placement failed for %s (pid %d): %s. Attempting to close.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR")
+            try:
+                # Attempt to close the position immediately to prevent a naked position
+                await self.exchange.create_market_order(
+                    sig.symbol, 'buy', size, params={'reduceOnly': True}
+                )
+                msg = f"🚨 CRITICAL: Failed to set SL/TP for {sig.symbol}. Position has been emergency closed."
+                LOG.warning(msg)
+                await self.tg.send(msg)
+            except Exception as close_e:
+                msg = f"🚨 !!! CRITICAL: NAKED POSITION for {sig.gbol}. Manual intervention required IMMEDIATELY. Error: {close_e}"
+                LOG.critical(msg)
+                await self.tg.send(msg)
 
     # ---------------- MANAGE OPEN POSITIONS -------
     async def _manage_positions_loop(self):
@@ -598,7 +604,7 @@ class LiveTrader:
                 return
 
         # Detect partial TP fill ------------------------------------------------
-        if (not pos["trailing_active"]) and self._cid(pid, "TP1") not in open_cids:
+        if self.cfg.get("PARTIAL_TP_ENABLED", False) and (not pos["trailing_active"]) and self._cid(pid, "TP1") not in open_cids:
             # TP1 gone ⇒ filled
             fill_price = None
             try:
@@ -672,7 +678,7 @@ class LiveTrader:
 
         new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
         is_favorable_move = new_stop < pos["stop_price"]
-        min_move_required = pos["stop_price"] * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
+        min_move_required = price * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
         is_significant_move = (pos["stop_price"] - new_stop) > min_move_required
 
         if first or (is_favorable_move and is_significant_move):
@@ -685,12 +691,18 @@ class LiveTrader:
             # cancel existing trail order if any
             try:
                 await self.exchange.cancel_order_by_client_id(self._cid(pid, "SL_TRAIL"), symbol)
-            except Exception as e:  # noqa: BLE001
-                LOG.warning("Cancel existing trail failed %s", e)
-                # If the order still exists, avoid creating a duplicate
-                orders = await self.exchange.fetch_open_orders(symbol)
-                if any(o.get("clientOrderId") == self._cid(pid, "SL_TRAIL") for o in orders):
-                    return
+            except ccxt.OrderNotFound:
+                # This is the expected outcome if the trail has been moved before.
+                pass
+            except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.DDoSProtection) as e:
+                # If we have a temporary network issue, log it and abort this cycle.
+                # The next loop iteration will retry the trail adjustment.
+                LOG.warning("Trail cancel failed due to network issue for %s: %s. Will retry.", symbol, e)
+                return
+            except Exception as e:
+                # For other unexpected errors, log critically and abort to prevent duplicate orders.
+                LOG.error("Unexpected error cancelling trail for %s: %s. Aborting trail update.", symbol, e)
+                return
             await self.exchange.create_order(
                 symbol, "STOP_MARKET", "buy", qty_left,
                 params={"stopPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL"), 'reduceOnly': True}
@@ -821,7 +833,7 @@ class LiveTrader:
             if not ohlcvs or len(ohlcvs) < 2:
                 return
 
-            last_closed_candle = ohlcvs[0]
+            last_closed_candle = ohlcvs[-1]
 
             close_price = last_closed_candle[4]
             volume = last_closed_candle[5]
@@ -891,12 +903,13 @@ class LiveTrader:
                 current_equity = bal["total"]["USDT"]
                 await self.db.snapshot_equity(current_equity)
 
+                if current_equity > self.peak_equity:
+                    self.peak_equity = current_equity
+
                 # --- Drawdown Kill-Switch Logic ---
                 if self.cfg.get("DD_PAUSE_ENABLED", True) and not self.risk.kill_switch:
-                    # Find the peak equity from our own records
-                    peak_equity = await self.db.pool.fetchval(
-                        "SELECT MAX(equity) FROM equity_snapshots"
-                    )
+                    # Use the cached peak equity value
+                    peak_equity = self.peak_equity
                     if peak_equity and current_equity < peak_equity:
                         drawdown_pct = (peak_equity - current_equity) / peak_equity * 100
                         max_dd_pct = self.cfg.get("DD_MAX_PCT", 10.0)
@@ -958,6 +971,9 @@ class LiveTrader:
         """
         LOG.info("Resuming state and reconciling positions...")
     
+        peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
+        self.peak_equity = float(peak) if peak is not None else 0.0
+        LOG.info("Initial peak equity loaded: $%.2f", self.peak_equity)
 
         # 1. Fetch all open positions from the exchange
         try:
@@ -1011,6 +1027,28 @@ class LiveTrader:
                 await self.db.update_position(
                     pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=0
                 )
+
+        # Case C: Position exists in both. Verify size consistency.
+        for symbol, db_pos in db_positions.items():
+            if symbol in open_exchange_positions:
+                ex_pos = open_exchange_positions[symbol]
+                db_size = float(db_pos['size'])
+                ex_size = float(ex_pos['info']['size'])
+                
+                # Use a small tolerance for float comparison
+                if abs(db_size - ex_size) > 1e-9:
+                    pid = db_pos["id"]
+                    msg = (
+                        f"🚨 SIZE MISMATCH on resume for {symbol} (pid {pid}): "
+                        f"DB size is {db_size}, Exchange size is {ex_size}. "
+                        f"Flagging for manual review."
+                    )
+                    LOG.critical(msg)
+                    await self.tg.send(msg)
+                    # Mark in DB and do NOT load into memory for trading
+                    await self.db.update_position(pid, status="SIZE_MISMATCH")
+                    # Remove from the list of positions to be loaded
+                    del db_positions[symbol]
 
         # 4. Load the correctly reconciled positions into memory
         final_open_rows = await self.db.fetch_open_positions()

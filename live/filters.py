@@ -35,8 +35,8 @@ class Runtime:
     def update_ticker(self, symbol: str, price: float, volume: Optional[float] = None) -> None:
         self._last_px[symbol] = price
 
-        k_fast = 2 / (cfg.FAST_EMA_LEN + 1)
-        k_slow = 2 / (cfg.SLOW_EMA_LEN + 1)
+        k_fast = 2 / (cfg.EMA_FAST_PERIOD + 1)
+        k_slow = 2 / (cfg.EMA_SLOW_PERIOD + 1)
         self._ema_fast[symbol] = (
             price if symbol not in self._ema_fast else self._ema_fast[symbol] + k_fast * (price - self._ema_fast[symbol])
         )
@@ -120,7 +120,7 @@ def evaluate(
     if open_positions >= cfg.MAX_OPEN:
         vetoes.append("MAX_OPEN")
         ok = False
-    if equity < cfg.MIN_EQUITY_USDT:
+    if equity < getattr(cfg, "MIN_EQUITY_USDT", 0):
         vetoes.append("LOW_EQUITY")
         ok = False
 

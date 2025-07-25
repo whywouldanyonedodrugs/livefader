@@ -70,7 +70,10 @@ class ExchangeProxy:
                 def sync_call():
                     return original_attr(*args, **kwargs)
                 return sync_call()
-
+        # Cache the newly created wrapper function on the instance.
+        # The next call to this method will use the cached version
+        # instead of triggering __getattr__ again.
+        setattr(self, name, wrapper)
         return wrapper
 
     async def close(self):

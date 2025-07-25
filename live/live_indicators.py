@@ -102,4 +102,15 @@ def atr_from_deques(highs: Deque[float], lows: Deque[float], closes: Deque[float
     if not true_ranges:
         return 0.0
 
+    if len(true_ranges) < period:
+        return 0.0 # Not enough TRs to calculate
+
+    atr = sum(true_ranges[:period]) / period
+    
+    # Apply smoothing for subsequent values to get the most recent ATR
+    for i in range(period, len(true_ranges)):
+        atr = (atr * (period - 1) + true_ranges[i]) / period
+        
+    return atr
+
     return sum(true_ranges) / len(true_ranges)

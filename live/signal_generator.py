@@ -35,7 +35,7 @@ class SignalGenerator:
         # We need enough data for the longest lookback (PRICE_BOOM_PERIOD_H)
         # The 4h timeframe means we need (PRICE_BOOM_PERIOD_H / 4) candles.
         boom_candles = int(cfg.PRICE_BOOM_PERIOD_H / 4)
-        self.closes: Deque[float] = deque(maxlen=boom_candles + 5) # Add buffer
+        self.price_history: Deque[float] = deque(maxlen=boom_candles + 5) # Add buffer
 
         # For ATR and RSI calculations
         indicator_deque_len = max(self.RSI_PERIOD, self.ATR_PERIOD) + 1
@@ -64,8 +64,8 @@ class SignalGenerator:
             self.lows.extend([c[3] for c in ohlcv])
             self.closes.extend(all_closes)
 
-            self.ema_fast = ta.ema_from_list(all_closes, cfg.EMA_FAST)
-            self.ema_slow = ta.ema_from_list(all_closes, cfg.EMA_SLOW)
+            self.ema_fast = ta.ema_from_list(all_closes, cfg.EMA_FAST_PERIOD)
+            self.ema_slow = ta.ema_from_list(all_closes, cfg.EMA_SLOW_PERIOD)
             self.atr = ta.atr_from_deques(self.highs, self.lows, self.closes, self.ATR_PERIOD)
             self.rsi = ta.rsi_from_deque(self.closes, self.RSI_PERIOD)
 
@@ -96,8 +96,8 @@ class SignalGenerator:
         self.closes.append(close)
 
         # --- Incrementally or fully update indicators ---
-        self.ema_fast = ta.next_ema(close, self.ema_fast, cfg.EMA_FAST)
-        self.ema_slow = ta.next_ema(close, self.ema_slow, cfg.EMA_SLOW)
+        self.ema_fast = ta.next_ema(close, self.ema_fast, cfg.EMA_FAST_PERIOD)
+        self.ema_slow = ta.next_ema(close, self.ema_slow, cfg.EMA_SLOW_PERIOD)
         self.atr = ta.atr_from_deques(self.highs, self.lows, self.closes, self.ATR_PERIOD)
         self.rsi = ta.rsi_from_deque(self.closes, self.RSI_PERIOD)
 
