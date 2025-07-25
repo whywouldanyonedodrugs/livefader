@@ -1,5 +1,5 @@
 """
-live_trader.py – v1.2.1 (CLOSED‑LOOP, indentation + minor bug‑fix release)
+live_trader.py – v1.2.1
 ===========================================================================
 
 """
@@ -21,13 +21,13 @@ import aiohttp
 import asyncpg
 import ccxt.async_support as ccxt
 import yaml
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import config as cfg   # <‑‑ your static defaults
 import filters
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from .signal_generator import SignalGenerator, Signal
 from .exchange_proxy import ExchangeProxy
-from . import cache_manager
 
 from pydantic import BaseSettings, Field, ValidationError
 
@@ -123,19 +123,36 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
 CREATE INDEX IF NOT EXISTS idx_positions_symbol_status ON positions (symbol, status);
 CREATE INDEX IF NOT EXISTS idx_positions_closed_at ON positions (closed_at);
 """
+DB_RETRYABLE_EXCEPTIONS = (
+    asyncpg.exceptions.InterfaceError,       # Connection errors
+    asyncpg.exceptions.DeadlockDetectedError,  # Deadlocks
+    asyncpg.exceptions.SerializationError,     # Transaction conflicts
+)
 
+# Create a retry decorator for database operations
+db_retry = retry(
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type(DB_RETRYABLE_EXCEPTIONS),
+    before_sleep=lambda state: LOG.warning(
+        "Retrying DB call %s due to %s. Attempt #%d",
+        state.fn.__name__, state.outcome.exception(), state.attempt_number
+    )
+)
 
 class DB:
     def __init__(self, dsn: str):
         self._dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None
 
+    @db_retry
     async def init(self):
         self.pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
             await conn.execute(TABLES_SQL)
 
     # ---------- helper wrappers ------------------------------------------
+    @db_retry
     async def insert_position(self, data: Dict[str, Any]) -> int:
         q = """INSERT INTO positions(symbol,side,size,entry_price,stop_price,
                  trailing_active,atr,status,opened_at)
@@ -153,12 +170,14 @@ class DB:
             data["opened_at"],
         )
 
+    @db_retry
     async def update_position(self, pid: int, **fields):
         sets = ",".join(f"{k}=${i+2}" for i, k in enumerate(fields))
         await self.pool.execute(
             f"UPDATE positions SET {sets} WHERE id=$1", pid, *fields.values()
         )
 
+    @db_retry
     async def add_fill(self, pid: int, fill_type: str, price: Optional[float], qty: float):
         await self.pool.execute(
             "INSERT INTO fills(position_id,fill_type,price,qty,ts) VALUES($1,$2,$3,$4,$5)",
@@ -169,14 +188,17 @@ class DB:
             datetime.now(timezone.utc),
         )
 
+    @db_retry
     async def fetch_open_positions(self) -> List[asyncpg.Record]:
         return await self.pool.fetch("SELECT * FROM positions WHERE status='OPEN'")
 
+    @db_retry
     async def latest_equity(self) -> Optional[float]:
         return await self.pool.fetchval(
             "SELECT equity FROM equity_snapshots ORDER BY ts DESC LIMIT 1"
         )
 
+    @db_retry
     async def snapshot_equity(self, equity: float):
         await self.pool.execute(
             "INSERT INTO equity_snapshots VALUES($1,$2) ON CONFLICT DO NOTHING",
@@ -184,6 +206,7 @@ class DB:
             equity,
         )
 
+    @db_retry
     async def batch_insert_fills(self, fills_data: list[tuple]):
         """
         Inserts multiple fill records in a single database transaction.
@@ -318,8 +341,6 @@ class LiveTrader:
         self.exchange = ExchangeProxy(self._init_ccxt())
 
         self.symbols = self._load_symbols()
-        for sym, d in self._load_listing_dates().items():
-            self.filter_rt.set_listing_date(sym, d)
         self.open_positions: Dict[int, Dict[str, Any]] = {}  # pid → row dict
         self.signal_generators: Dict[str, SignalGenerator] = {}
         
@@ -329,8 +350,6 @@ class LiveTrader:
         # hot‑reload on file edit
         _Watcher(CONFIG_PATH, self._reload_cfg)
         _Watcher(SYMBOLS_PATH, self._reload_symbols)
-
-        cache_manager.init_cache()
 
         self.paused = False
         self.tasks: List[asyncio.Task] = []
@@ -375,31 +394,58 @@ class LiveTrader:
     # ------------------------------------------------------------------#
     #                 LISTING‑DATE CACHE (JSON on disk)                 #
     # ------------------------------------------------------------------#
-    @staticmethod
-    def _load_listing_dates() -> Dict[str, datetime.date]:
+    async def _load_listing_dates(self) -> Dict[str, datetime.date]:
         """
         Returns {symbol: first‑trade‑date}.
         Tries listing_dates.json first; otherwise queries exchange once and caches.
         """
         if LISTING_PATH.exists():
             import datetime as _dt
-
             raw = json.loads(LISTING_PATH.read_text())
             return {s: _dt.date.fromisoformat(ts) for s, ts in raw.items()}
 
-        ex = ccxt_sync.bybit()
-        out = {}
-        for sym in SYMBOLS_PATH.read_text().split():
+        LOG.info("listing_dates.json not found. Fetching from exchange (one-time operation)...")
+
+        async def fetch_date(sym):
             try:
-                candles = ex.fetch_ohlcv(sym, timeframe="1d", limit=1, since=0)
+                # Fetch the very first daily candle to get the listing date
+                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1, since=0)
                 if candles:
-                    out[sym] = datetime.utcfromtimestamp(candles[0][0] / 1000).date()
-            except Exception:
-                continue
+                    # CCXT returns timestamp in milliseconds
+                    ts = datetime.fromtimestamp(candles[0][0] / 1000, tz=timezone.utc)
+                    return sym, ts.date()
+            except Exception as e:
+                LOG.warning("Could not fetch listing date for %s: %s", sym, e)
+            return sym, None
+
+        tasks = [fetch_date(sym) for sym in self.symbols]
+        results = await asyncio.gather(*tasks)
+        
+        out = {sym: dt for sym, dt in results if dt}
+
+        # Cache the results to disk to avoid this on next startup
         LISTING_PATH.write_text(
             json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2)
         )
+        LOG.info("Saved %d listing dates to %s", len(out), LISTING_PATH)
         return out
+
+    async def _fetch_platform_balance(self) -> dict:
+        """
+        Fetches balance from the exchange, using the correct method
+        based on the configured account type (STANDARD vs UNIFIED).
+        """
+        account_type = self.cfg.get("BYBIT_ACCOUNT_TYPE", "STANDARD").upper()
+        params = {}
+        if account_type == "UNIFIED":
+            params['accountType'] = 'UNIFIED'
+        
+        try:
+            return await self.exchange.fetch_balance(params=params)
+        except Exception as e:
+            LOG.error("Failed to fetch %s account balance: %s", account_type, e)
+            # Return a zeroed-out structure on failure to prevent crashes downstream
+            return {"total": {"USDT": 0.0}, "free": {"USDT": 0.0}}
 
     # ---------------- POSITION SIZING ---------------
     async def _risk_amount(self, free_usdt: float) -> float:
@@ -408,34 +454,10 @@ class LiveTrader:
             return free_usdt * self.cfg["RISK_PCT"]
         return float(self.cfg["FIXED_RISK_USDT"])
 
-    _atr_cache: Dict[str, Tuple[float, float]] = {}  # symbol → (atr, monotonic_ts)
 
     # ────────────────────────────────────────────────────────────────────────
     #   Quick ATR(14, 1h) helper with 2‑minute cache
     # ────────────────────────────────────────────────────────────────────────
-    async def _fresh_atr(self, symbol: str) -> Optional[float]:
-        now = asyncio.get_event_loop().time()
-        if symbol in self._atr_cache and now - self._atr_cache[symbol][1] < 120:
-            return self._atr_cache[symbol][0]
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, "1h", limit=15)
-            if len(ohlcv) < 2:
-                return None
-            import pandas as _pd
-            import indicators as ta
-
-            df = _pd.DataFrame(
-                ohlcv, columns=["ts", "open", "high", "low", "close", "vol"]
-            )
-            atr_val = float(ta.atr(df)["atr"].iloc[-1])
-            self._atr_cache[symbol] = (atr_val, now)
-
-            cache_manager.save_atr_to_cache(symbol, atr_val, now)
-
-            return atr_val
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("ATR fetch failed for %s: %s", symbol, e)
-            return None
 
     # ---------------- ORDER TAGS ------------------
     @staticmethod
@@ -447,19 +469,20 @@ class LiveTrader:
         # skip if already in trade or cooling‑down
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
             return
+
         cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
         last_x = self.last_exit.get(sig.symbol)
-        if last_x and datetime.utcnow() - last_x < timedelta(hours=cd_h):
+        if last_x and datetime.now(timezone.utc) - last_x < timedelta(hours=cd_h): # MODIFIED
             LOG.debug("Cool‑down veto on %s (%.1f h left)", sig.symbol,
-                      (timedelta(hours=cd_h) - (datetime.utcnow() - last_x)).total_seconds() / 3600)
+                    (timedelta(hours=cd_h) - (datetime.now(timezone.utc) - last_x)).total_seconds() / 3600) # MODIFIED
             return
 
-        bal = await self.exchange.fetch_balance()
+        bal = await self._fetch_platform_balance()
         free_usdt = bal["USDT"]["free"]
         risk_amt = await self._risk_amount(free_usdt)
 
         entry = sig.entry
-        atr   = await self._fresh_atr(sig.symbol) or sig.atr
+        atr   = sig.atr
 
         stop = entry + self.cfg["SL_ATR_MULT"] * atr
         stop_dist = abs(entry - stop)
@@ -500,11 +523,11 @@ class LiveTrader:
 
         # time‑based exit deadline
         exit_deadline = (
-            datetime.utcnow() + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", cfg.TIME_EXIT_DAYS))
+            datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", cfg.TIME_EXIT_DAYS)) # MODIFIED
             if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED)
             else None
         )
-       
+
         now = datetime.now(timezone.utc)
         pid = await self.db.insert_position({
             "symbol": sig.symbol,
@@ -528,7 +551,7 @@ class LiveTrader:
             # initial SL
             await self.exchange.create_order(
                 sig.symbol, "STOP_MARKET", "buy", size,
-                params={"stopPrice": stop, "clientOrderId": self._cid(pid, "SL")}
+                params={"stopPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True}
             )
             # partial TP
             if self.cfg.get("PARTIAL_TP_ENABLED", True):
@@ -536,7 +559,7 @@ class LiveTrader:
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
                 await self.exchange.create_order(
                     sig.symbol, "TAKE_PROFIT_MARKET", "buy", qty,
-                    params={"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1")}
+                    params={"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True}
                 )
             await self.db.update_position(pid, status="OPEN")
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
@@ -569,11 +592,11 @@ class LiveTrader:
         # ── TIME‑BASED HARD EXIT ──────────────────────────────────────────
         if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
             ddl = pos.get("exit_deadline")
-            if ddl and datetime.utcnow() >= ddl:
+            if ddl and datetime.now(timezone.utc) >= ddl: # MODIFIED
                 LOG.info("Time‑exit firing on %s (pid %d)", symbol, pid)
                 await self._force_close_position(pid, pos, tag="TIME_EXIT")
                 return
-       
+
         # Detect partial TP fill ------------------------------------------------
         if (not pos["trailing_active"]) and self._cid(pid, "TP1") not in open_cids:
             # TP1 gone ⇒ filled
@@ -633,11 +656,12 @@ class LiveTrader:
                 qty_left = pos["size"] * (1 - self.cfg["PARTIAL_TP_PCT"])
 
                 LOG.info(f"Placing final TP for {symbol} (pos {pid}) at {final_tp_price:.4f}")
-                
+
                 await self.exchange.create_order(
                     symbol, "TAKE_PROFIT_MARKET", "buy", qty_left,
-                    params={"triggerPrice": final_tp_price, "clientOrderId": self._cid(pid, "TP2")}
-                )
+                    params={"triggerPrice": final_tp_price, "clientOrderId": self._cid(pid, "TP2"), 'reduceOnly': True}
+                )                
+
             except Exception as e:
                 LOG.error(f"Failed to place final TP2 order for {pid}: {e}")
 
@@ -646,9 +670,7 @@ class LiveTrader:
         price = (await self.exchange.fetch_ticker(symbol))["last"]
         atr = pos["atr"]
 
-
-        
-        new_stop = price + self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
+        new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
         is_favorable_move = new_stop < pos["stop_price"]
         min_move_required = pos["stop_price"] * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
         is_significant_move = (pos["stop_price"] - new_stop) > min_move_required
@@ -671,39 +693,96 @@ class LiveTrader:
                     return
             await self.exchange.create_order(
                 symbol, "STOP_MARKET", "buy", qty_left,
-                params={"stopPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL")}
+                params={"stopPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL"), 'reduceOnly': True}
             )
             await self.db.update_position(pid, stop_price=new_stop)
             pos["stop_price"] = new_stop
             LOG.info("Trail updated %s to %.4f", symbol, new_stop)
 
+
     async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
+        exit_price = None
+        exit_qty = 0.0
+        closing_order_type = "UNKNOWN_CLOSE"
+
+        # Determine which order closed the position and get its fill price
+        active_stop_cid = self._cid(pid, "SL_TRAIL") if pos["trailing_active"] else self._cid(pid, "SL")
+        cids_to_check = [active_stop_cid]
+        if pos["trailing_active"] and self.cfg.get("FINAL_TP_ENABLED", False):
+            cids_to_check.append(self._cid(pid, "TP2"))
+
+        for cid in cids_to_check:
+            try:
+                order = await self.exchange.fetch_order_by_client_id(cid, symbol)
+                # Check if the order was filled
+                if order and order.get('status') == 'closed' and order.get('filled', 0) > 0:
+                    exit_price = order.get('average') or order.get('price')
+                    exit_qty = order['filled']
+                    closing_order_type = "TP2" if "TP2" in cid else "SL"
+                    LOG.info(f"Position {pid} closed by order {cid} at avg price {exit_price}")
+                    break  # Found the closing order
+            except ccxt.OrderNotFound:
+                # This is expected if this order wasn't the one that got filled
+                continue
+            except Exception as e:
+                LOG.warning(f"Could not fetch closing order {cid} for PnL calc: {e}")
+
+        # Fallback to ticker price if we couldn't get the fill price
+        if not exit_price:
+            LOG.warning(f"Could not determine exact fill price for {pid}. Using last market price for PnL.")
+            ticker = await self.exchange.fetch_ticker(symbol)
+            exit_price = ticker["last"]
+            # Estimate exit quantity based on position state
+            exit_qty = (
+                pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
+                if pos["trailing_active"] else pos["size"]
+            )
+
+        # Ensure any other related orders are cancelled
+        # 1. Define all possible clientOrderIds for this position that might still be open
+        cids_to_cleanup = []
+        if pos["trailing_active"]:
+            # If trailing was active, the final TP (TP2) and the last trail SL might be open
+            if self.cfg.get("FINAL_TP_ENABLED", False):
+                cids_to_cleanup.append(self._cid(pid, "TP2"))
+            cids_to_cleanup.append(self._cid(pid, "SL_TRAIL"))
+        else:
+            # If it never trailed, the initial SL and TP1 might be open
+            cids_to_cleanup.append(self._cid(pid, "SL"))
+            if self.cfg.get("PARTIAL_TP_ENABLED", True):
+                cids_to_cleanup.append(self._cid(pid, "TP1"))
         
+        # 2. Fetch open orders and find the exchange IDs to cancel
         try:
+            open_orders = await self.exchange.fetch_open_orders(symbol)
+            order_ids_to_cancel = [
+                o['id'] for o in open_orders 
+                if o.get('clientOrderId') in cids_to_cleanup
+            ]
 
-            if pos["trailing_active"]:
-                await self.exchange.cancel_order_by_client_id(self._cid(pid, "TP2"), symbol)
-            active_stop_cid = self._cid(pid, "SL_TRAIL") if pos["trailing_active"] else self._cid(pid, "SL")
-            await self.exchange.cancel_order_by_client_id(active_stop_cid, symbol)
-        except ccxt.OrderNotFound:
-            pass
+            # 3. Batch-cancel the identified orders in a single request
+            if order_ids_to_cancel:
+                LOG.info(f"Batch-cancelling {len(order_ids_to_cancel)} remaining orders for position {pid}.")
+                await self.exchange.cancel_orders(order_ids_to_cancel, symbol)
+
         except Exception as e:
-            LOG.warning(f"Could not clean up all orders for closed position {pid}: {e}")
+            LOG.warning(f"Precise order cleanup for position {pid} failed: {e}. Falling back to cancel_all_orders for safety.")
+            # Fallback to ensure the symbol is clear of any stray orders
+            await self.exchange.cancel_all_orders(symbol)
 
-
-        last_price = (await self.exchange.fetch_ticker(symbol))["last"]
-        exit_qty = (
-            pos["size"] * (1 - self.cfg["PARTIAL_TP_PCT"])
-            if pos["trailing_active"] else pos["size"]
-        )
-        pnl = (pos["entry_price"] - last_price) * exit_qty  # short pnl
+        # Calculate PnL with the best available price and finalize in DB
+        pnl = (pos["entry_price"] - exit_price) * exit_qty
         await self.db.update_position(
             pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl
         )
+        await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty)
         await self.risk.on_trade_close(pnl, self.tg)
+        
         del self.open_positions[pid]
-        await self.tg.send(f"✅ {symbol} position closed. PnL ≈ {pnl:.2f} USDT")
+        self.last_exit[symbol] = datetime.now(timezone.utc)
+        await self.tg.send(f"✅ {symbol} position closed. PnL ≈ {pnl:.2f} USDT")
+
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
         """Market‑closes the remaining leg, cancels all orders, finalises DB."""
@@ -721,7 +800,7 @@ class LiveTrader:
         )
         await self.db.add_fill(pid, tag, last_price, pos["size"])
         await self.risk.on_trade_close(pnl, self.tg)
-        self.last_exit[symbol] = datetime.utcnow()
+        self.last_exit[symbol] = datetime.now(timezone.utc)
         del self.open_positions[pid]
         await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
@@ -743,6 +822,10 @@ class LiveTrader:
                 return
 
             last_closed_candle = ohlcvs[0]
+
+            close_price = last_closed_candle[4]
+            volume = last_closed_candle[5]
+            self.filter_rt.update_ticker(sym, close_price, volume)
 
             # Let the generator process it and check for a signal
             signal = generator.update_and_check(last_closed_candle)
@@ -804,7 +887,7 @@ class LiveTrader:
     async def _equity_loop(self):
         while True:
             try:
-                bal = await self.exchange.fetch_balance()
+                bal = await self._fetch_platform_balance()
                 current_equity = bal["total"]["USDT"]
                 await self.db.snapshot_equity(current_equity)
 
@@ -874,8 +957,7 @@ class LiveTrader:
         exchange positions to detect and handle orphans.
         """
         LOG.info("Resuming state and reconciling positions...")
-        
-        self._atr_cache = cache_manager.load_atr_from_cache()
+    
 
         # 1. Fetch all open positions from the exchange
         try:
@@ -945,7 +1027,7 @@ class LiveTrader:
             timedelta(hours=cd_h),
         )
         for r in rows:
-            self.last_exit[r["symbol"]] = r["closed_at"].replace(tzinfo=None)
+            self.last_exit[r["symbol"]] = r["closed_at"] 
 
     # ---------------- RUN -----------------------
     async def run(self):
@@ -960,6 +1042,11 @@ class LiveTrader:
         except Exception as e:
             LOG.error("Could not load exchange market data: %s. Exiting.", e)
             return
+
+        LOG.info("Loading symbol listing dates...")
+        listing_dates = await self._load_listing_dates()
+        for sym, d in listing_dates.items():
+            self.filter_rt.set_listing_date(sym, d)
 
         await self._resume()
         await self.tg.send("🤖 Bot online v1.2.1")
@@ -1019,8 +1106,3 @@ async def scan_symbol(sym: str, cfg: dict):
     if scan_single is None:
         raise NotImplementedError("scan_single() not found in scout module")
     return await scan_single(sym, cfg)
-
-
-###############################################################################
-# TODO – WebSocket order‑stream implementation (ccxt.pro) for instant fills ###
-###############################################################################
