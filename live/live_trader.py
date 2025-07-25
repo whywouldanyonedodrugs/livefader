@@ -23,13 +23,13 @@ import ccxt.async_support as ccxt
 import yaml
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import config as cfg   # <‑‑ your static defaults
-import filters
+from . import filters
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
-from live.signal_generator import SignalGenerator, Signal
-from live.exchange_proxy import ExchangeProxy
-from live.database import DB
-from live.telegram import TelegramBot
+from .signal_generator import SignalGenerator, Signal
+from .exchange_proxy import ExchangeProxy
+from .database import DB
+from .telegram import TelegramBot
 
 from pydantic import BaseSettings, Field, ValidationError
 
