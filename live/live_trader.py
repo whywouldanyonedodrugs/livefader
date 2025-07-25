@@ -686,12 +686,18 @@ class LiveTrader:
         and triggers trades.
         """
         # --- One-time setup: Instantiate and warm up a generator for each symbol ---
+        LOG.info("Starting signal generator warm-up for %d symbols...", len(self.symbols))
+        
+        warmup_tasks = []
         for sym in self.symbols:
             gen = SignalGenerator(sym, self.exchange)
             self.signal_generators[sym] = gen
-            asyncio.create_task(gen.warm_up())
+            # Add the warmup coroutine to a list, don't create a task yet
+            warmup_tasks.append(gen.warm_up())
 
-        await asyncio.sleep(15)
+        # Now, run all warmup tasks concurrently and wait for them all to complete
+        await asyncio.gather(*warmup_tasks)
+        
         LOG.info("All signal generators warmed up. Starting main scan loop.")
 
         # --- The main concurrent polling logic ---
@@ -701,18 +707,12 @@ class LiveTrader:
                     await asyncio.sleep(5)
                     continue
 
-                # 1. Create a list of tasks, one for each symbol.
-                #    This does NOT run them yet.
                 tasks = [self._fetch_and_process_symbol(sym) for sym in self.symbols]
-                
-                # 2. Run all tasks concurrently and wait for them all to complete.
-                #    This is the key to the performance improvement.
                 await asyncio.gather(*tasks)
 
             except Exception as e:
                 LOG.error("Error in main signal loop: %s", e)
 
-            # Wait for a configurable interval before the next full scan.
             await asyncio.sleep(self.cfg.get("SCAN_INTERVAL_SEC", 60))
 
     # ---------------- EQUITY SNAPSHOT ----------
