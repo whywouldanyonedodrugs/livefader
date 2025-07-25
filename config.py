@@ -46,6 +46,10 @@ TRAIL_MIN_MOVE_PCT      = 0.001
 TIME_EXIT_ENABLED       = True     # set False to disable
 TIME_EXIT_DAYS          = 10         # close runner after N days
 
+# --- Coin Age Filter (Applied in filters.py) ---
+MIN_COIN_AGE_DAYS = 14  # Min days since listing
+MAX_COIN_AGE_DAYS = 1825 # Max days since listing (e.g., 5 years)
+
 # --- Structural Trend Filter (Long-Term) ---
 STRUCTURAL_TREND_DAYS    = 30
 STRUCTURAL_TREND_RET_PCT = 0.01
@@ -68,6 +72,7 @@ MIN_ATR_PCT               = 0.005 # Min ATR as a percentage of price
 MAX_OPEN            = 30          # max concurrent positions
 MAX_LOSS_STREAK     = 5
 KILL_EQUITY_LEVEL   = 90.0        # USDT
+MIN_EQUITY_USDT     = 100.0
 MAX_LEVERAGE        = 10
 MIN_NOTIONAL        = 0.01         # exchange min order size
 MIN_STOP_DIST_USD   = 0.1
