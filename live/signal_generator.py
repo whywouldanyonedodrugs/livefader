@@ -109,6 +109,20 @@ class SignalGenerator:
             df_hr = pd.DataFrame(hr_ohlc_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_day = pd.DataFrame(day_ohlc_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
+            # ── Strip the still‑forming candle (volume == 0 or NaNs) ─────────────────────
+            for _df in (df_ema, df_hr, df_day):
+                if _df.iloc[-1]['volume'] == 0 or _df.iloc[-1].isna().any():
+                    _df.drop(index=_df.index[-1], inplace=True)
+
+            # ── Calculate indicators and pick the last **non‑NaN** value ────────────────
+            rsi_series = ta.rsi(df_hr['close'], self.rsi_period).dropna()
+            atr_series = ta.atr(df_hr,            self.atr_period).dropna()
+            adx_series = ta.adx(df_hr,            self.adx_period).dropna()
+
+            self.rsi = rsi_series.iloc[-1] if not rsi_series.empty else np.nan
+            self.atr = atr_series.iloc[-1] if not atr_series.empty else np.nan
+            self.adx = adx_series.iloc[-1] if not adx_series.empty else np.nan
+
             # --- Calculate Indicators ---
             self.ema_fast = ta.ema(df_ema['close'], cfg.EMA_FAST_PERIOD).iloc[-1]
             self.ema_slow = ta.ema(df_ema['close'], cfg.EMA_SLOW_PERIOD).iloc[-1]
