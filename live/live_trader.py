@@ -183,6 +183,9 @@ class LiveTrader:
                 "apiKey": self.settings.bybit_api_key,
                 "secret": self.settings.bybit_api_secret,
                 "enableRateLimit": True,
+                "options": {
+                    "defaultType": "swap",  # This is the critical line
+                },
             }
         )
         ex.urls["api"] = {"public": url, "private": url}
