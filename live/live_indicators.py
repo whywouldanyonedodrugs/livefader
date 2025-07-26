@@ -130,3 +130,44 @@ def next_atr(prev_atr: float, high: float, low: float, close: float, prev_close:
     # If this is the first calculation, prev_atr might be a simple average.
     # The formula remains the same for subsequent calculations.
     return (prev_atr * (period - 1) + tr) / period
+
+# --- ADX (Average Directional Index) --------------------------------------
+def _tr(high, low, prev_close):
+    return max(high - low, abs(high - prev_close), abs(low - prev_close))
+
+def initial_adx(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return 0.0, 0.0          # adx, prev_dmi
+
+    trs  = [_tr(h, l, closes[i-1]) for i, (h, l) in enumerate(zip(highs[1:], lows[1:]), start=1)]
+    plus_dm  = [max(0, highs[i]   - highs[i-1]) for i in range(1, len(highs))]
+    minus_dm = [max(0, lows[i-1]  - lows[i])    for i in range(1, len(lows))]
+
+    tr_sma   = sum(trs[:period]) / period
+    plus_sma = sum(plus_dm[:period]) / period
+    minus_sma= sum(minus_dm[:period]) / period
+
+    def dx(p,m,tr): 
+        if p+m == 0: return 0
+        return abs(p - m) / (p + m) * 100
+
+    dxs = [dx(plus_dm[i], minus_dm[i], trs[i]) for i in range(period, len(trs))]
+    adx = sum(dxs[:period]) / period if dxs else 0
+    return adx, (plus_sma, minus_sma, tr_sma)
+
+def next_adx(high, low, close, prev_close, prev_state, period=14):
+    prev_plus, prev_minus, prev_tr = prev_state
+    tr   = _tr(high, low, prev_close)
+    p_dm = max(0, high - prev_close)
+    m_dm = max(0, prev_close - low)
+
+    plus = (prev_plus  * (period-1) + p_dm) / period
+    minus= (prev_minus * (period-1) + m_dm) / period
+    tr_s = (prev_tr    * (period-1) + tr  ) / period
+
+    if plus + minus == 0:
+        return 0.0, (plus, minus, tr_s)
+
+    dx  = abs(plus - minus) / (plus + minus) * 100
+    adx = (prev_state[0] * (period-1) + dx) / period
+    return adx, (plus, minus, tr_s)
