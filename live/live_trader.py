@@ -169,7 +169,7 @@ class LiveTrader:
         self.paused = False
         self.tasks: List[asyncio.Task] = []
         self.api_semaphore = asyncio.Semaphore(20)
-
+        self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock) # ADD THIS
     # ---------------- HELPERS -------------------
     def _init_ccxt(self):
         url = (
@@ -431,7 +431,7 @@ class LiveTrader:
                 LOG.warning("Failed to fetch TP1 fill price %s", e)
 
             await self.db.add_fill(
-                pid, "TP1", fill_price, pos["size"] * self.cfg["PARTIAL_TP_PCT"]
+                pid, "TP1", fill_price, pos["size"] * self.cfg["PARTIAL_TP_PCT"], datetime.now(timezone.utc)
             )
             await self.db.update_position(pid, trailing_active=True)
             pos["trailing_active"] = True
@@ -601,16 +601,29 @@ class LiveTrader:
             await self.exchange.cancel_all_orders(symbol)
 
         # Calculate PnL with the best available price and finalize in DB
-        pnl = (pos["entry_price"] - exit_price) * exit_qty
+        await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, datetime.now(timezone.utc))
+
+        # Fetch ALL fills for this position to calculate total PnL accurately
+        all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
+        total_pnl = 0
+        entry_price = pos["entry_price"]
+        for fill in all_fills:
+            if fill['price'] is not None and fill['qty'] is not None:
+                total_pnl += (entry_price - float(fill['price'])) * float(fill['qty'])
+
         await self.db.update_position(
-            pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl
+            pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=total_pnl
         )
-        await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty)
-        await self.risk.on_trade_close(pnl, self.tg)
+        await self.risk.on_trade_close(total_pnl, self.tg)
         
         del self.open_positions[pid]
         self.last_exit[symbol] = datetime.now(timezone.utc)
-        await self.tg.send(f"✅ {symbol} position closed. PnL ≈ {pnl:.2f} USDT")
+        await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
+
+        # The original finalization logic is now moved here or handled above.
+        # Note: The original call to add_fill, risk.on_trade_close, etc., are removed from here
+        # as they are now handled in the new block above.
+        return # Add a return to ensure the old code path is not executed.
 
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
@@ -627,7 +640,7 @@ class LiveTrader:
         await self.db.update_position(
             pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl
         )
-        await self.db.add_fill(pid, tag, last_price, pos["size"])
+        await self.db.add_fill(pid, tag, last_price, pos["size"], datetime.now(timezone.utc))
         await self.risk.on_trade_close(pnl, self.tg)
         self.last_exit[symbol] = datetime.now(timezone.utc)
         del self.open_positions[pid]
@@ -642,42 +655,44 @@ class LiveTrader:
         if not generator or not generator.is_warmed_up:
             return
 
-        try:
-            # Fetch all candles since the last one we processed
-            async with self.api_semaphore:
-                # Add 1ms to `since` to avoid fetching the same candle again
-                ohlcvs = await self.exchange.fetch_ohlcv(
-                    sym, cfg.TIMEFRAME, since=generator.last_processed_timestamp + 1, limit=200
-                )
-            
-            if not ohlcvs:
-                return
-
-            # Process each new candle in sequence
-            for candle in ohlcvs:
-                close_price = candle[4]
-                volume = candle[5]
-                self.filter_rt.update_ticker(sym, close_price, volume)
-
-                signal = generator.update_and_check(candle)
-
-                if signal:
-                    equity = await self.db.latest_equity() or 0.0
-                    ok, vetoes = filters.evaluate(
-                        signal,
-                        self.filter_rt,
-                        open_positions=len(self.open_positions),
-                        equity=equity,
+        # Lock this symbol to prevent race conditions on order placement
+        async with self.symbol_locks[sym]:
+            try:
+                # Fetch all candles since the last one we processed
+                async with self.api_semaphore:
+                    # Add 1ms to `since` to avoid fetching the same candle again
+                    ohlcvs = await self.exchange.fetch_ohlcv(
+                        sym, cfg.TIMEFRAME, since=generator.last_processed_timestamp + 1, limit=200
                     )
-                    if ok:
-                        # Prevent re-entrant signals from the same batch of candles
-                        if not any(p["symbol"] == sym for p in self.open_positions.values()):
-                            await self._open_position(signal)
-                    else:
-                        LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
+                
+                if not ohlcvs:
+                    return
 
-        except Exception as e:
-            LOG.error("Error processing symbol %s: %s", sym, e)
+                # Process each new candle in sequence
+                for candle in ohlcvs:
+                    close_price = candle[4]
+                    volume = candle[5]
+                    self.filter_rt.update_ticker(sym, close_price, volume)
+
+                    signal = generator.update_and_check(candle)
+
+                    if signal:
+                        equity = await self.db.latest_equity() or 0.0
+                        ok, vetoes = filters.evaluate(
+                            signal,
+                            self.filter_rt,
+                            open_positions=len(self.open_positions),
+                            equity=equity,
+                        )
+                        if ok:
+                            # Prevent re-entrant signals from the same batch of candles
+                            if not any(p["symbol"] == sym for p in self.open_positions.values()):
+                                await self._open_position(signal)
+                        else:
+                            LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
+
+            except Exception as e:
+                LOG.error("Error processing symbol %s: %s", sym, e)
 
     # ---------------- MAIN SIGNAL LOOP -----------------
     async def _main_signal_loop(self):
