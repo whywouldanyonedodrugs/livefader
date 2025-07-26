@@ -15,6 +15,7 @@ import signal as sigmod
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
