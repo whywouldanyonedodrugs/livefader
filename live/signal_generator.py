@@ -85,6 +85,7 @@ class SignalGenerator:
         This is where all `await` calls belong.
         """
         LOG.info("Warming up indicators for %s...", self.symbol)
+        ohlcv_5m = []
 
         try: # <--- ADD THIS TRY BLOCK
             # --- 4-hour data for EMAs ---
@@ -122,16 +123,22 @@ class SignalGenerator:
             ohlcv_5m = await fetch_ohlcv_paginated(self.exchange, self.symbol, cfg.TIMEFRAME, self.price_history.maxlen)
             if not ohlcv_5m:
                 LOG.warning("Could not fetch 5m data for %s", self.symbol)
-                return
+                return None # Return None on failure
             self.price_history.extend([c[4] for c in ohlcv_5m])
             self.last_processed_timestamp = ohlcv_5m[-1][0]
 
-        except ccxt.BadSymbol as e: # <--- ADD THIS EXCEPT BLOCK
+        except ccxt.BadSymbol as e:
             LOG.warning("Could not warm up %s: Invalid symbol on exchange. Skipping. Error: %s", self.symbol, e)
-            return # Gracefully exit the warmup for this symbol only
+            return None # Return None on failure
+        except Exception as e:
+            LOG.error("An unexpected error occurred during warm up for %s: %s", self.symbol, e)
+            return None # Return None on any other failure
 
         self.is_warmed_up = True
         LOG.info("Signal generator for %s is warmed up. ATR=%.4f, RSI=%.2f, ADX=%.2f", self.symbol, self.atr, self.rsi, self.adx)
+        
+        # --- ADD THIS RETURN STATEMENT AT THE END ---
+        return ohlcv_5m
 
     def update_and_check(self, candle: list) -> Optional[Signal]:
         """

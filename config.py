@@ -67,6 +67,7 @@ STRUCTURAL_TREND_DAYS    = 30
 STRUCTURAL_TREND_RET_PCT = 0.01
 
 # --- Sideways "Gap" Filter (Pre-Entry Consolidation) ---
+GAP_FILTER_ENABLED = True
 GAP_VWAP_HOURS  = 2
 GAP_MAX_DEV_PCT = 0.01
 GAP_MIN_BARS    = 3

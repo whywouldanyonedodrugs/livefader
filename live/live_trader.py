@@ -692,7 +692,7 @@ class LiveTrader:
                         else:
                             LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
                         break
-                    
+
             except Exception as e:
                 LOG.error("Error processing symbol %s: %s", sym, e)
 
@@ -709,21 +709,23 @@ class LiveTrader:
         warmup_semaphore = asyncio.Semaphore(10)
 
         async def _warm_up_symbol(gen: SignalGenerator):
-            """Wrapper to apply semaphore to each warmup task."""
+            """Wrapper to apply semaphore and handle VWAP warm-up."""
             async with warmup_semaphore:
-                await gen.warm_up()
-                # Add a small sleep to further space out requests
-                await asyncio.sleep(0.1)
+                # The generator's warm_up now returns historical data
+                historical_data = await gen.warm_up()
 
+                # If warm-up was successful, pre-fill the VWAP filter
+                if historical_data:
+                    self.filter_rt.warm_up_vwap(gen.symbol, historical_data)
+
+                await asyncio.sleep(0.1)
 
         warmup_tasks = []
         for sym in self.symbols:
             gen = SignalGenerator(sym, self.exchange)
             self.signal_generators[sym] = gen
-            # Add the warmup coroutine to a list, don't create a task yet
-            warmup_tasks.append(gen.warm_up())
+            warmup_tasks.append(_warm_up_symbol(gen))
 
-        # Now, run all warmup tasks concurrently and wait for them all to complete
         await asyncio.gather(*warmup_tasks)
         
         LOG.info("All signal generators warmed up. Starting main scan loop.")

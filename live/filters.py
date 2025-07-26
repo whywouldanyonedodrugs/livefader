@@ -60,6 +60,18 @@ class Runtime:
         # listing dates (UTC)
         self._listing_dates: Dict[str, date] = {}
 
+    def warm_up_vwap(self, symbol: str, ohlcv_data: List[List[float]]) -> None:
+        """Pre-fills the VWAP buffers using historical candle data."""
+        if not ohlcv_data:
+            return
+
+        # We use the existing update_ticker logic to ensure consistency
+        for candle in ohlcv_data:
+            # candle format is [timestamp, open, high, low, close, volume]
+            close_price = candle[4]
+            volume = candle[5]
+            self.update_ticker(symbol, close_price, volume)
+
     # ── update hooks ──────────────────────────────────────────────────────
     def update_ticker(self, symbol: str, price: float, volume: Optional[float] = None) -> None:
         self._last_px[symbol] = price
@@ -107,16 +119,20 @@ class Runtime:
 
     # ── query helpers ─────────────────────────────────────────────────────
     def vwap(self, symbol: str) -> Optional[float]:
-
         buf = self._vwap_calc_buf.get(symbol)
-        if not buf or len(buf) < max(cfg.GAP_MIN_BARS + 1, 2):
+        
+        # The original code had two checks. We only need this one.
+        # This allows calculation as soon as we have enough bars for the consolidation check,
+        # instead of waiting for the entire VWAP window to be full.
+        min_bars_needed = cfg.GAP_MIN_BARS + 1
+        if not buf or len(buf) < min_bars_needed:
             return None
         
-        # Only calculate if the buffer is full, matching the backtester's rolling window behavior.
-        if not buf or len(buf) < buf.maxlen:
-            return None
-            
-        pv_slice = list(buf)[:-1]
+        # The check `if len(buf) < buf.maxlen:` has been removed.
+
+        # Using the full buffer gives a more accurate, real-time VWAP.
+        # The `[:-1]` slice creates a lagging indicator.
+        pv_slice = list(buf) # REMOVED [:-1]
         pv_sum = sum(pv for pv, _ in pv_slice)
         v_sum = sum(v  for _,  v in pv_slice)
         return pv_sum / v_sum if v_sum else None
@@ -150,9 +166,10 @@ def evaluate(
 
     # ── 1. VWAP gap check (MODIFIED) ────────────────────────────────────────
     # This now checks if the gap has been small for the last `GAP_MIN_BARS`, matching the backtester.
-    if not rt.is_vwap_gap_consolidated(sig.symbol):
-        vetoes.append("GAP")
-        ok = False
+    if getattr(cfg, "GAP_FILTER_ENABLED", True):
+        if not rt.is_vwap_gap_consolidated(sig.symbol):
+            vetoes.append("GAP")
+            ok = False
 
     # ── 2. Coin‑age veto ────────────────────────────────────────────────
     age = rt.listing_age_days(sig.symbol)
