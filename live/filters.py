@@ -1,15 +1,34 @@
 """
-filters.py – v2.1
-Adds 5‑min VWAP “GAP” veto, coin‑age veto, and keeps fast/slow EMA + OI checks.
+filters.py – v2.2 (VWAP Backtester Alignment)
+Aligns VWAP filter with backtester logic by using a bar-based rolling window
+and checking for sustained consolidation.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 from typing import Deque, Dict, List, Tuple, Optional
+import re
 
 import config as cfg
+
+# Helper function to parse timeframe string to minutes
+def _timeframe_to_minutes(tf: str) -> int:
+    """Converts timeframe string like '5m', '1h' to minutes."""
+    match = re.match(r"(\d+)(\w)", tf)
+    if not match:
+        return 1  # Default to 1 minute if format is unexpected
+    
+    val, unit = int(match.group(1)), match.group(2).lower()
+    
+    if unit == 'm':
+        return val
+    if unit == 'h':
+        return val * 60
+    if unit == 'd':
+        return val * 24 * 60
+    return 1
 
 # ════════════════════════════════════════════════════════════════════════════
 # Runtime cache
@@ -23,9 +42,19 @@ class Runtime:
         self._ema_slow: Dict[str, float] = {}
         self._oi: Dict[str, float] = {}
 
-        # 5‑min rolling VWAP buffer: deque[(ts, px*vol, vol)]
-        self._vwap_buf: Dict[str, Deque[Tuple[datetime, float, float]]] = defaultdict(
-            lambda: deque(maxlen=300)
+        tf_minutes = _timeframe_to_minutes(cfg.TIMEFRAME)
+        vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes) if tf_minutes > 0 else 0
+
+        self._vwap_len = vwap_bars
+
+        # Buffer for VWAP calculation: deque[(px*vol, vol)]
+        self._vwap_calc_buf: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
+            lambda: deque(maxlen=vwap_bars)
+        )
+
+        # Buffer to track the gap condition over the last N bars
+        self._vwap_gap_ok_buf: Dict[str, Deque[bool]] = defaultdict(
+            lambda: deque(maxlen=cfg.GAP_MIN_BARS)
         )
 
         # listing dates (UTC)
@@ -43,13 +72,25 @@ class Runtime:
         self._ema_slow[symbol] = (
             price if symbol not in self._ema_slow else self._ema_slow[symbol] + k_slow * (price - self._ema_slow[symbol])
         )
+        
+        if volume and volume > 0:
+            # ----- dynamic window length: recreate if config changed -----
+            if self._vwap_calc_buf[symbol].maxlen != self._vwap_len:
+                self._vwap_calc_buf[symbol] = deque(self._vwap_calc_buf[symbol],
+                                                    maxlen=self._vwap_len)
+            # -------------------------------------------------------------
 
-        if volume:
-            now = datetime.utcnow()
-            self._vwap_buf[symbol].append((now, price * volume, volume))
-            cut = now - timedelta(minutes=5)
-            while self._vwap_buf[symbol] and self._vwap_buf[symbol][0][0] < cut:
-                self._vwap_buf[symbol].popleft()
+            # 1. Update the buffer for VWAP calculation. `maxlen` handles the rolling window.
+            self._vwap_calc_buf[symbol].append((price * volume, volume))
+
+            # 2. Calculate the current VWAP (it will be None until the buffer is full).
+            current_vwap = self.vwap(symbol)
+
+            # 3. Check the gap condition and update the history buffer.
+            if current_vwap is not None:
+                deviation = abs(price - current_vwap) / current_vwap
+                is_ok = deviation <= cfg.GAP_MAX_DEV_PCT
+                self._vwap_gap_ok_buf[symbol].append(is_ok)
 
     def update_open_interest(self, symbol: str, oi: float) -> None:
         self._oi[symbol] = oi
@@ -66,12 +107,27 @@ class Runtime:
 
     # ── query helpers ─────────────────────────────────────────────────────
     def vwap(self, symbol: str) -> Optional[float]:
-        buf = self._vwap_buf[symbol]
-        if not buf:
+
+        buf = self._vwap_calc_buf.get(symbol)
+        if not buf or len(buf) < max(cfg.GAP_MIN_BARS + 1, 2):
             return None
-        pv_sum = sum(pv for _ts, pv, _v in buf)
-        v_sum = sum(v for _ts, _pv, v in buf)
+        
+        # Only calculate if the buffer is full, matching the backtester's rolling window behavior.
+        if not buf or len(buf) < buf.maxlen:
+            return None
+            
+        pv_slice = list(buf)[:-1]
+        pv_sum = sum(pv for pv, _ in pv_slice)
+        v_sum = sum(v  for _,  v in pv_slice)
         return pv_sum / v_sum if v_sum else None
+
+    def is_vwap_gap_consolidated(self, symbol: str) -> bool:
+        """Checks if the gap condition has been true for the required number of bars."""
+        buf = self._vwap_gap_ok_buf.get(symbol)
+        # Condition is met if the buffer is full and all values within it are True.
+        if not buf or len(buf) < buf.maxlen:
+            return False
+        return all(buf)
 
     def last_price(self, symbol: str) -> Optional[float]:
         return self._last_px.get(symbol)
@@ -92,13 +148,11 @@ def evaluate(
     vetoes: List[str] = []
     ok = True
 
-    # ── 1. VWAP gap check ───────────────────────────────────────────────
-    last = rt.last_price(sig.symbol)
-    vwap = rt.vwap(sig.symbol)
-    if last is not None and vwap is not None:
-        if abs(last - vwap) / vwap > cfg.GAP_MAX_DEV_PCT:
-            vetoes.append("GAP")
-            ok = False
+    # ── 1. VWAP gap check (MODIFIED) ────────────────────────────────────────
+    # This now checks if the gap has been small for the last `GAP_MIN_BARS`, matching the backtester.
+    if not rt.is_vwap_gap_consolidated(sig.symbol):
+        vetoes.append("GAP")
+        ok = False
 
     # ── 2. Coin‑age veto ────────────────────────────────────────────────
     age = rt.listing_age_days(sig.symbol)

@@ -6,6 +6,7 @@ import config as cfg
 import logging
 import re
 from live import live_indicators as ta
+from exchange_proxy import fetch_ohlcv_paginated
 
 LOG = logging.getLogger(__name__)
 
@@ -68,6 +69,24 @@ class SignalGenerator:
     async def warm_up(self):
         """Fetch initial historical data to calculate baseline indicators."""
         LOG.info("Warming up indicators for %s...", self.symbol)
+
+        wanted = max(
+            cfg.EMA_SLOW_PERIOD + 1,
+            self.price_history.maxlen,
+            self.closes.maxlen,
+        )
+
+        ohlcv = await fetch_ohlcv_paginated(
+            self.exchange,
+            self.symbol,
+            cfg.TIMEFRAME,
+            wanted,
+        )
+
+        if len(ohlcv) < wanted:
+            LOG.warning("Not enough historical data to warm up %s. Disabling.", self.symbol)
+            return
+
         try:
             limit = max(cfg.EMA_SLOW_PERIOD + 1, self.price_history.maxlen, self.closes.maxlen)
             ohlcv = await self.exchange.fetch_ohlcv(self.symbol, cfg.TIMEFRAME, limit=limit)
