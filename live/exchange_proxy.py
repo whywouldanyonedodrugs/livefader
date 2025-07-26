@@ -149,7 +149,7 @@ async def fetch_ohlcv_paginated(
             break  # no more history
 
         # When fetching with `since`, Bybit returns newest→oldest; reverse
-        rows.reverse()
+######### COULD BE WRONG -->        rows.reverse()
         # Drop the *newest* row if it is the same timestamp as last append
         if all_rows and rows and rows[-1][0] >= all_rows[0][0]:
             rows = rows[:-1]
