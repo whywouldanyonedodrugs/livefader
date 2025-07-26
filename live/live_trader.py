@@ -70,6 +70,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+logging.getLogger("ccxt").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
 ###############################################################################
 # 1 ▸ SETTINGS pulled from ENV (.env) #########################################
 ###############################################################################
@@ -259,20 +261,23 @@ class LiveTrader:
 
     async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
         """
-        Fetches market data, calculates indicators, and checks for a "boom & bust" signal.
-        This is a simplified, robust approach inspired by the discretionary alert bot.
-        Returns a Signal object if all conditions are met, otherwise None.
+        Checks a symbol for a signal using a 5-minute base timeframe while calculating
+        indicators on their respective higher timeframes (1h, 4h), perfectly matching
+        the backtester's "rolling window" logic.
         """
-        LOG.info("Checking %s...", symbol) # <-- VISIBILITY: Log which symbol is being processed
+        LOG.info("Checking %s...", symbol)
         try:
-            # 1. Fetch data for all needed timeframes
+            # --- Define Timeframes ---
+            base_tf = self.cfg.get('TIMEFRAME', '5m')
+            ema_tf = self.cfg.get('EMA_TIMEFRAME', '4h')
+            rsi_tf = self.cfg.get('RSI_TIMEFRAME', '1h')
+            atr_tf = self.cfg.get('ADX_TIMEFRAME', '1h') # ATR and ADX often share a timeframe
+            
+            required_tfs = {base_tf, ema_tf, rsi_tf, atr_tf, '1d'}
+
+            # 1. Fetch all unique required timeframes data
             async with self.api_semaphore:
-                tasks = {
-                    '5m': self.exchange.fetch_ohlcv(symbol, '5m', limit=500),
-                    '1h': self.exchange.fetch_ohlcv(symbol, '1h', limit=500),
-                    '4h': self.exchange.fetch_ohlcv(symbol, '4h', limit=500),
-                    '1d': self.exchange.fetch_ohlcv(symbol, '1d', limit=100)
-                }
+                tasks = {tf: self.exchange.fetch_ohlcv(symbol, tf, limit=500) for tf in required_tfs}
                 results = await asyncio.gather(*tasks.values(), return_exceptions=True)
                 ohlcv_data = dict(zip(tasks.keys(), results))
 
@@ -280,56 +285,50 @@ class LiveTrader:
             dfs = {}
             for tf, data in ohlcv_data.items():
                 if isinstance(data, Exception) or not data:
-                    LOG.debug("Could not fetch OHLCV data for %s on %s timeframe.", symbol, tf)
+                    LOG.debug("Could not fetch OHLCV for %s on %s timeframe.", symbol, tf)
                     return None
                 df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
                 df.set_index('timestamp', inplace=True)
-                df.drop(df.index[-1], inplace=True)
-                if df.empty:
-                    LOG.debug("DataFrame for %s on %s is empty after dropping last candle.", symbol, tf)
-                    return None
+                df.drop(df.index[-1], inplace=True) # Drop the incomplete, current candle
+                if df.empty: return None
                 dfs[tf] = df
 
-            df5, df1h, df4h, df1d = dfs['5m'], dfs['1h'], dfs['4h'], dfs['1d']
+            # 3. Use the 5m DataFrame as the base for our checks
+            df5 = dfs[base_tf]
 
-            # 3. Calculate indicators and conditions
-            df5['ema_fast'] = ta.ema(df4h['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
-            df5['ema_slow'] = ta.ema(df4h['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
-            df5['rsi'] = ta.rsi(df1h['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
-            df5['atr'] = ta.atr(df1h, cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
-            df5['adx'] = ta.adx(df1h, cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
+            # 4. Calculate indicators on their proper timeframes and map them to the 5m base
+            df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
+            df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
+            df5['rsi'] = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
+            df5['atr'] = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
+            df5['adx'] = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
+            # 5. Calculate rolling window conditions on the 5m base
             tf_minutes = 5
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
             df5['price_boom_ago'] = df5['close'].shift(boom_bars)
             df5['price_slowdown_ago'] = df5['close'].shift(slowdown_bars)
 
-            ret_30d = 0.0
-            if len(df1d) > cfg.STRUCTURAL_TREND_DAYS:
-                price_30d_ago = df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS]
-                ret_30d = (df1d['close'].iloc[-1] / price_30d_ago - 1) if price_30d_ago else 0.0
+            df1d = dfs['1d']
+            ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
 
-            # --- CORRECTED VWAP/GAP FILTER LOGIC ---
             if cfg.GAP_FILTER_ENABLED:
                 vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
-                # The .shift(1) is critical to align with the backtester and prevent look-ahead bias.
                 vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
                 vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
                 df5['vwap'] = vwap_num / vwap_den
                 df5['vwap_dev'] = abs(df5['close'] - df5['vwap']) / df5['vwap']
                 df5['vwap_ok'] = df5['vwap_dev'] <= cfg.GAP_MAX_DEV_PCT
-                # Use .min() to check for consolidation, which is equivalent to .apply(all) but robust
                 df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
             else:
                 df5['vwap_consolidated'] = True
 
             df5.dropna(inplace=True)
-            if df5.empty:
-                return None
+            if df5.empty: return None
 
-            # 4. Check conditions on the last completed candle
+            # 6. Check conditions on the very last completed 5-minute candle
             last = df5.iloc[-1]
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = abs(last['close'] / last['price_slowdown_ago'] - 1)
@@ -338,14 +337,17 @@ class LiveTrader:
             price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
             ema_down = last['ema_fast'] < last['ema_slow']
 
-            # --- DETAILED DEBUG LOGGING ---
+            # --- CLEAN DEBUG LOGGING ---
             LOG.debug(
-                f"\n--- {symbol} | {last.name} UTC ---\n"
-                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}): {'✅' if price_boom else '❌'} ({boom_ret_pct:+.2%})\n"
-                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}): {'✅' if price_slowdown else '❌'} ({slowdown_ret_pct:.2%})\n"
-                f"  - EMA Trend Down:          {'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} | Slow: {last['ema_slow']:.4f})\n"
-                f"  - RSI: {last['rsi']:.2f} | ATR: {last['atr']:.6f} | ADX: {last['adx']:.2f}\n"
-                f"  - VWAP Consolidated:       {'✅' if last['vwap_consolidated'] else '❌'}"
+                f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
+                f"  [Base Timeframe: {base_tf}]\n"
+                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h lookback): {'✅' if price_boom else '❌'} (is {boom_ret_pct:+.2%})\n"
+                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h lookback): {'✅' if price_slowdown else '❌'} (is {slowdown_ret_pct:.2%})\n"
+                f"  - EMA Trend Down ({ema_tf}):      {'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} < Slow: {last['ema_slow']:.4f})\n"
+                f"  --------------------------------------------------\n"
+                f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
+                f"  - VWAP Consolidated:       {'✅' if last['vwap_consolidated'] else '❌'}\n"
+                f"  - ATR ({atr_tf}):                 {last['atr']:.6f}"
             )
 
             if price_boom and price_slowdown and ema_down:
