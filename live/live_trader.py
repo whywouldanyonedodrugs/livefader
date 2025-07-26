@@ -65,7 +65,7 @@ LISTING_PATH = Path("listing_dates.json")
 
 LOG = logging.getLogger("live_trader")
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -263,6 +263,7 @@ class LiveTrader:
         This is a simplified, robust approach inspired by the discretionary alert bot.
         Returns a Signal object if all conditions are met, otherwise None.
         """
+        LOG.info("Checking %s...", symbol) # <-- VISIBILITY: Log which symbol is being processed
         try:
             # 1. Fetch data for all needed timeframes
             async with self.api_semaphore:
@@ -284,7 +285,7 @@ class LiveTrader:
                 df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
                 df.set_index('timestamp', inplace=True)
-                df.drop(df.index[-1], inplace=True) # Drop the still-forming candle
+                df.drop(df.index[-1], inplace=True)
                 if df.empty:
                     LOG.debug("DataFrame for %s on %s is empty after dropping last candle.", symbol, tf)
                     return None
@@ -310,13 +311,17 @@ class LiveTrader:
                 price_30d_ago = df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS]
                 ret_30d = (df1d['close'].iloc[-1] / price_30d_ago - 1) if price_30d_ago else 0.0
 
+            # --- CORRECTED VWAP/GAP FILTER LOGIC ---
             if cfg.GAP_FILTER_ENABLED:
                 vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
-                df5['pv'] = df5['close'] * df5['volume']
-                df5['vwap'] = df5['pv'].rolling(vwap_bars).sum() / df5['volume'].rolling(vwap_bars).sum()
+                # The .shift(1) is critical to align with the backtester and prevent look-ahead bias.
+                vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
+                vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
+                df5['vwap'] = vwap_num / vwap_den
                 df5['vwap_dev'] = abs(df5['close'] - df5['vwap']) / df5['vwap']
                 df5['vwap_ok'] = df5['vwap_dev'] <= cfg.GAP_MAX_DEV_PCT
-                df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).apply(all, raw=True).fillna(0).astype(bool)
+                # Use .min() to check for consolidation, which is equivalent to .apply(all) but robust
+                df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
             else:
                 df5['vwap_consolidated'] = True
 
@@ -326,9 +331,22 @@ class LiveTrader:
 
             # 4. Check conditions on the last completed candle
             last = df5.iloc[-1]
-            price_boom = (last['close'] / last['price_boom_ago'] - 1) > cfg.PRICE_BOOM_PCT
-            price_slowdown = abs(last['close'] / last['price_slowdown_ago'] - 1) < cfg.PRICE_SLOWDOWN_PCT
+            boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
+            slowdown_ret_pct = abs(last['close'] / last['price_slowdown_ago'] - 1)
+
+            price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
+            price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
             ema_down = last['ema_fast'] < last['ema_slow']
+
+            # --- DETAILED DEBUG LOGGING ---
+            LOG.debug(
+                f"\n--- {symbol} | {last.name} UTC ---\n"
+                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}): {'✅' if price_boom else '❌'} ({boom_ret_pct:+.2%})\n"
+                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}): {'✅' if price_slowdown else '❌'} ({slowdown_ret_pct:.2%})\n"
+                f"  - EMA Trend Down:          {'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} | Slow: {last['ema_slow']:.4f})\n"
+                f"  - RSI: {last['rsi']:.2f} | ATR: {last['atr']:.6f} | ADX: {last['adx']:.2f}\n"
+                f"  - VWAP Consolidated:       {'✅' if last['vwap_consolidated'] else '❌'}"
+            )
 
             if price_boom and price_slowdown and ema_down:
                 LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, last['close'])
