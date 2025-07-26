@@ -17,8 +17,21 @@ BYBIT_ACCOUNT_TYPE    = "UNIFIED"  # or "STANDARD"
 START_DATE = "2022-01-01"
 END_DATE = "2026-01-01"
 
-EMA_FAST_PERIOD = 960   # 20
-EMA_SLOW_PERIOD = 9600  # 200
+EMA_TIMEFRAME   = "4h" 
+EMA_FAST_PERIOD = 20   # 20
+EMA_SLOW_PERIOD = 200 # 200
+
+RSI_PERIOD      = 14
+RSI_TIMEFRAME   = "1h"
+ADX_PERIOD      = 14
+ADX_TIMEFRAME   = "1h"
+
+RSI_ENTRY_MIN   = 30
+RSI_ENTRY_MAX   = 70
+
+ADX_FILTER_ENABLED = False  # enable in YAML/Telegram if desired
+ADX_MIN           = 10       # skip if trendless
+ADX_MAX           = 25       # skip if strongly trending
 
 PRICE_BOOM_PERIOD_H = 24
 PRICE_BOOM_PCT      = 0.15

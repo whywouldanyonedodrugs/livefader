@@ -16,6 +16,8 @@ class Signal:
     entry: float
     atr: float
     rsi: float
+    ret_30d: float
+    adx:   float
 
 def _get_hours_from_timeframe(tf: str) -> float:
     """Converts timeframe string like '1h', '4h', '1d' to hours."""
@@ -37,10 +39,15 @@ def _get_hours_from_timeframe(tf: str) -> float:
 
 class SignalGenerator:
 
-    RSI_PERIOD = 672
-    ATR_PERIOD = 672
-
     def __init__(self, symbol: str, exchange):
+
+        self.ema_tf      = cfg.EMA_TIMEFRAME
+        self.rsi_tf      = cfg.RSI_TIMEFRAME
+        self.adx_tf      = cfg.ADX_TIMEFRAME
+        self.rsi_period  = cfg.RSI_PERIOD
+        self.atr_period  = cfg.ADX_PERIOD     # ATR still 14 unless overridden
+        self.adx_period  = cfg.ADX_PERIOD
+
         self.symbol = symbol
         self.exchange = exchange
         self.last_processed_timestamp = 0
@@ -63,6 +70,31 @@ class SignalGenerator:
         self.highs: Deque[float] = deque(maxlen=indicator_deque_len)
         self.lows: Deque[float] = deque(maxlen=indicator_deque_len)
         self.closes: Deque[float] = deque(maxlen=indicator_deque_len)
+
+        self.ema_closes_4h: Deque[float] = deque(maxlen=cfg.EMA_SLOW_PERIOD + 2)
+        self.hr_closes:     Deque[float] = deque(maxlen=self.rsi_period + 2)
+        self.day_closes:    Deque[float] = deque(maxlen=cfg.STRUCTURAL_TREND_DAYS + 2)
+
+        # 4‑hour closes for EMAs
+        ema_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol,
+                                               self.ema_tf, cfg.EMA_SLOW_PERIOD + 5)
+        self.ema_closes_4h.extend([c[4] for c in ema_ohlc])
+        self.ema_fast = ta.ema_from_list(self.ema_closes_4h, cfg.EMA_FAST_PERIOD)
+        self.ema_slow = ta.ema_from_list(self.ema_closes_4h, cfg.EMA_SLOW_PERIOD)
+
+        # 1‑hour closes for RSI / ADX
+        hr_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol,
+                                              self.rsi_tf, self.rsi_period + 20)
+        self.hr_closes.extend([c[4] for c in hr_ohlc])
+        highs  = [c[2] for c in hr_ohlc]
+        lows   = [c[3] for c in hr_ohlc]
+        self.adx, self._adx_state = ta.initial_adx(highs, lows, self.hr_closes, self.adx_period)
+        self.rsi, self.avg_gain, self.avg_loss = ta.initial_rsi(self.hr_closes, self.rsi_period)
+
+        # daily closes for 30‑day return
+        day_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol,
+                                               "1d", cfg.STRUCTURAL_TREND_DAYS + 2)
+        self.day_closes.extend([c[4] for c in day_ohlc])
 
         self.is_warmed_up = False
 
@@ -121,6 +153,30 @@ class SignalGenerator:
         """
         Updates indicators with a new closed candle and checks for a signal.
         """
+
+        if timestamp // (4*60*60*1000) > self.last_processed_timestamp // (4*60*60*1000):
+            self.ema_closes_4h.append(close)
+            self.ema_fast = ta.next_ema(close, self.ema_fast, cfg.EMA_FAST_PERIOD)
+            self.ema_slow = ta.next_ema(close, self.ema_slow, cfg.EMA_SLOW_PERIOD)
+
+        # 1‑hour boundary
+        if timestamp // (60*60*1000) > self.last_processed_timestamp // (60*60*1000):
+            prev_hr_close = self.hr_closes[-1] if self.hr_closes else close
+            self.hr_closes.append(close)
+            self.rsi, self.avg_gain, self.avg_loss = ta.next_rsi(
+                close, prev_hr_close, self.avg_gain, self.avg_loss, self.rsi_period)
+            self.adx, self._adx_state = ta.next_adx(
+                high, low, close, prev_hr_close, self._adx_state, self.adx_period)
+
+        # daily boundary (for 30‑day return)
+        if timestamp // (24*60*60*1000) > self.last_processed_timestamp // (24*60*60*1000):
+            self.day_closes.append(close)
+
+        ret_30d = 0.0
+        if len(self.day_closes) > cfg.STRUCTURAL_TREND_DAYS:
+            price_30d_ago = self.day_closes[-cfg.STRUCTURAL_TREND_DAYS-1]
+            ret_30d = (close / price_30d_ago - 1) if price_30d_ago else 0.0
+
         if not self.is_warmed_up or not candle:
             return None
 
@@ -169,10 +225,14 @@ class SignalGenerator:
 
         if price_boom and price_slowdown and c3_ema_down:
             LOG.info("SIGNAL FOUND for %s at price %.4f", self.symbol, close)
+        
             return Signal(
                 symbol=self.symbol,
                 entry=float(close),
                 atr=float(self.atr),
                 rsi=float(self.rsi),
+                ret_30d=float(ret_30d),
+                adx=float(self.adx),
             )
+
         return None

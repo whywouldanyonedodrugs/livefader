@@ -72,7 +72,7 @@ class Runtime:
         self._ema_slow[symbol] = (
             price if symbol not in self._ema_slow else self._ema_slow[symbol] + k_slow * (price - self._ema_slow[symbol])
         )
-        
+
         if volume and volume > 0:
             # ----- dynamic window length: recreate if config changed -----
             if self._vwap_calc_buf[symbol].maxlen != self._vwap_len:
@@ -164,13 +164,23 @@ def evaluate(
             vetoes.append("AGE_TOO_OLD")
             ok = False
 
-    # ── 3. Fast > slow EMA trend filter (BTC/ALT) ──────────────────────
-    ema_fast, ema_slow = rt.emas(sig.symbol)
-    if ema_fast and ema_slow and ema_fast > ema_slow:
-        vetoes.append("EMA_UPTREND")
+    # ── 3. Primary RSI window ───────────────────────────────────────────
+    if not (cfg.RSI_ENTRY_MIN <= sig.rsi <= cfg.RSI_ENTRY_MAX):
+        vetoes.append("RSI_RANGE")
         ok = False
 
-    # ── 4. Portfolio / equity caps ──────────────────────────────────────
+    # ── 4. 30‑day structural‑trend veto ─────────────────────────────────
+    if sig.ret_30d is not None and sig.ret_30d > cfg.STRUCTURAL_TREND_RET_PCT:
+        vetoes.append("STRUCTURAL_TREND")
+        ok = False
+
+    # ── 5. Optional ADX trend‑strength veto ─────────────────────────────
+    if cfg.ADX_FILTER_ENABLED:
+        if not (cfg.ADX_MIN <= sig.adx <= cfg.ADX_MAX):
+            vetoes.append("ADX")
+            ok = False
+
+    # ── 6. Portfolio / equity caps ──────────────────────────────────────
     if open_positions >= cfg.MAX_OPEN:
         vetoes.append("MAX_OPEN")
         ok = False
