@@ -46,14 +46,19 @@ def ema(series: pd.Series, span: int) -> pd.Series:
 def atr(df: pd.DataFrame, period: int) -> pd.Series:
     if _HAS_TA:
         return pd.Series(talib.ATR(df["high"], df["low"], df["close"], timeperiod=period), index=df.index)
-    return pta.atr(high=df["high"], low=df["low"], close=df["close"], length=period)
+    atr_series = pta.atr(high=df["high"], low=df["low"], close=df["close"], length=period)
+    if atr_series is None:
+        return pd.Series(dtype='float64', index=df.index)
+    return atr_series
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     if _HAS_TA:
         return pd.Series(talib.RSI(series, timeperiod=period), index=series.index)
-    return pta.rsi(series, length=period)
-
+    rsi_series = pta.rsi(series, length=period)
+    if rsi_series is None:
+        return pd.Series(dtype='float64', index=series.index)
+    return rsi_series
 
 def macd(series: pd.Series) -> pd.DataFrame:
     """

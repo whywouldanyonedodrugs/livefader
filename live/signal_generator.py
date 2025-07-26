@@ -5,6 +5,7 @@ from collections import deque
 import config as cfg
 import logging
 import re
+import traceback
 import ccxt
 import pandas as pd
 from . import indicators as ta
@@ -86,17 +87,21 @@ class SignalGenerator:
         This is where all `await` calls belong.
         """
         LOG.info("Warming up indicators for %s...", self.symbol)
-        ohlcv_5m = []
 
         try:
-            # --- Fetch all required data first ---
-            ema_ohlc_list = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.ema_tf, cfg.EMA_SLOW_PERIOD + 50)
-            hr_ohlc_list = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.rsi_tf, self.rsi_period + 100)
-            day_ohlc_list = await fetch_ohlcv_paginated(self.exchange, self.symbol, "1d", cfg.STRUCTURAL_TREND_DAYS + 5)
-            ohlcv_5m_list = await fetch_ohlcv_paginated(self.exchange, self.symbol, cfg.TIMEFRAME, self.price_history.maxlen)
+            
+            ema_ohlc_list = await self.exchange.fetch_ohlcv(self.symbol, self.ema_tf, since=None, limit=500)
+            hr_ohlc_list = await self.exchange.fetch_ohlcv(self.symbol, self.rsi_tf, since=None, limit=500)
+            day_ohlc_list = await self.exchange.fetch_ohlcv(self.symbol, "1d", since=None, limit=100)
+            ohlcv_5m_list = await self.exchange.fetch_ohlcv(self.symbol, cfg.TIMEFRAME, since=None, limit=500)
 
-            if not all([ema_ohlc_list, hr_ohlc_list, ohlcv_5m_list]):
-                LOG.warning("Could not fetch required historical data for %s. Skipping.", self.symbol)
+            # --- Pre-flight check: Do we have enough data? ---
+            min_bars_required = self.adx_period * 2
+            if not hr_ohlc_list or len(hr_ohlc_list) < min_bars_required:
+                LOG.warning(
+                    f"Skipping {self.symbol}: Not enough historical data on {self.rsi_tf} timeframe. "
+                    f"Required >{min_bars_required} bars, but found only {len(hr_ohlc_list) if hr_ohlc_list else 0}."
+                )
                 return None
 
             # --- Convert to Pandas DataFrames ---
@@ -104,13 +109,17 @@ class SignalGenerator:
             df_hr = pd.DataFrame(hr_ohlc_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_day = pd.DataFrame(day_ohlc_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-            # --- Calculate Indicators using the robust 'indicators.py' library ---
+            # --- Calculate Indicators ---
             self.ema_fast = ta.ema(df_ema['close'], cfg.EMA_FAST_PERIOD).iloc[-1]
             self.ema_slow = ta.ema(df_ema['close'], cfg.EMA_SLOW_PERIOD).iloc[-1]
             
             self.rsi = ta.rsi(df_hr['close'], self.rsi_period).iloc[-1]
             self.atr = ta.atr(df_hr, self.atr_period).iloc[-1]
             self.adx = ta.adx(df_hr, self.adx_period).iloc[-1]
+
+            if pd.isna(self.rsi) or pd.isna(self.atr) or pd.isna(self.adx):
+                LOG.warning(f"Indicator calculation resulted in NaN for {self.symbol}. Skipping.")
+                return None
 
             # --- Calculate 30-day return ---
             if len(df_day) > cfg.STRUCTURAL_TREND_DAYS:
@@ -125,22 +134,16 @@ class SignalGenerator:
             self.price_history.extend([c[4] for c in ohlcv_5m_list])
             self.last_processed_timestamp = ohlcv_5m_list[-1][0]
 
-            # We still need to initialize the incremental RSI state for 'next_rsi'
-            # This part is tricky, but we can approximate it. For simplicity, we will leave it
-            # as is, knowing our initial RSI is now 100% correct. The incremental updates
-            # will take over from here. A more advanced solution would re-calculate the
-            # final avg_gain/loss, but this is a massive improvement.
-
         except ccxt.BadSymbol as e:
             LOG.warning("Could not warm up %s: Invalid symbol on exchange. Skipping. Error: %s", self.symbol, e)
             return None
         except Exception as e:
             LOG.error("An unexpected error occurred during warm up for %s: %s", self.symbol, e)
-            traceback.print_exc() # Print full traceback for debugging
+            traceback.print_exc()
             return None
 
         self.is_warmed_up = True
-        LOG.info("Signal generator for %s is warmed up. ATR=%.4f, RSI=%.2f, ADX=%.2f", self.symbol, self.atr, self.rsi, self.adx)
+        LOG.info("Signal generator for %s is warmed up. ATR=%.8f, RSI=%.2f, ADX=%.2f", self.symbol, self.atr, self.rsi, self.adx)
         
         return ohlcv_5m_list
 
