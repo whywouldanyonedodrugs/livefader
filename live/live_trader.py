@@ -809,7 +809,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 Bot online v3.0 (Simplified)")
+        await self.tg.send("🤖 Bot online v3.0")
 
         try:
             async with asyncio.TaskGroup() as tg:
