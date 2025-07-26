@@ -4,7 +4,6 @@
 aiohttp
 asyncpg
 ccxt
-ccxt-pro
 pyyaml
 watchdog
 pydantic
