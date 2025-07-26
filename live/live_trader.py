@@ -173,22 +173,27 @@ class LiveTrader:
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock) # ADD THIS
     # ---------------- HELPERS -------------------
     def _init_ccxt(self):
-        url = (
-            "https://api-testnet.bybit.com"
-            if self.settings.bybit_testnet
-            else "https://api.bybit.com"
-        )
+        """
+        Initializes the ccxt exchange object.
+        This version removes the brittle manual URL override and uses the standard
+        ccxt method for testnet activation, which is the root cause of the data
+        source issues.
+        """
         ex = ccxt.bybit(
             {
                 "apiKey": self.settings.bybit_api_key,
                 "secret": self.settings.bybit_api_secret,
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "swap",  # This is the critical line
+                    "defaultType": "swap",  # This will now be respected
                 },
             }
         )
-        ex.urls["api"] = {"public": url, "private": url}
+
+        # Use the standard library method to enable testnet
+        if self.settings.bybit_testnet:
+            ex.set_sandbox_mode(True)
+            
         return ex
 
     @staticmethod
