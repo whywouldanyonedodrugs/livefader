@@ -135,39 +135,89 @@ def next_atr(prev_atr: float, high: float, low: float, close: float, prev_close:
 def _tr(high, low, prev_close):
     return max(high - low, abs(high - prev_close), abs(low - prev_close))
 
-def initial_adx(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return 0.0, 0.0          # adx, prev_dmi
+# --- ADX (Average Directional Index) --------------------------------------
+def _calculate_dms_and_tr(high, low, close, prev_high, prev_low, prev_close):
+    """Calculates Directional Movement and True Range for a single period."""
+    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+    
+    move_up = high - prev_high
+    move_down = prev_low - low
+    
+    plus_dm = move_up if move_up > move_down and move_up > 0 else 0
+    minus_dm = move_down if move_down > move_up and move_down > 0 else 0
+    
+    return plus_dm, minus_dm, tr
 
-    trs  = [_tr(h, l, closes[i-1]) for i, (h, l) in enumerate(zip(highs[1:], lows[1:]), start=1)]
-    plus_dm  = [max(0, highs[i]   - highs[i-1]) for i in range(1, len(highs))]
-    minus_dm = [max(0, lows[i-1]  - lows[i])    for i in range(1, len(lows))]
+def initial_adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Tuple[float, tuple]:
+    """
+    Calculates initial ADX using Wilder's smoothing.
+    Returns (adx, state_tuple)
+    """
+    if len(closes) < period * 2: # Need enough data for initial smoothing
+        return 0.0, (0.0, 0.0, 0.0, 0.0)
 
-    tr_sma   = sum(trs[:period]) / period
-    plus_sma = sum(plus_dm[:period]) / period
-    minus_sma= sum(minus_dm[:period]) / period
+    # Calculate initial series of +DM, -DM, and TR
+    plus_dms, minus_dms, trs = [], [], []
+    for i in range(1, len(closes)):
+        pdm, mdm, tr = _calculate_dms_and_tr(highs[i], lows[i], closes[i], highs[i-1], lows[i-1], closes[i-1])
+        plus_dms.append(pdm)
+        minus_dms.append(mdm)
+        trs.append(tr)
 
-    def dx(p,m,tr): 
-        if p+m == 0: return 0
-        return abs(p - m) / (p + m) * 100
+    # First smoothed values are simple averages
+    atr = sum(trs[:period]) / period
+    smooth_plus_dm = sum(plus_dms[:period]) / period
+    smooth_minus_dm = sum(minus_dms[:period]) / period
 
-    dxs = [dx(plus_dm[i], minus_dm[i], trs[i]) for i in range(period, len(trs))]
+    # Wilder's smoothing for the rest of the initial data
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+        smooth_plus_dm = (smooth_plus_dm * (period - 1) + plus_dms[i]) / period
+        smooth_minus_dm = (smooth_minus_dm * (period - 1) + minus_dms[i]) / period
+
+    # Calculate DI and DX
+    dxs = []
+    for i in range(period, len(trs)):
+        plus_di = 100 * (smooth_plus_dm / atr) if atr != 0 else 0
+        minus_di = 100 * (smooth_minus_dm / atr) if atr != 0 else 0
+        di_sum = plus_di + minus_di
+        dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum != 0 else 0
+        dxs.append(dx)
+
+    # Initial ADX is a simple average of the first DX values
     adx = sum(dxs[:period]) / period if dxs else 0
-    return adx, (plus_sma, minus_sma, tr_sma)
+    
+    # Smooth the rest of the DXs to get the final ADX
+    for i in range(period, len(dxs)):
+        adx = (adx * (period - 1) + dxs[i]) / period
 
-def next_adx(high, low, close, prev_close, prev_state, period=14):
-    prev_plus, prev_minus, prev_tr = prev_state
-    tr   = _tr(high, low, prev_close)
-    p_dm = max(0, high - prev_close)
-    m_dm = max(0, prev_close - low)
+    # State: prev_adx, prev_plus_dm, prev_minus_dm, prev_tr
+    state = (adx, smooth_plus_dm, smooth_minus_dm, atr)
+    return adx, state
 
-    plus = (prev_plus  * (period-1) + p_dm) / period
-    minus= (prev_minus * (period-1) + m_dm) / period
-    tr_s = (prev_tr    * (period-1) + tr  ) / period
+def next_adx(high: float, low: float, close: float, prev_high: float, prev_low: float, prev_close: float, prev_state: tuple, period: int = 14) -> Tuple[float, tuple]:
+    """
+    Calculates the next ADX value incrementally.
+    prev_state = (prev_adx, prev_smooth_plus_dm, prev_smooth_minus_dm, prev_atr)
+    """
+    prev_adx, prev_smooth_plus_dm, prev_smooth_minus_dm, prev_atr = prev_state
+    
+    # 1. Calculate current +DM, -DM, TR
+    plus_dm, minus_dm, tr = _calculate_dms_and_tr(high, low, close, prev_high, prev_low, prev_close)
 
-    if plus + minus == 0:
-        return 0.0, (plus, minus, tr_s)
+    # 2. Calculate smoothed values
+    smooth_atr = (prev_atr * (period - 1) + tr) / period
+    smooth_plus_dm = (prev_smooth_plus_dm * (period - 1) + plus_dm) / period
+    smooth_minus_dm = (prev_smooth_minus_dm * (period - 1) + minus_dm) / period
 
-    dx  = abs(plus - minus) / (plus + minus) * 100
-    adx = (prev_state[0] * (period-1) + dx) / period
-    return adx, (plus, minus, tr_s)
+    # 3. Calculate current DI and DX
+    plus_di = 100 * (smooth_plus_dm / smooth_atr) if smooth_atr != 0 else 0
+    minus_di = 100 * (smooth_minus_dm / smooth_atr) if smooth_atr != 0 else 0
+    di_sum = plus_di + minus_di
+    dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum != 0 else 0
+
+    # 4. Smooth DX to get the new ADX
+    new_adx = (prev_adx * (period - 1) + dx) / period
+    
+    new_state = (new_adx, smooth_plus_dm, smooth_minus_dm, smooth_atr)
+    return new_adx, new_state

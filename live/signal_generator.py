@@ -38,171 +38,148 @@ def _get_hours_from_timeframe(tf: str) -> float:
     return 1.0
 
 class SignalGenerator:
-
     def __init__(self, symbol: str, exchange):
-
-        self.ema_tf      = cfg.EMA_TIMEFRAME
-        self.rsi_tf      = cfg.RSI_TIMEFRAME
-        self.adx_tf      = cfg.ADX_TIMEFRAME
-        self.rsi_period  = cfg.RSI_PERIOD
-        self.atr_period  = cfg.ADX_PERIOD     # ATR still 14 unless overridden
-        self.adx_period  = cfg.ADX_PERIOD
-
+        """
+        Initializes the generator. All async operations are moved to warm_up().
+        """
         self.symbol = symbol
         self.exchange = exchange
+        self.is_warmed_up = False
         self.last_processed_timestamp = 0
 
-        # State for indicators
-        self.ema_fast = 0.0
-        self.ema_slow = 0.0
-        self.atr = 0.0
-        self.rsi = 50.0
-        # --- NEW: State for smoothed RSI ---
-        self.avg_gain = 0.0
-        self.avg_loss = 0.0
+        # --- Configurable Parameters ---
+        self.ema_tf = cfg.EMA_TIMEFRAME
+        self.rsi_tf = cfg.RSI_TIMEFRAME
+        self.adx_tf = cfg.ADX_TIMEFRAME
+        self.rsi_period = cfg.RSI_PERIOD
+        self.atr_period = cfg.ADX_PERIOD  # Using ADX_PERIOD for ATR as per your code
+        self.adx_period = cfg.ADX_PERIOD
 
+        # --- State for raw 5m data (for boom/bust check) ---
         hours_per_candle = _get_hours_from_timeframe(cfg.TIMEFRAME)
         boom_candles = int(cfg.PRICE_BOOM_PERIOD_H / hours_per_candle)
-        
         self.price_history: Deque[float] = deque(maxlen=boom_candles + 5)
 
-        indicator_deque_len = max(self.RSI_PERIOD, self.ATR_PERIOD) + 2 # Need prev_close
-        self.highs: Deque[float] = deque(maxlen=indicator_deque_len)
-        self.lows: Deque[float] = deque(maxlen=indicator_deque_len)
-        self.closes: Deque[float] = deque(maxlen=indicator_deque_len)
-
+        # --- State for resampled data ---
         self.ema_closes_4h: Deque[float] = deque(maxlen=cfg.EMA_SLOW_PERIOD + 2)
-        self.hr_closes:     Deque[float] = deque(maxlen=self.rsi_period + 2)
-        self.day_closes:    Deque[float] = deque(maxlen=cfg.STRUCTURAL_TREND_DAYS + 2)
+        self.hr_data: Deque[dict] = deque(maxlen=self.rsi_period + 20) # Stores {'high', 'low', 'close'}
+        self.day_closes: Deque[float] = deque(maxlen=cfg.STRUCTURAL_TREND_DAYS + 2)
 
-        # 4‑hour closes for EMAs
-        ema_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol,
-                                               self.ema_tf, cfg.EMA_SLOW_PERIOD + 5)
-        self.ema_closes_4h.extend([c[4] for c in ema_ohlc])
-        self.ema_fast = ta.ema_from_list(self.ema_closes_4h, cfg.EMA_FAST_PERIOD)
-        self.ema_slow = ta.ema_from_list(self.ema_closes_4h, cfg.EMA_SLOW_PERIOD)
+        # --- Indicator State ---
+        self.ema_fast = 0.0
+        self.ema_slow = 0.0
+        self.atr = 0.0 # ATR will be calculated on the 1h timeframe with RSI/ADX
+        self.rsi = 50.0
+        self.adx = 0.0
+        self.ret_30d = 0.0
 
-        # 1‑hour closes for RSI / ADX
-        hr_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol,
-                                              self.rsi_tf, self.rsi_period + 20)
-        self.hr_closes.extend([c[4] for c in hr_ohlc])
-        highs  = [c[2] for c in hr_ohlc]
-        lows   = [c[3] for c in hr_ohlc]
-        self.adx, self._adx_state = ta.initial_adx(highs, lows, self.hr_closes, self.adx_period)
-        self.rsi, self.avg_gain, self.avg_loss = ta.initial_rsi(self.hr_closes, self.rsi_period)
-
-        # daily closes for 30‑day return
-        day_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol,
-                                               "1d", cfg.STRUCTURAL_TREND_DAYS + 2)
-        self.day_closes.extend([c[4] for c in day_ohlc])
-
-        self.is_warmed_up = False
+        # --- Internal state for incremental calculations ---
+        self._avg_gain = 0.0
+        self._avg_loss = 0.0
+        self._adx_state = (0.0, 0.0, 0.0, 0.0) # prev_adx, prev_plus, prev_minus, prev_tr
 
     async def warm_up(self):
-        """Fetch initial historical data to calculate baseline indicators."""
+        """
+        Fetch initial historical data and calculate baseline indicators.
+        This is where all `await` calls belong.
+        """
         LOG.info("Warming up indicators for %s...", self.symbol)
 
-        wanted = max(
-            cfg.EMA_SLOW_PERIOD + 1,
-            self.price_history.maxlen,
-            self.closes.maxlen,
-        )
-
-        ohlcv = await fetch_ohlcv_paginated(
-            self.exchange,
-            self.symbol,
-            cfg.TIMEFRAME,
-            wanted,
-        )
-
-        if len(ohlcv) < wanted:
-            LOG.warning("Not enough historical data to warm up %s. Disabling.", self.symbol)
+        # --- 4-hour data for EMAs ---
+        ema_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.ema_tf, cfg.EMA_SLOW_PERIOD + 5)
+        if len(ema_ohlc) < cfg.EMA_SLOW_PERIOD:
+            LOG.warning("Not enough 4h data for EMA on %s", self.symbol)
             return
+        self.ema_closes_4h.extend([c[4] for c in ema_ohlc])
+        self.ema_fast = ta.ema_from_list(list(self.ema_closes_4h), cfg.EMA_FAST_PERIOD)
+        self.ema_slow = ta.ema_from_list(list(self.ema_closes_4h), cfg.EMA_SLOW_PERIOD)
 
-        try:
-            limit = max(cfg.EMA_SLOW_PERIOD + 1, self.price_history.maxlen, self.closes.maxlen)
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, cfg.TIMEFRAME, limit=limit)
+        # --- 1-hour data for RSI, ADX, and ATR ---
+        hr_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.rsi_tf, self.rsi_period + 50) # Need more for ADX smoothing
+        if len(hr_ohlc) < self.rsi_period + 20:
+            LOG.warning("Not enough 1h data for RSI/ADX on %s", self.symbol)
+            return
+        
+        highs = [c[2] for c in hr_ohlc]
+        lows = [c[3] for c in hr_ohlc]
+        closes = [c[4] for c in hr_ohlc]
+        self.hr_data.extend([{'high': h, 'low': l, 'close': c} for h, l, c in zip(highs, lows, closes)])
 
-            if len(ohlcv) < cfg.EMA_SLOW_PERIOD + 1:
-                LOG.warning("Not enough historical data to warm up %s. Disabling.", self.symbol)
-                return
+        self.rsi, self._avg_gain, self._avg_loss = ta.initial_rsi(closes, self.rsi_period)
+        self.atr = ta.initial_atr(highs, lows, closes, self.atr_period)
+        self.adx, self._adx_state = ta.initial_adx(highs, lows, closes, self.adx_period)
 
-            all_closes = [c[4] for c in ohlcv]
-            all_highs = [c[2] for c in ohlcv]
-            all_lows = [c[3] for c in ohlcv]
+        # --- Daily data for 30-day return ---
+        day_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, "1d", cfg.STRUCTURAL_TREND_DAYS + 2)
+        if len(day_ohlc) > cfg.STRUCTURAL_TREND_DAYS:
+            self.day_closes.extend([c[4] for c in day_ohlc])
+            price_30d_ago = self.day_closes[0]
+            self.ret_30d = (self.day_closes[-1] / price_30d_ago - 1) if price_30d_ago else 0.0
 
-            self.price_history.extend(all_closes)
-            self.highs.extend(all_highs)
-            self.lows.extend(all_lows)
-            self.closes.extend(all_closes)
+        # --- 5-minute data for boom/bust ---
+        ohlcv_5m = await fetch_ohlcv_paginated(self.exchange, self.symbol, cfg.TIMEFRAME, self.price_history.maxlen)
+        if not ohlcv_5m:
+            LOG.warning("Could not fetch 5m data for %s", self.symbol)
+            return
+        self.price_history.extend([c[4] for c in ohlcv_5m])
+        self.last_processed_timestamp = ohlcv_5m[-1][0]
 
-            self.ema_fast = ta.ema_from_list(all_closes, cfg.EMA_FAST_PERIOD)
-            self.ema_slow = ta.ema_from_list(all_closes, cfg.EMA_SLOW_PERIOD)
-            
-            # Use initial calculation methods and store state
-            self.atr = ta.initial_atr(all_highs, all_lows, all_closes, self.ATR_PERIOD)
-            self.rsi, self.avg_gain, self.avg_loss = ta.initial_rsi(all_closes, self.RSI_PERIOD)
-
-            self.last_processed_timestamp = ohlcv[-1][0]
-            self.is_warmed_up = True
-            LOG.info("Signal generator for %s is warmed up. ATR=%.4f, RSI=%.2f", self.symbol, self.atr, self.rsi)
-        except Exception as e:
-            LOG.error("Error during warm-up for %s: %s", self.symbol, e)
+        self.is_warmed_up = True
+        LOG.info("Signal generator for %s is warmed up. ATR=%.4f, RSI=%.2f, ADX=%.2f", self.symbol, self.atr, self.rsi, self.adx)
 
     def update_and_check(self, candle: list) -> Optional[Signal]:
         """
-        Updates indicators with a new closed candle and checks for a signal.
+        Updates indicators with a new 5m candle, resampling where necessary, and checks for a signal.
         """
-
-        if timestamp // (4*60*60*1000) > self.last_processed_timestamp // (4*60*60*1000):
-            self.ema_closes_4h.append(close)
-            self.ema_fast = ta.next_ema(close, self.ema_fast, cfg.EMA_FAST_PERIOD)
-            self.ema_slow = ta.next_ema(close, self.ema_slow, cfg.EMA_SLOW_PERIOD)
-
-        # 1‑hour boundary
-        if timestamp // (60*60*1000) > self.last_processed_timestamp // (60*60*1000):
-            prev_hr_close = self.hr_closes[-1] if self.hr_closes else close
-            self.hr_closes.append(close)
-            self.rsi, self.avg_gain, self.avg_loss = ta.next_rsi(
-                close, prev_hr_close, self.avg_gain, self.avg_loss, self.rsi_period)
-            self.adx, self._adx_state = ta.next_adx(
-                high, low, close, prev_hr_close, self._adx_state, self.adx_period)
-
-        # daily boundary (for 30‑day return)
-        if timestamp // (24*60*60*1000) > self.last_processed_timestamp // (24*60*60*1000):
-            self.day_closes.append(close)
-
-        ret_30d = 0.0
-        if len(self.day_closes) > cfg.STRUCTURAL_TREND_DAYS:
-            price_30d_ago = self.day_closes[-cfg.STRUCTURAL_TREND_DAYS-1]
-            ret_30d = (close / price_30d_ago - 1) if price_30d_ago else 0.0
-
         if not self.is_warmed_up or not candle:
             return None
 
         timestamp, _, high, low, close, _ = candle
-
         if timestamp <= self.last_processed_timestamp:
             return None
 
-        prev_close = self.closes[-1] if self.closes else close
-
-        self.price_history.append(close)
-        self.highs.append(high)
-        self.lows.append(low)
-        self.closes.append(close)
-
-        # Incrementally update indicators using previous state
-        self.ema_fast = ta.next_ema(close, self.ema_fast, cfg.EMA_FAST_PERIOD)
-        self.ema_slow = ta.next_ema(close, self.ema_slow, cfg.EMA_SLOW_PERIOD)
-        self.atr = ta.next_atr(self.atr, high, low, close, prev_close, self.ATR_PERIOD)
-        self.rsi, self.avg_gain, self.avg_loss = ta.next_rsi(
-            close, prev_close, self.avg_gain, self.avg_loss, self.RSI_PERIOD
-        )
-
+        prev_ts = self.last_processed_timestamp
         self.last_processed_timestamp = timestamp
 
-        # Check Entry Conditions
+        # --- Update raw 5m price history for boom/bust check ---
+        self.price_history.append(close)
+
+        # --- Check for timeframe boundaries to update resampled indicators ---
+
+        # 4-hour boundary
+        if timestamp // (4 * 3600 * 1000) > prev_ts // (4 * 3600 * 1000):
+            self.ema_closes_4h.append(close)
+            self.ema_fast = ta.next_ema(close, self.ema_fast, cfg.EMA_FAST_PERIOD)
+            self.ema_slow = ta.next_ema(close, self.ema_slow, cfg.EMA_SLOW_PERIOD)
+
+        # 1-hour boundary
+        if timestamp // (3600 * 1000) > prev_ts // (3600 * 1000):
+            prev_hr_candle = self.hr_data[-1]
+            self.hr_data.append({'high': high, 'low': low, 'close': close})
+            
+            # Update RSI
+            self.rsi, self._avg_gain, self._avg_loss = ta.next_rsi(
+                close, prev_hr_candle['close'], self._avg_gain, self._avg_loss, self.rsi_period
+            )
+            # Update ATR
+            self.atr = ta.next_atr(
+                self.atr, high, low, close, prev_hr_candle['close'], self.atr_period
+            )
+            # Update ADX
+            self.adx, self._adx_state = ta.next_adx(
+                high, low, close, 
+                prev_hr_candle['high'], prev_hr_candle['low'], prev_hr_candle['close'],
+                self._adx_state, self.adx_period
+            )
+
+        # Daily boundary (for 30-day return)
+        if timestamp // (24 * 3600 * 1000) > prev_ts // (24 * 3600 * 1000):
+            self.day_closes.append(close)
+            if len(self.day_closes) > cfg.STRUCTURAL_TREND_DAYS:
+                price_30d_ago = self.day_closes[0]
+                self.ret_30d = (close / price_30d_ago - 1) if price_30d_ago else 0.0
+
+        # --- Check Entry Conditions ---
         hours_per_candle = _get_hours_from_timeframe(cfg.TIMEFRAME)
         boom_periods = int(cfg.PRICE_BOOM_PERIOD_H / hours_per_candle)
         if len(self.price_history) < boom_periods + 1:
@@ -219,20 +196,18 @@ class SignalGenerator:
         c3_ema_down = self.ema_fast < self.ema_slow
 
         LOG.debug(
-            "%s check: Boom=%s, Slowdown=%s, EMA_Down=%s, ATR=%.4f, RSI=%.2f",
-            self.symbol, price_boom, price_slowdown, c3_ema_down, self.atr, self.rsi
+            "%s check: Boom=%s, Slowdown=%s, EMA_Down=%s, ATR=%.4f, RSI=%.2f, ADX=%.2f",
+            self.symbol, price_boom, price_slowdown, c3_ema_down, self.atr, self.rsi, self.adx
         )
 
         if price_boom and price_slowdown and c3_ema_down:
             LOG.info("SIGNAL FOUND for %s at price %.4f", self.symbol, close)
-        
             return Signal(
                 symbol=self.symbol,
                 entry=float(close),
                 atr=float(self.atr),
                 rsi=float(self.rsi),
-                ret_30d=float(ret_30d),
+                ret_30d=float(self.ret_30d),
                 adx=float(self.adx),
             )
-
         return None

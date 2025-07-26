@@ -109,7 +109,6 @@ def lbr_310(series: pd.Series) -> pd.Series:
     """Linda Bradford Raschke 3‑10 oscillator = SMA3(close) – SMA10(close)."""
     return series.rolling(3).mean() - series.rolling(10).mean()
 
-# --- MODIFICATION START (ADX Filter) ---
 def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
     Calculates the Average Directional Index (ADX).
@@ -134,4 +133,3 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
         return pd.Series(dtype='float64', index=df.index)
         
     return adx_df[adx_col[0]]
-# --- MODIFICATION END (ADX Filter) ---
