@@ -5,8 +5,8 @@ from collections import deque
 import config as cfg
 import logging
 import re
-from live import live_indicators as ta
-from exchange_proxy import fetch_ohlcv_paginated
+from . import live_indicators as ta
+from .exchange_proxy import fetch_ohlcv_paginated
 
 LOG = logging.getLogger(__name__)
 
