@@ -347,7 +347,10 @@ class LiveTrader:
                 f"  --------------------------------------------------\n"
                 f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
                 f"  - VWAP Consolidated:       {'✅' if last['vwap_consolidated'] else '❌'}\n"
-                f"  - ATR ({atr_tf}):                 {last['atr']:.6f}"
+                f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
+                f"====================================================\n"
+                f"====================================================\n"
+                f"====================================================\n"
             )
 
             if price_boom and price_slowdown and ema_down:
