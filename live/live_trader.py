@@ -335,7 +335,14 @@ class LiveTrader:
 
             price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
             price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
-            ema_down = last['ema_fast'] < last['ema_slow']
+
+            ema_filter_enabled = self.cfg.get("EMA_FILTER_ENABLED", True)
+            if ema_filter_enabled:
+                ema_down = last['ema_fast'] < last['ema_slow']
+                ema_log_msg = f"{'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} < Slow: {last['ema_slow']:.4f})"
+            else:
+                ema_down = True  # If disabled, this condition is always met
+                ema_log_msg = " DISABLED"
 
             # --- CLEAN DEBUG LOGGING ---
             LOG.debug(
