@@ -691,7 +691,8 @@ class LiveTrader:
                                 await self._open_position(signal)
                         else:
                             LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
-
+                        break
+                    
             except Exception as e:
                 LOG.error("Error processing symbol %s: %s", sym, e)
 
@@ -703,7 +704,18 @@ class LiveTrader:
         """
         # --- One-time setup: Instantiate and warm up a generator for each symbol ---
         LOG.info("Starting signal generator warm-up for %d symbols...", len(self.symbols))
-        
+
+        # Limit concurrent warm-ups to avoid API rate limiting. 10 is a safe number.
+        warmup_semaphore = asyncio.Semaphore(10)
+
+        async def _warm_up_symbol(gen: SignalGenerator):
+            """Wrapper to apply semaphore to each warmup task."""
+            async with warmup_semaphore:
+                await gen.warm_up()
+                # Add a small sleep to further space out requests
+                await asyncio.sleep(0.1)
+
+
         warmup_tasks = []
         for sym in self.symbols:
             gen = SignalGenerator(sym, self.exchange)

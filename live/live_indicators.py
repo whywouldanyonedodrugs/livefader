@@ -44,25 +44,27 @@ def next_ema(price: float, prev_ema: float, period: int) -> float:
 def initial_rsi(prices: List[float], period: int = 14) -> Tuple[float, float, float]:
     """
     Calculates the initial RSI, Average Gain, and Average Loss from a list of prices.
-    The first average is a simple average, subsequent values are smoothed.
-    Returns (rsi, avg_gain, avg_loss)
+    This version is corrected to prevent over-smoothing the entire history.
     """
     if len(prices) < period + 1:
         return 50.0, 0.0, 0.0
 
-    changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    
+    # We only need the most recent data for the calculation
+    relevant_prices = prices[-(period + 2):]
+    changes = [relevant_prices[i] - relevant_prices[i-1] for i in range(1, len(relevant_prices))]
+
+    # The first average is a simple average of the first `period` changes
     initial_gains = sum(c for c in changes[:period] if c > 0)
     initial_losses = sum(-c for c in changes[:period] if c < 0)
 
     avg_gain = initial_gains / period
     avg_loss = initial_losses / period
 
-    # Smooth subsequent values
-    for i in range(period, len(changes)):
-        change = changes[i]
-        gain = change if change > 0 else 0
-        loss = -change if change < 0 else 0
+    # If there's any extra data, do one smoothing step to align with incremental updates
+    if len(changes) > period:
+        last_change = changes[period]
+        gain = last_change if last_change > 0 else 0
+        loss = -last_change if last_change < 0 else 0
         avg_gain = (avg_gain * (period - 1) + gain) / period
         avg_loss = (avg_loss * (period - 1) + loss) / period
 
@@ -99,14 +101,19 @@ def next_rsi(price: float, prev_price: float, prev_avg_gain: float, prev_avg_los
 def initial_atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
     """
     Calculates the initial ATR from lists of historical data.
-    Uses Wilder's Smoothing Method (same as TA-Lib).
+    Corrected to prevent over-smoothing the entire history.
     """
     if len(closes) < period + 1:
         return 0.0
 
+    # We only need the most recent data for the calculation
+    relevant_highs = highs[-(period + 2):]
+    relevant_lows = lows[-(period + 2):]
+    relevant_closes = closes[-(period + 2):]
+
     true_ranges = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+    for i in range(1, len(relevant_closes)):
+        tr = max(relevant_highs[i] - relevant_lows[i], abs(relevant_highs[i] - relevant_closes[i-1]), abs(relevant_lows[i] - relevant_closes[i-1]))
         true_ranges.append(tr)
 
     if not true_ranges or len(true_ranges) < period:
@@ -115,9 +122,9 @@ def initial_atr(highs: List[float], lows: List[float], closes: List[float], peri
     # The first ATR is a simple average of the first `period` TRs
     atr = sum(true_ranges[:period]) / period
     
-    # Apply Wilder's smoothing for the rest of the historical data
-    for i in range(period, len(true_ranges)):
-        atr = (atr * (period - 1) + true_ranges[i]) / period
+    # If there's any extra data, do one smoothing step
+    if len(true_ranges) > period:
+        atr = (atr * (period - 1) + true_ranges[period]) / period
         
     return atr
 
