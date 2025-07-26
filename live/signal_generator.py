@@ -8,6 +8,7 @@ import re
 import traceback
 import ccxt
 import pandas as pd
+import numpy as np
 from . import indicators as ta
 from .exchange_proxy import fetch_ohlcv_paginated
 
