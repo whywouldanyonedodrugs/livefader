@@ -85,44 +85,49 @@ class SignalGenerator:
         """
         LOG.info("Warming up indicators for %s...", self.symbol)
 
-        # --- 4-hour data for EMAs ---
-        ema_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.ema_tf, cfg.EMA_SLOW_PERIOD + 5)
-        if len(ema_ohlc) < cfg.EMA_SLOW_PERIOD:
-            LOG.warning("Not enough 4h data for EMA on %s", self.symbol)
-            return
-        self.ema_closes_4h.extend([c[4] for c in ema_ohlc])
-        self.ema_fast = ta.ema_from_list(list(self.ema_closes_4h), cfg.EMA_FAST_PERIOD)
-        self.ema_slow = ta.ema_from_list(list(self.ema_closes_4h), cfg.EMA_SLOW_PERIOD)
+        try: # <--- ADD THIS TRY BLOCK
+            # --- 4-hour data for EMAs ---
+            ema_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.ema_tf, cfg.EMA_SLOW_PERIOD + 5)
+            if len(ema_ohlc) < cfg.EMA_SLOW_PERIOD:
+                LOG.warning("Not enough 4h data for EMA on %s", self.symbol)
+                return
+            self.ema_closes_4h.extend([c[4] for c in ema_ohlc])
+            self.ema_fast = ta.ema_from_list(list(self.ema_closes_4h), cfg.EMA_FAST_PERIOD)
+            self.ema_slow = ta.ema_from_list(list(self.ema_closes_4h), cfg.EMA_SLOW_PERIOD)
 
-        # --- 1-hour data for RSI, ADX, and ATR ---
-        hr_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.rsi_tf, self.rsi_period + 50) # Need more for ADX smoothing
-        if len(hr_ohlc) < self.rsi_period + 20:
-            LOG.warning("Not enough 1h data for RSI/ADX on %s", self.symbol)
-            return
-        
-        highs = [c[2] for c in hr_ohlc]
-        lows = [c[3] for c in hr_ohlc]
-        closes = [c[4] for c in hr_ohlc]
-        self.hr_data.extend([{'high': h, 'low': l, 'close': c} for h, l, c in zip(highs, lows, closes)])
+            # --- 1-hour data for RSI, ADX, and ATR ---
+            hr_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, self.rsi_tf, self.rsi_period + 50) # Need more for ADX smoothing
+            if len(hr_ohlc) < self.rsi_period + 20:
+                LOG.warning("Not enough 1h data for RSI/ADX on %s", self.symbol)
+                return
+            
+            highs = [c[2] for c in hr_ohlc]
+            lows = [c[3] for c in hr_ohlc]
+            closes = [c[4] for c in hr_ohlc]
+            self.hr_data.extend([{'high': h, 'low': l, 'close': c} for h, l, c in zip(highs, lows, closes)])
 
-        self.rsi, self._avg_gain, self._avg_loss = ta.initial_rsi(closes, self.rsi_period)
-        self.atr = ta.initial_atr(highs, lows, closes, self.atr_period)
-        self.adx, self._adx_state = ta.initial_adx(highs, lows, closes, self.adx_period)
+            self.rsi, self._avg_gain, self._avg_loss = ta.initial_rsi(closes, self.rsi_period)
+            self.atr = ta.initial_atr(highs, lows, closes, self.atr_period)
+            self.adx, self._adx_state = ta.initial_adx(highs, lows, closes, self.adx_period)
 
-        # --- Daily data for 30-day return ---
-        day_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, "1d", cfg.STRUCTURAL_TREND_DAYS + 2)
-        if len(day_ohlc) > cfg.STRUCTURAL_TREND_DAYS:
-            self.day_closes.extend([c[4] for c in day_ohlc])
-            price_30d_ago = self.day_closes[0]
-            self.ret_30d = (self.day_closes[-1] / price_30d_ago - 1) if price_30d_ago else 0.0
+            # --- Daily data for 30-day return ---
+            day_ohlc = await fetch_ohlcv_paginated(self.exchange, self.symbol, "1d", cfg.STRUCTURAL_TREND_DAYS + 2)
+            if len(day_ohlc) > cfg.STRUCTURAL_TREND_DAYS:
+                self.day_closes.extend([c[4] for c in day_ohlc])
+                price_30d_ago = self.day_closes[0]
+                self.ret_30d = (self.day_closes[-1] / price_30d_ago - 1) if price_30d_ago else 0.0
 
-        # --- 5-minute data for boom/bust ---
-        ohlcv_5m = await fetch_ohlcv_paginated(self.exchange, self.symbol, cfg.TIMEFRAME, self.price_history.maxlen)
-        if not ohlcv_5m:
-            LOG.warning("Could not fetch 5m data for %s", self.symbol)
-            return
-        self.price_history.extend([c[4] for c in ohlcv_5m])
-        self.last_processed_timestamp = ohlcv_5m[-1][0]
+            # --- 5-minute data for boom/bust ---
+            ohlcv_5m = await fetch_ohlcv_paginated(self.exchange, self.symbol, cfg.TIMEFRAME, self.price_history.maxlen)
+            if not ohlcv_5m:
+                LOG.warning("Could not fetch 5m data for %s", self.symbol)
+                return
+            self.price_history.extend([c[4] for c in ohlcv_5m])
+            self.last_processed_timestamp = ohlcv_5m[-1][0]
+
+        except ccxt.BadSymbol as e: # <--- ADD THIS EXCEPT BLOCK
+            LOG.warning("Could not warm up %s: Invalid symbol on exchange. Skipping. Error: %s", self.symbol, e)
+            return # Gracefully exit the warmup for this symbol only
 
         self.is_warmed_up = True
         LOG.info("Signal generator for %s is warmed up. ATR=%.4f, RSI=%.2f, ADX=%.2f", self.symbol, self.atr, self.rsi, self.adx)
