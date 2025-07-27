@@ -271,11 +271,12 @@ class LiveTrader:
     def _cid(pid: int, tag: str) -> str:
         return f"bot_{pid}_{tag}"
 
+# In class LiveTrader:
+
     async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
         """
-        Checks a symbol for a signal using a 5-minute base timeframe while calculating
-        indicators on their respective higher timeframes (1h, 4h), perfectly matching
-        the backtester's "rolling window" logic.
+        Final corrected version. Includes a configurable switch for the
+        structural trend filter and adds its status to the debug log.
         """
         LOG.info("Checking %s...", symbol)
         try:
@@ -283,7 +284,7 @@ class LiveTrader:
             base_tf = self.cfg.get('TIMEFRAME', '5m')
             ema_tf = self.cfg.get('EMA_TIMEFRAME', '4h')
             rsi_tf = self.cfg.get('RSI_TIMEFRAME', '1h')
-            atr_tf = self.cfg.get('ADX_TIMEFRAME', '1h') # ATR and ADX often share a timeframe
+            atr_tf = self.cfg.get('ADX_TIMEFRAME', '1h')
             
             required_tfs = {base_tf, ema_tf, rsi_tf, atr_tf, '1d'}
 
@@ -302,21 +303,29 @@ class LiveTrader:
                 df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
                 df.set_index('timestamp', inplace=True)
-                df.drop(df.index[-1], inplace=True) # Drop the incomplete, current candle
+                
+                recent_candles = df.tail(100)
+                if not recent_candles.empty:
+                    zero_volume_pct = (recent_candles['volume'] == 0).sum() / len(recent_candles)
+                    if zero_volume_pct > 0.25:
+                        LOG.warning("DATA_ERROR for %s on %s: Detected stale data (%.0f%% zero volume). Skipping symbol.", symbol, tf, zero_volume_pct * 100)
+                        return None
+                
+                df.drop(df.index[-1], inplace=True)
                 if df.empty: return None
                 dfs[tf] = df
 
             # 3. Use the 5m DataFrame as the base for our checks
             df5 = dfs[base_tf]
 
-            # 4. Calculate indicators on their proper timeframes and map them to the 5m base
+            # 4. Calculate indicators
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
             df5['rsi'] = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
             df5['atr'] = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
             df5['adx'] = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
-            # 5. Calculate rolling window conditions on the 5m base
+            # 5. Calculate rolling window conditions
             tf_minutes = 5
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
@@ -353,21 +362,29 @@ class LiveTrader:
                 ema_down = last['ema_fast'] < last['ema_slow']
                 ema_log_msg = f"{'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} < Slow: {last['ema_slow']:.4f})"
             else:
-                ema_down = True  # If disabled, this condition is always met
+                ema_down = True
                 ema_log_msg = " DISABLED"
+            
+            # --- NEW: Prepare log message for the Trend Filter ---
+            trend_filter_enabled = self.cfg.get("STRUCTURAL_TREND_FILTER_ENABLED", True)
+            if trend_filter_enabled:
+                trend_ok = ret_30d <= self.cfg.get("STRUCTURAL_TREND_RET_PCT", 0.01)
+                trend_log_msg = f"{'✅' if trend_ok else '❌'} (Return: {ret_30d:+.2%})"
+            else:
+                trend_log_msg = " DISABLED"
 
             # --- CLEAN DEBUG LOGGING ---
             LOG.debug(
                 f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
                 f"  [Base Timeframe: {base_tf}]\n"
                 f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h lookback): {'✅' if price_boom else '❌'} (is {boom_ret_pct:+.2%})\n"
-                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h lookback): {'✅' if price_slowdown else '❌'} (is {slowdown_ret_pct:.2%})\n"
-                f"  - EMA Trend Down ({ema_tf}):      {'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} < Slow: {last['ema_slow']:.4f})\n"
+                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h lookback): {'✅' if price_slowdown else '❌'} (is {slowdown_ret_pct:+.2%})\n"
+                f"  - EMA Trend Down ({ema_tf}):      {ema_log_msg}\n"
                 f"  --------------------------------------------------\n"
                 f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
+                f"  - 30d Trend Filter:        {trend_log_msg}\n"
                 f"  - VWAP Consolidated:       {'✅' if last['vwap_consolidated'] else '❌'}\n"
                 f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
-                f"====================================================\n"
                 f"====================================================\n"
                 f"====================================================\n"
             )

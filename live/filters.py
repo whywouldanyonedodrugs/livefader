@@ -44,11 +44,13 @@ def evaluate(
     if not (cfg.RSI_ENTRY_MIN <= sig.rsi <= cfg.RSI_ENTRY_MAX):
         vetoes.append("RSI_RANGE")
         ok = False
-
+        
     # ── 4. 30‑day structural‑trend veto ─────────────────────────────────
-    if sig.ret_30d is not None and sig.ret_30d > cfg.STRUCTURAL_TREND_RET_PCT:
-        vetoes.append("STRUCTURAL_TREND")
-        ok = False
+    # Use getattr for a safe way to check for the new switch
+    if getattr(cfg, "STRUCTURAL_TREND_FILTER_ENABLED", True):
+        if sig.ret_30d is not None and sig.ret_30d > cfg.STRUCTURAL_TREND_RET_PCT:
+            vetoes.append("STRUCTURAL_TREND")
+            ok = False
 
     # ── 5. Optional ADX trend‑strength veto ─────────────────────────────
     if cfg.ADX_FILTER_ENABLED:

@@ -17,7 +17,7 @@ BYBIT_ACCOUNT_TYPE    = "UNIFIED"  # or "STANDARD"
 START_DATE = "2022-01-01"
 END_DATE = "2026-01-01"
 
-EMA_FILTER_ENABLED = False
+EMA_FILTER_ENABLED = True
 EMA_TIMEFRAME   = "4h" 
 EMA_FAST_PERIOD = 20   # 20
 EMA_SLOW_PERIOD = 200 # 200
@@ -64,6 +64,7 @@ MIN_COIN_AGE_DAYS = 14  # Min days since listing
 MAX_COIN_AGE_DAYS = 1825 # Max days since listing (e.g., 5 years)
 
 # --- Structural Trend Filter (Long-Term) ---
+STRUCTURAL_TREND_FILTER_ENABLED = False 
 STRUCTURAL_TREND_DAYS    = 30
 STRUCTURAL_TREND_RET_PCT = 0.01
 
