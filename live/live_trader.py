@@ -377,14 +377,14 @@ class LiveTrader:
             LOG.debug(
                 f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
                 f"  [Base Timeframe: {base_tf}]\n"
-                f"  - Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h lookback): {'✅' if price_boom else '❌'} (is {boom_ret_pct:+.2%})\n"
-                f"  - Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h lookback): {'✅' if price_slowdown else '❌'} (is {slowdown_ret_pct:+.2%})\n"
-                f"  - EMA      ({ema_tf}): {ema_log_msg}\n"
+                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h lookback): {'✅' if price_boom else '❌'} (is {boom_ret_pct:+.2%})\n"
+                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h lookback): {'✅' if price_slowdown else '❌'} (is {slowdown_ret_pct:+.2%})\n"
+                f"  - EMA Trend Down ({ema_tf}):      {ema_log_msg}\n"
                 f"  --------------------------------------------------\n"
-                f"  - RSI ({rsi_tf}):   {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
-                f"  - 30d Trend:        {trend_log_msg}\n"
-                f"  - VWAP Cons:        {'✅' if last['vwap_consolidated'] else '❌'}\n"
-                f"  - ATR ({atr_tf}):   {last['atr']:.6f}\n"
+                f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
+                f"  - 30d Trend Filter:        {trend_log_msg}\n" # <-- ADDED THIS LINE
+                f"  - VWAP Consolidated:       {'✅' if last['vwap_consolidated'] else '❌'}\n"
+                f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
                 f"====================================================\n"
                 f"====================================================\n"
             )
