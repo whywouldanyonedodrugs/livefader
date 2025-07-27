@@ -158,14 +158,26 @@ class RiskManager:
 class LiveTrader:
     def __init__(self, settings: Settings, cfg_dict: Dict[str, Any]):
         self.settings = settings
-        self.cfg = cfg_dict
 
-        for k, v in cfg_dict.items():
+        # 1. Create a new config dictionary that will hold the unified settings.
+        self.cfg = {}
+        
+        # 2. Load all the default values from the config.py module first.
+        # This iterates through config.py and adds all uppercase variables.
+        for key in dir(cfg):
+            if key.isupper():
+                self.cfg[key] = getattr(cfg, key)
+        
+        # 3. Now, update the dictionary with any overrides from config.yaml.
+        # This ensures that settings in config.yaml take precedence.
+        self.cfg.update(cfg_dict)
+
+        for k, v in self.cfg.items():
             setattr(cfg, k, v)
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
-        self.risk = RiskManager(cfg_dict)
+        self.risk = RiskManager(self.cfg) # Pass the unified config to the risk manager
 
         self.exchange = ExchangeProxy(self._init_ccxt())
 
