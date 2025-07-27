@@ -331,7 +331,7 @@ class LiveTrader:
             # 6. Check conditions on the very last completed 5-minute candle
             last = df5.iloc[-1]
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
-            slowdown_ret_pct = abs(last['close'] / last['price_slowdown_ago'] - 1)
+            slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
 
             price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
             price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
