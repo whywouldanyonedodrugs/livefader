@@ -17,7 +17,7 @@ BYBIT_ACCOUNT_TYPE    = "UNIFIED"  # or "STANDARD"
 START_DATE = "2022-01-01"
 END_DATE = "2026-01-01"
 
-EMA_FILTER_ENABLED = False
+EMA_FILTER_ENABLED = True
 EMA_TIMEFRAME   = "4h" 
 EMA_FAST_PERIOD = 20   # 20
 EMA_SLOW_PERIOD = 200 # 200
@@ -46,7 +46,7 @@ RISK_PCT           = 0.005         # 0.5 %
 SLIPPAGE_BUFFER_PCT = 0.0005
 
 # ── stop / targets ─────────────────────────────────────────────────────────
-SL_ATR_MULT             = 3.0
+SL_ATR_MULT             = 2.5
 FINAL_TP_ENABLED        = True
 FINAL_TP_ATR_MULT       = 1.0
 PARTIAL_TP_ENABLED      = False
