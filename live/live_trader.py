@@ -277,8 +277,8 @@ class LiveTrader:
 
     async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
         """
-        Final corrected version. Includes a configurable switch for the
-        structural trend filter and adds the exact VWAP deviation % to the debug log.
+        Final robust version. Correctly handles disabled filters by providing
+        safe placeholder values instead of NaN, preventing the dropna() error.
         """
         LOG.info("Checking %s...", symbol)
         try:
@@ -337,6 +337,7 @@ class LiveTrader:
             df1d = dfs['1d']
             ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
 
+            # --- CORRECTED FILTER LOGIC ---
             if self.cfg.get("GAP_FILTER_ENABLED", True):
                 vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
                 vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
@@ -346,8 +347,11 @@ class LiveTrader:
                 df5['vwap_ok'] = df5['vwap_dev'] <= cfg.GAP_MAX_DEV_PCT
                 df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
             else:
+                # If filter is disabled, create placeholder columns with safe, non-NaN values.
                 df5['vwap_consolidated'] = True
-                df5['vwap_dev'] = float('nan') # Add column so it doesn't crash later
+                df5['vwap_dev'] = 0.0
+                df5['vwap_ok'] = True
+                df5['vwap'] = df5['close']
 
             df5.dropna(inplace=True)
             if df5.empty: return None
@@ -375,16 +379,15 @@ class LiveTrader:
             else:
                 trend_log_msg = " DISABLED"
 
-            # --- NEW: Prepare detailed log message for the VWAP Filter ---
             gap_filter_enabled = self.cfg.get("GAP_FILTER_ENABLED", True)
             if gap_filter_enabled:
                 vwap_dev_pct = last.get('vwap_dev', float('nan'))
                 vwap_dev_str = f"{vwap_dev_pct:.2%}" if pd.notna(vwap_dev_pct) else "N/A"
-                vwap_log_msg = f"{'✅' if last['vwap_consolidated'] else '❌'} (Deviation: {vwap_dev_str})"
+                current_dev_ok = last.get('vwap_ok', False)
+                vwap_log_msg = f"{'✅' if last['vwap_consolidated'] else '❌'} (Streak Failed) | Current Dev: {'✅' if current_dev_ok else '❌'} ({vwap_dev_str})"
             else:
                 vwap_log_msg = " DISABLED"
 
-            # --- CLEAN DEBUG LOGGING ---
             LOG.debug(
                 f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
                 f"  [Base Timeframe: {base_tf}]\n"
@@ -394,7 +397,7 @@ class LiveTrader:
                 f"  --------------------------------------------------\n"
                 f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
                 f"  - 30d Trend Filter:        {trend_log_msg}\n"
-                f"  - VWAP Consolidated:       {vwap_log_msg}\n" 
+                f"  - VWAP Consolidated:       {vwap_log_msg}\n"
                 f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
                 f"====================================================\n"
             )
