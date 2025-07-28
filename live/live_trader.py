@@ -273,10 +273,12 @@ class LiveTrader:
 
 # In class LiveTrader:
 
+# In class LiveTrader:
+
     async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
         """
         Final corrected version. Includes a configurable switch for the
-        structural trend filter and adds its status to the debug log.
+        structural trend filter and adds the exact VWAP deviation % to the debug log.
         """
         LOG.info("Checking %s...", symbol)
         try:
@@ -335,7 +337,7 @@ class LiveTrader:
             df1d = dfs['1d']
             ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
 
-            if cfg.GAP_FILTER_ENABLED:
+            if self.cfg.get("GAP_FILTER_ENABLED", True):
                 vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
                 vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
                 vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
@@ -345,6 +347,7 @@ class LiveTrader:
                 df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
             else:
                 df5['vwap_consolidated'] = True
+                df5['vwap_dev'] = float('nan') # Add column so it doesn't crash later
 
             df5.dropna(inplace=True)
             if df5.empty: return None
@@ -365,13 +368,21 @@ class LiveTrader:
                 ema_down = True
                 ema_log_msg = " DISABLED"
             
-            # --- NEW: Prepare log message for the Trend Filter ---
             trend_filter_enabled = self.cfg.get("STRUCTURAL_TREND_FILTER_ENABLED", True)
             if trend_filter_enabled:
                 trend_ok = ret_30d <= self.cfg.get("STRUCTURAL_TREND_RET_PCT", 0.01)
                 trend_log_msg = f"{'✅' if trend_ok else '❌'} (Return: {ret_30d:+.2%})"
             else:
                 trend_log_msg = " DISABLED"
+
+            # --- NEW: Prepare detailed log message for the VWAP Filter ---
+            gap_filter_enabled = self.cfg.get("GAP_FILTER_ENABLED", True)
+            if gap_filter_enabled:
+                vwap_dev_pct = last.get('vwap_dev', float('nan'))
+                vwap_dev_str = f"{vwap_dev_pct:.2%}" if pd.notna(vwap_dev_pct) else "N/A"
+                vwap_log_msg = f"{'✅' if last['vwap_consolidated'] else '❌'} (Deviation: {vwap_dev_str})"
+            else:
+                vwap_log_msg = " DISABLED"
 
             # --- CLEAN DEBUG LOGGING ---
             LOG.debug(
@@ -382,10 +393,9 @@ class LiveTrader:
                 f"  - EMA Trend Down ({ema_tf}):      {ema_log_msg}\n"
                 f"  --------------------------------------------------\n"
                 f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
-                f"  - 30d Trend Filter:        {trend_log_msg}\n" # <-- ADDED THIS LINE
-                f"  - VWAP Consolidated:       {'✅' if last['vwap_consolidated'] else '❌'}\n"
+                f"  - 30d Trend Filter:        {trend_log_msg}\n"
+                f"  - VWAP Consolidated:       {vwap_log_msg}\n" 
                 f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
-                f"====================================================\n"
                 f"====================================================\n"
             )
 
