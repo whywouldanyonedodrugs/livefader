@@ -1,10 +1,8 @@
 """
-live_trader.py – v3.0 (Simplified)
+live_trader.py – v3.0 (Simplified & Corrected)
 ===========================================================================
-This version removes the complex stateful signal generation layer and
-adopts a simpler, more robust stateless scanning approach. In each cycle,
-it fetches fresh data, calculates all indicators using pandas, and checks
-for signals, mirroring the logic of the proven discretionary alert bot.
+This version restores the missing _load_listing_dates method that was
+accidentally deleted, fixing the startup crash.
 """
 
 from __future__ import annotations
@@ -43,10 +41,6 @@ from .telegram import TelegramBot
 from pydantic import Field, Extra, ValidationError
 from pydantic_settings import BaseSettings
 
-# ---------------------------  YOUR MODULES  ------------------------------
-# The old scout import is no longer needed with the integrated scanner.
-# -------------------------------------------------------------------------
-
 @dataclasses.dataclass
 class Signal:
     symbol: str
@@ -72,29 +66,25 @@ logging.basicConfig(
 
 logging.getLogger("ccxt").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
 ###############################################################################
 # 1 ▸ SETTINGS pulled from ENV (.env) #########################################
 ###############################################################################
 
 class Settings(BaseSettings):
     """Secrets & env flags."""
-
     bybit_api_key: str = Field(..., validation_alias="BYBIT_API_KEY")
     bybit_api_secret: str = Field(..., validation_alias="BYBIT_API_SECRET")
     bybit_testnet: bool = Field(False, validation_alias="BYBIT_TESTNET")
-
     tg_bot_token: str = Field(..., validation_alias="TG_BOT_TOKEN")
     tg_chat_id: str = Field(..., validation_alias="TG_CHAT_ID")
-
     pg_dsn: str = Field(..., validation_alias="DATABASE_URL")
-
     default_leverage: int = 10
 
     class Config:
         env_file = ".env"
         case_sensitive = False
         extra = 'ignore'
-
 
 ###############################################################################
 # 2 ▸ PATHS & YAML LOADER #####################################################
@@ -103,17 +93,14 @@ class Settings(BaseSettings):
 CONFIG_PATH = Path("config.yaml")
 SYMBOLS_PATH = Path("symbols.txt")
 
-
 def load_yaml(p: Path) -> Dict[str, Any]:
     if not p.exists():
         raise FileNotFoundError(p)
     return yaml.safe_load(p.read_text()) or {}
 
-
 ###############################################################################
 # 3 ▸ HOT‑RELOAD WATCHER ######################################################
 ###############################################################################
-
 
 class _Watcher(FileSystemEventHandler):
     def __init__(self, path: Path, cb):
@@ -124,13 +111,14 @@ class _Watcher(FileSystemEventHandler):
         obs.daemon = True
         obs.start()
 
-    def on_modified(self, e):  # noqa: N802
+    def on_modified(self, e):
         if Path(e.src_path).resolve() == self.path:
             self.cb()
 
 ###############################################################################
 # 4 ▸ RISK MANAGER ###########################################################
 ###############################################################################
+
 class RiskManager:
     def __init__(self, cfg_dict: Dict[str, Any]):
         self.cfg = cfg_dict
@@ -149,27 +137,17 @@ class RiskManager:
     def can_trade(self) -> bool:
         return not self.kill_switch
 
-
 ###############################################################################
 # 5 ▸ MAIN TRADER ###########################################################
 ###############################################################################
 
-
 class LiveTrader:
     def __init__(self, settings: Settings, cfg_dict: Dict[str, Any]):
         self.settings = settings
-
-        # 1. Create a new config dictionary that will hold the unified settings.
         self.cfg = {}
-        
-        # 2. Load all the default values from the config.py module first.
-        # This iterates through config.py and adds all uppercase variables.
         for key in dir(cfg):
             if key.isupper():
                 self.cfg[key] = getattr(cfg, key)
-        
-        # 3. Now, update the dictionary with any overrides from config.yaml.
-        # This ensures that settings in config.yaml take precedence.
         self.cfg.update(cfg_dict)
 
         for k, v in self.cfg.items():
@@ -177,20 +155,15 @@ class LiveTrader:
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
-        self.risk = RiskManager(self.cfg) # Pass the unified config to the risk manager
-
+        self.risk = RiskManager(self.cfg)
         self.exchange = ExchangeProxy(self._init_ccxt())
-
         self.symbols = self._load_symbols()
         self.open_positions: Dict[int, Dict[str, Any]] = {}
         self.peak_equity: float = 0.0
         self._listing_dates_cache: Dict[str, datetime.date] = {}
-
         self.last_exit: Dict[str, datetime] = {}
-
         _Watcher(CONFIG_PATH, self._reload_cfg)
         _Watcher(SYMBOLS_PATH, self._reload_symbols)
-
         self.paused = False
         self.tasks: List[asyncio.Task] = []
         self.api_semaphore = asyncio.Semaphore(10)
@@ -224,17 +197,32 @@ class LiveTrader:
             await self.exchange.set_margin_mode("cross", symbol)
             await self.exchange.set_leverage(self.settings.default_leverage, symbol)
         except ccxt.ExchangeError as e:
-            # Bybit throws an error if the leverage is already set to the desired value.
-            # We can safely ignore this specific error message.
             if "leverage not modified" in str(e):
                 LOG.debug("Leverage for %s already set to %dx.", symbol, self.settings.default_leverage)
             else:
-                # Re-raise the exception if it's a different, more serious error
                 LOG.warning("Leverage setup failed for %s: %s", symbol, e)
                 raise e
         except Exception as e:
             LOG.warning("An unexpected error occurred during leverage setup for %s: %s", symbol, e)
             raise e
+
+    # --- THIS METHOD WAS MISSING ---
+    async def _load_listing_dates(self) -> Dict[str, datetime.date]:
+        if LISTING_PATH.exists():
+            import datetime as _dt
+            raw = json.loads(LISTING_PATH.read_text())
+            return {s: _dt.date.fromisoformat(ts) for s, ts in raw.items()}
+
+        LOG.info("listing_dates.json not found. Fetching from exchange...")
+        async def fetch_date(sym):
+            try:
+                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1, since=0)
+                if candles:
+                    ts = datetime.fromtimestamp(candles[0][0] / 1000, tz=timezone.utc)
+                    return sym, ts.date()
+            except Exception as e:
+                LOG.warning("Could not fetch listing date for %s: %s", sym, e)
+            return sym, None
 
         tasks = [fetch_date(sym) for sym in self.symbols]
         results = await asyncio.gather(*tasks)
@@ -264,32 +252,20 @@ class LiveTrader:
     def _cid(pid: int, tag: str) -> str:
         return f"bot_{pid}_{tag}"
 
-# In class LiveTrader:
-
-# In class LiveTrader:
-
     async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
-        """
-        Final robust version. Correctly handles disabled filters by providing
-        safe placeholder values instead of NaN, preventing the dropna() error.
-        """
         LOG.info("Checking %s...", symbol)
         try:
-            # --- Define Timeframes ---
             base_tf = self.cfg.get('TIMEFRAME', '5m')
             ema_tf = self.cfg.get('EMA_TIMEFRAME', '4h')
             rsi_tf = self.cfg.get('RSI_TIMEFRAME', '1h')
             atr_tf = self.cfg.get('ADX_TIMEFRAME', '1h')
-            
             required_tfs = {base_tf, ema_tf, rsi_tf, atr_tf, '1d'}
 
-            # 1. Fetch all unique required timeframes data
             async with self.api_semaphore:
                 tasks = {tf: self.exchange.fetch_ohlcv(symbol, tf, limit=500) for tf in required_tfs}
                 results = await asyncio.gather(*tasks.values(), return_exceptions=True)
                 ohlcv_data = dict(zip(tasks.keys(), results))
 
-            # 2. Create and validate pandas DataFrames
             dfs = {}
             for tf, data in ohlcv_data.items():
                 if isinstance(data, Exception) or not data:
@@ -310,17 +286,13 @@ class LiveTrader:
                 if df.empty: return None
                 dfs[tf] = df
 
-            # 3. Use the 5m DataFrame as the base for our checks
             df5 = dfs[base_tf]
-
-            # 4. Calculate indicators
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
             df5['rsi'] = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
             df5['atr'] = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
             df5['adx'] = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
-            # 5. Calculate rolling window conditions
             tf_minutes = 5
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
@@ -330,7 +302,6 @@ class LiveTrader:
             df1d = dfs['1d']
             ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
 
-            # --- CORRECTED FILTER LOGIC ---
             if self.cfg.get("GAP_FILTER_ENABLED", True):
                 vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
                 vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
@@ -340,7 +311,6 @@ class LiveTrader:
                 df5['vwap_ok'] = df5['vwap_dev'] <= cfg.GAP_MAX_DEV_PCT
                 df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
             else:
-                # If filter is disabled, create placeholder columns with safe, non-NaN values.
                 df5['vwap_consolidated'] = True
                 df5['vwap_dev'] = 0.0
                 df5['vwap_ok'] = True
@@ -349,11 +319,9 @@ class LiveTrader:
             df5.dropna(inplace=True)
             if df5.empty: return None
 
-            # 6. Check conditions on the very last completed 5-minute candle
             last = df5.iloc[-1]
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
-
             price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
             price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
 
@@ -454,11 +422,9 @@ class LiveTrader:
             traceback.print_exc()
             return
 
-        # --- NEW LOGIC: Set leverage BEFORE the main entry/SL/TP block ---
         try:
             await self._ensure_leverage(sig.symbol)
         except Exception:
-            # _ensure_leverage already logs the warning. We can just abort the trade.
             return
 
         exit_deadline = (
@@ -680,9 +646,6 @@ class LiveTrader:
         await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
     async def _main_signal_loop(self):
-        """
-        Central loop that periodically scans all symbols for trading signals.
-        """
         LOG.info("Starting main signal scan loop.")
         while True:
             try:
@@ -844,6 +807,13 @@ class LiveTrader:
     async def run(self):
         await self.db.init()
         
+        if self.settings.bybit_testnet:
+            LOG.warning("="*60)
+            LOG.warning("RUNNING ON TESTNET")
+            LOG.warning("Testnet data is unreliable for most altcoins.")
+            LOG.warning("Signals may be incorrect. Use for order logic testing only.")
+            LOG.warning("="*60)
+
         LOG.info("Loading exchange market data...")
         try:
             await self.exchange._exchange.load_markets()
