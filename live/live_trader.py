@@ -221,27 +221,20 @@ class LiveTrader:
 
     async def _ensure_leverage(self, symbol: str):
         try:
-            await self.exchange.set_margin_mode("CROSSED", symbol)
+            await self.exchange.set_margin_mode("cross", symbol)
             await self.exchange.set_leverage(self.settings.default_leverage, symbol)
+        except ccxt.ExchangeError as e:
+            # Bybit throws an error if the leverage is already set to the desired value.
+            # We can safely ignore this specific error message.
+            if "leverage not modified" in str(e):
+                LOG.debug("Leverage for %s already set to %dx.", symbol, self.settings.default_leverage)
+            else:
+                # Re-raise the exception if it's a different, more serious error
+                LOG.warning("Leverage setup failed for %s: %s", symbol, e)
+                raise e
         except Exception as e:
-            LOG.warning("leverage setup failed %s", e)
-
-    async def _load_listing_dates(self) -> Dict[str, datetime.date]:
-        if LISTING_PATH.exists():
-            import datetime as _dt
-            raw = json.loads(LISTING_PATH.read_text())
-            return {s: _dt.date.fromisoformat(ts) for s, ts in raw.items()}
-
-        LOG.info("listing_dates.json not found. Fetching from exchange...")
-        async def fetch_date(sym):
-            try:
-                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1, since=0)
-                if candles:
-                    ts = datetime.fromtimestamp(candles[0][0] / 1000, tz=timezone.utc)
-                    return sym, ts.date()
-            except Exception as e:
-                LOG.warning("Could not fetch listing date for %s: %s", sym, e)
-            return sym, None
+            LOG.warning("An unexpected error occurred during leverage setup for %s: %s", symbol, e)
+            raise e
 
         tasks = [fetch_date(sym) for sym in self.symbols]
         results = await asyncio.gather(*tasks)
@@ -461,6 +454,13 @@ class LiveTrader:
             traceback.print_exc()
             return
 
+        # --- NEW LOGIC: Set leverage BEFORE the main entry/SL/TP block ---
+        try:
+            await self._ensure_leverage(sig.symbol)
+        except Exception:
+            # _ensure_leverage already logs the warning. We can just abort the trade.
+            return
+
         exit_deadline = (
             datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
             if self.cfg.get("TIME_EXIT_ENABLED", True) else None
@@ -474,10 +474,6 @@ class LiveTrader:
         })
 
         try:
-            # --- FIX #1: Correct the margin mode to lowercase ---
-            await self.exchange.set_margin_mode("cross", sig.symbol)
-            await self.exchange.set_leverage(self.settings.default_leverage, sig.symbol)
-            
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
@@ -489,15 +485,12 @@ class LiveTrader:
             return
 
         try:
-            # --- FIX #2: Add the required triggerDirection parameter ---
-            # For a short's BUY STOP, the price must be RISING (1)
             sl_params = {"stopPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
             await self.exchange.create_order(sig.symbol, "STOP_MARKET", "buy", size, params=sl_params)
             
             if self.cfg.get("PARTIAL_TP_ENABLED", True):
                 tp1 = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
-                # For a short's BUY TP, the price must be FALLING (2)
                 tp_params = {"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
                 await self.exchange.create_order(sig.symbol, "TAKE_PROFIT_MARKET", "buy", qty, params=tp_params)
             
