@@ -452,13 +452,15 @@ class LiveTrader:
 
         try:
             sl_params = {"stopPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
-            await self.exchange.create_order(sig.symbol, "STOP_MARKET", "buy", size, params=sl_params)
+            # --- BUG FIX: Use 'market' as the order type ---
+            await self.exchange.create_order(sig.symbol, 'market', "buy", size, params=sl_params)
             
             if self.cfg.get("PARTIAL_TP_ENABLED", True):
                 tp1 = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
                 tp_params = {"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
-                await self.exchange.create_order(sig.symbol, "TAKE_PROFIT_MARKET", "buy", qty, params=tp_params)
+                # --- BUG FIX: Use 'market' as the order type ---
+                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, params=tp_params)
             
             await self.db.update_position(pid, status="OPEN")
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
@@ -572,14 +574,16 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("Trail cancel failed for %s: %s. Will retry.", symbol, e)
                 return
+            
+            # --- BUG FIX: Use 'market' as the order type ---
             await self.exchange.create_order(
-                symbol, "STOP_MARKET", "buy", qty_left,
-                params={"stopPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL"), 'reduceOnly': True}
+                symbol, 'market', "buy", qty_left,
+                params={"stopPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL"), 'reduceOnly': True, 'triggerDirection': 1}
             )
             await self.db.update_position(pid, stop_price=new_stop)
             pos["stop_price"] = new_stop
             LOG.info("Trail updated %s to %.4f", symbol, new_stop)
-
+            
     async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN_CLOSE"
