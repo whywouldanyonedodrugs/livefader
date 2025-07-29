@@ -451,15 +451,15 @@ class LiveTrader:
             return
 
         try:
-            sl_params = {"stopPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
-            # --- BUG FIX: Use 'market' as the order type ---
+            # Correctly create a separate BUY order, conditional on the triggerPrice (your SL)
+            sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
             await self.exchange.create_order(sig.symbol, 'market', "buy", size, params=sl_params)
             
             if self.cfg.get("PARTIAL_TP_ENABLED", True):
                 tp1 = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
+                # Correctly create a separate BUY order, conditional on the triggerPrice (your TP1)
                 tp_params = {"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
-                # --- BUG FIX: Use 'market' as the order type ---
                 await self.exchange.create_order(sig.symbol, 'market', "buy", qty, params=tp_params)
             
             await self.db.update_position(pid, status="OPEN")
@@ -574,6 +574,15 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("Trail cancel failed for %s: %s. Will retry.", symbol, e)
                 return
+            
+            # Correctly create a separate BUY order, conditional on the triggerPrice (your new SL)
+            sl_params = {"triggerPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL"), 'reduceOnly': True, 'triggerDirection': 1}
+            await self.exchange.create_order(
+                symbol, 'market', "buy", qty_left, params=sl_params
+            )
+            await self.db.update_position(pid, stop_price=new_stop)
+            pos["stop_price"] = new_stop
+            LOG.info("Trail updated %s to %.4f", symbol, new_stop)
             
             # --- BUG FIX: Use 'market' as the order type ---
             await self.exchange.create_order(
