@@ -449,13 +449,9 @@ class LiveTrader:
 
         try:
             market = self.exchange.market(sig.symbol)
-            
-            # --- BUG FIX STARTS HERE ---
-            # Safely extract the min_cost, providing a default if it's missing or None.
             min_cost = market.get('limits', {}).get('cost', {}).get('min')
             if min_cost is None:
-                min_cost = self.cfg.get("MIN_NOTIONAL", 0.01) # Use a safe default
-            # --- BUG FIX ENDS HERE ---
+                min_cost = self.cfg.get("MIN_NOTIONAL", 0.01)
 
             if (size * entry) < min_cost:
                 LOG.warning("VETO: Order for %s size %s costs less than exchange minimum of %s.", sig.symbol, size, min_cost)
@@ -478,7 +474,10 @@ class LiveTrader:
         })
 
         try:
-            await self._ensure_leverage(sig.symbol)
+            # --- FIX #1: Correct the margin mode to lowercase ---
+            await self.exchange.set_margin_mode("cross", sig.symbol)
+            await self.exchange.set_leverage(self.settings.default_leverage, sig.symbol)
+            
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
@@ -490,17 +489,17 @@ class LiveTrader:
             return
 
         try:
-            await self.exchange.create_order(
-                sig.symbol, "STOP_MARKET", "buy", size,
-                params={"stopPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True}
-            )
+            # --- FIX #2: Add the required triggerDirection parameter ---
+            # For a short's BUY STOP, the price must be RISING (1)
+            sl_params = {"stopPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
+            await self.exchange.create_order(sig.symbol, "STOP_MARKET", "buy", size, params=sl_params)
+            
             if self.cfg.get("PARTIAL_TP_ENABLED", True):
                 tp1 = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
-                await self.exchange.create_order(
-                    sig.symbol, "TAKE_PROFIT_MARKET", "buy", qty,
-                    params={"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True}
-                )
+                # For a short's BUY TP, the price must be FALLING (2)
+                tp_params = {"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
+                await self.exchange.create_order(sig.symbol, "TAKE_PROFIT_MARKET", "buy", qty, params=tp_params)
             
             await self.db.update_position(pid, status="OPEN")
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
