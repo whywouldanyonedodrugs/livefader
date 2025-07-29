@@ -445,15 +445,20 @@ class LiveTrader:
             LOG.info("EXEC_ATR veto %s – stop %.4f < min dist", sig.symbol, stop_dist)
             return
 
-        size = risk_amt / stop_dist # size is now kept as a float
+        size = risk_amt / stop_dist
 
         try:
             market = self.exchange.market(sig.symbol)
-            min_cost = market.get('limits', {}).get('cost', {}).get('min', 0.01)
+            
+            # --- BUG FIX STARTS HERE ---
+            # Safely extract the min_cost, providing a default if it's missing or None.
+            min_cost = market.get('limits', {}).get('cost', {}).get('min')
+            if min_cost is None:
+                min_cost = self.cfg.get("MIN_NOTIONAL", 0.01) # Use a safe default
+            # --- BUG FIX ENDS HERE ---
 
-            # Perform the check using the float version of size. This is now correct.
             if (size * entry) < min_cost:
-                LOG.warning("VETO: Order for %s size %s costs less than exchange minimum.", sig.symbol, size)
+                LOG.warning("VETO: Order for %s size %s costs less than exchange minimum of %s.", sig.symbol, size, min_cost)
                 return
         except Exception as e:
             LOG.error("Error during size validation for %s: %s", sig.symbol, e)
@@ -474,7 +479,6 @@ class LiveTrader:
 
         try:
             await self._ensure_leverage(sig.symbol)
-            # Pass the float `size` directly. CCXT handles the precision formatting.
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
@@ -493,7 +497,6 @@ class LiveTrader:
             if self.cfg.get("PARTIAL_TP_ENABLED", True):
                 tp1 = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
-                # Pass the float `qty` directly. CCXT handles the precision formatting.
                 await self.exchange.create_order(
                     sig.symbol, "TAKE_PROFIT_MARKET", "buy", qty,
                     params={"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True}
