@@ -91,7 +91,7 @@ KILL_EQUITY_LEVEL   = 90.0        # USDT
 MIN_EQUITY_USDT     = 100.0
 MAX_LEVERAGE        = 10
 MIN_NOTIONAL        = 0.01         # exchange min order size
-MIN_STOP_DIST_USD   = 0.02
+MIN_STOP_DIST_USD   = 0.0002
 MIN_STOP_DIST_PCT   = 0.0008      # 0.08 %
 
 # draw‑down pause
