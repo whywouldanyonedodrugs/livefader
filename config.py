@@ -42,7 +42,7 @@ PRICE_SLOWDOWN_PCT      = 0.01
 # ── risk sizing ────────────────────────────────────────────────────────────
 RISK_MODE          = "FIXED"     # or "FIXED"
 FIXED_RISK_USDT    = 10.0
-RISK_PCT           = 0.005         # 0.5 %
+RISK_PCT           = 0.05         # 0.5 %
 SLIPPAGE_BUFFER_PCT = 0.0005
 
 # ── stop / targets ─────────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ KILL_EQUITY_LEVEL   = 90.0        # USDT
 MIN_EQUITY_USDT     = 100.0
 MAX_LEVERAGE        = 10
 MIN_NOTIONAL        = 0.01         # exchange min order size
-MIN_STOP_DIST_USD   = 0.1
+MIN_STOP_DIST_USD   = 0.02
 MIN_STOP_DIST_PCT   = 0.0008      # 0.08 %
 
 # draw‑down pause

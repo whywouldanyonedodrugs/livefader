@@ -441,14 +441,20 @@ class LiveTrader:
             LOG.warning("VETO: Stop distance is zero for %s. Skipping.", sig.symbol)
             return
 
-        size = risk_amt / stop_dist
-
+        # --- THIS IS THE FIRST VETO CHECK ---
         if (stop_dist < self.cfg["MIN_STOP_DIST_USD"] or (stop_dist / entry) < self.cfg["MIN_STOP_DIST_PCT"]):
             LOG.info("EXEC_ATR veto %s – stop %.4f < min dist", sig.symbol, stop_dist)
             return
 
+        size = risk_amt / stop_dist
+
         try:
-            market = self.exchange.markets[sig.symbol]
+            # --- BUG FIX STARTS HERE ---
+            # If the market data isn't in the cache from startup, fetch it now.
+            # This prevents the KeyError for newer or missed symbols.
+            market = await self.exchange.market(sig.symbol)
+            # --- BUG FIX ENDS HERE ---
+
             size = self.exchange.amount_to_precision(sig.symbol, size)
             min_cost = market.get('limits', {}).get('cost', {}).get('min', 0.01)
             if (size * entry) < min_cost:
@@ -456,6 +462,7 @@ class LiveTrader:
                 return
         except Exception as e:
             LOG.error("Error during size validation for %s: %s", sig.symbol, e)
+            traceback.print_exc() # Add traceback for better debugging
             return
 
         exit_deadline = (
