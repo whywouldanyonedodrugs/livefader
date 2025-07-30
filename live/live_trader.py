@@ -250,15 +250,26 @@ class LiveTrader:
 
     @staticmethod
     def _cid(pid: int, tag: str) -> str:
-        """
-        Creates a unique clientOrderId. Appends a millisecond timestamp
-        to the PID and tag to ensure uniqueness across restarts and prevent
-        "OrderLinkedID is duplicate" errors.
-        """
-        # Get the current time in milliseconds
         timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        # Create a unique ID that is also short enough for the exchange
         return f"bot_{pid}_{tag}_{timestamp_ms}"
+
+    # --- NEW, CORRECTED HELPER METHODS ---
+    async def _fetch_by_cid(self, cid: str, symbol: str):
+        """Fetches an order using the robust generic fetch_order method."""
+        return await self.exchange.fetch_order(
+            None, symbol, params={"clientOrderId": cid, "category": "linear"}
+        )
+
+    async def _cancel_by_cid(self, cid: str, symbol: str):
+        """Cancels an order using the robust generic cancel_order method."""
+        try:
+            return await self.exchange.cancel_order(
+                None, symbol, params={"clientOrderId": cid, "category": "linear"}
+            )
+        except ccxt.OrderNotFound:
+            LOG.warning("Order %s for %s already filled or cancelled, no action needed.", cid, symbol)
+        except Exception as e:
+            LOG.error("Failed to cancel order %s for %s: %s", cid, symbol, e)
 
     # --- ADD THIS NEW HELPER METHOD ---
     async def _all_open_orders(self, symbol: str) -> list:
@@ -463,30 +474,25 @@ class LiveTrader:
             "exit_deadline": exit_deadline,
         })
 
-        entry_order = None
         executed_size = 0.0
         client_order_id = self._cid(pid, "ENTRY")
         try:
-            # --- DEFINITIVE FIX based on expert analysis ---
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size, 
                 params={"clientOrderId": client_order_id, "category": "linear"}
             )
             
-            # 1. Trust both 'filled' and 'info.cumExecQty' from the initial response.
             executed_size = float(
                 entry_order.get('filled') or 
                 entry_order.get('info', {}).get('cumExecQty') or 
                 0.0
             )
 
-            # 2. If still no fill, confirm using the robust fetch_order with clientOrderId.
             if executed_size <= 0:
                 LOG.info("Initial response showed no fill, confirming via clientOrderId for %s...", sig.symbol)
-                for i in range(10): # Loop for up to 5 seconds
+                for i in range(10):
                     await asyncio.sleep(0.5)
-                    # Use fetch_order with the clientOrderId and the mandatory 'category' parameter
-                    order_status = await self.exchange.fetch_order_by_client_id(client_order_id, sig.symbol, {"category": "linear"})
+                    order_status = await self._fetch_by_cid(client_order_id, sig.symbol)
                     
                     if order_status:
                         filled_amount = float(order_status.get('filled') or order_status.get('info', {}).get('cumExecQty') or 0.0)
@@ -501,14 +507,10 @@ class LiveTrader:
         except Exception as e:
             LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR_ENTRY")
-            try:
-                await self.exchange.cancel_order_by_client_id(client_order_id, sig.symbol, {"category": "linear"})
-            except Exception as cancel_e:
-                LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
+            await self._cancel_by_cid(client_order_id, sig.symbol)
             return
 
         try:
-            # 3. Use the correct, specific order types for SL/TP and include 'category'.
             sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'}
             await self.exchange.create_order(sig.symbol, 'STOP_MARKET', "buy", executed_size, params=sl_params)
             
