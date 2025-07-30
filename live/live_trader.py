@@ -466,22 +466,25 @@ class LiveTrader:
         entry_order = None
         executed_size = 0.0
         try:
+            # --- DEFINITIVE FIX based on expert analysis ---
+            client_order_id = self._cid(pid, "ENTRY")
             entry_order = await self.exchange.create_market_order(
-                sig.symbol, "sell", intended_size, params={"clientOrderId": self._cid(pid, "ENTRY")}
+                sig.symbol, "sell", intended_size, params={"clientOrderId": client_order_id, "category": "linear"}
             )
             
-            # --- DEFINITIVE FIX: Safely handle the 'filled' key which can be None ---
-            # The `or 0.0` idiom correctly handles the case where the value is None.
-            executed_size = float(entry_order.get('filled') or 0.0)
+            # 1. Trust the initial response, checking both 'filled' and 'info.cumExecQty'
+            executed_size = float(entry_order.get('filled') or entry_order.get('info', {}).get('cumExecQty') or 0.0)
 
+            # 2. If still no fill, start a robust confirmation loop
             if executed_size <= 0:
                 LOG.info("Initial response showed no fill, starting confirmation loop for %s...", sig.symbol)
                 for i in range(10): # Loop for up to 5 seconds
                     await asyncio.sleep(0.5)
-                    order_status = await self.exchange.fetch_order(entry_order['id'], sig.symbol)
+                    # Use fetch_order with the mandatory 'category' parameter
+                    order_status = await self.exchange.fetch_order(entry_order['id'], sig.symbol, params={'category': 'linear'})
                     
                     if order_status:
-                        filled_amount = float(order_status.get('filled') or 0.0)
+                        filled_amount = float(order_status.get('filled') or order_status.get('info', {}).get('cumExecQty') or 0.0)
                         if order_status.get('status') == 'closed' and filled_amount > 0:
                             executed_size = filled_amount
                             LOG.info("Confirmation loop successful. Executed size: %s", executed_size)
@@ -495,7 +498,7 @@ class LiveTrader:
             await self.db.update_position(pid, status="ERROR_ENTRY")
             if entry_order and entry_order.get('id'):
                 try:
-                    await self.exchange.cancel_order(entry_order['id'], sig.symbol)
+                    await self.exchange.cancel_order(entry_order['id'], sig.symbol, params={'category': 'linear'})
                 except Exception as cancel_e:
                     LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
             return
