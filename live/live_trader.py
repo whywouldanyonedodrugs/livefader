@@ -432,10 +432,10 @@ class LiveTrader:
         1. Places a market order with a globally unique CID.
         2. Confirms the position exists on the exchange.
         3. Persists to DB to get a position ID (pid).
-        4. Places protective orders using stable CIDs based on the pid.
+        4. Places protective orders using the correct V5 syntax (market type + triggerPrice).
         5. If any step fails, it performs an emergency market-close.
         """
-        # --- 1. Pre-flight checks and size calculation ---
+        # --- Steps 1, 2, and 3 (Pre-checks, Entry Order, Confirmation) are correct and remain unchanged ---
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
             return
 
@@ -463,7 +463,6 @@ class LiveTrader:
         except Exception:
             return
 
-        # --- 2. Place market order with a UNIQUE CID ---
         entry_cid = create_unique_cid(f"ENTRY_{sig.symbol}")
         try:
             await self.exchange.create_market_order(
@@ -475,7 +474,6 @@ class LiveTrader:
             LOG.error("Initial market order placement for %s failed immediately: %s", sig.symbol, e)
             return
 
-        # --- 3. Robust confirmation loop ---
         actual_size, actual_entry_price, live_position = 0.0, 0.0, None
         CONFIRMATION_ATTEMPTS = 20
         for i in range(CONFIRMATION_ATTEMPTS):
@@ -487,7 +485,7 @@ class LiveTrader:
                     live_position = pos
                     actual_size = float(live_position['info']['size'])
                     actual_entry_price = float(live_position['info']['avgPrice'])
-                    LOG.info(f"ENTRY CONFIRMED for {sig.symbol}. Exchange reports size: {actual_size} @ {actual_entry_price}")
+                    LOG.info(f"ENTRY CONFIRMED for %s. Exchange reports size: {actual_size} @ {actual_entry_price}")
                     break
             except Exception as e:
                 LOG.warning("Confirmation loop check failed for %s (attempt %d/%d): %s", sig.symbol, i + 1, CONFIRMATION_ATTEMPTS, e)
@@ -496,7 +494,7 @@ class LiveTrader:
             LOG.error("ENTRY FAILED for %s: Position did not appear on exchange after %d attempts.", sig.symbol, CONFIRMATION_ATTEMPTS)
             return
 
-        # --- 4. Persist to DB and place protective orders (CRITICAL BLOCK) ---
+        # --- Step 4: Persist to DB and place protective orders (CRITICAL BLOCK) ---
         try:
             exit_deadline = (
                 datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
@@ -511,29 +509,25 @@ class LiveTrader:
             })
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
-            
-            # Use STABLE CIDs for manageable orders
             sl_cid = create_stable_cid(pid, "SL")
             tp1_cid = create_stable_cid(pid, "TP1")
 
-            await self.exchange.create_order(
-                sig.symbol, 'stop_market', "buy", actual_size, None,
-                params={
-                    "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
-                    'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
-                }
-            )
+            # FIX: Use 'market' type and define conditionality in params
+            sl_params = {
+                "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
+                'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
+            }
+            await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=sl_params)
 
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
                 tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
                 qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
-                await self.exchange.create_order(
-                    sig.symbol, 'take_profit_market', "buy", qty, None,
-                    params={
-                        "triggerPrice": tp_price, "clientOrderId": tp1_cid,
-                        'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
-                    }
-                )
+                # FIX: Use 'market' type and define conditionality in params
+                tp_params = {
+                    "triggerPrice": tp_price, "clientOrderId": tp1_cid,
+                    'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
+                }
+                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, None, params=tp_params)
             
             await self.db.update_position(
                 pid, status="OPEN", stop_price=stop_price_actual,
@@ -660,13 +654,12 @@ class LiveTrader:
                 LOG.warning("Trail cancel failed for %s: %s. Will retry.", symbol, e)
                 return
             
-            await self.exchange.create_order(
-                symbol, 'stop_market', "buy", qty_left, None,
-                params={
-                    "triggerPrice": new_stop, "clientOrderId": sl_trail_cid,
-                    'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
-                }
-            )
+            # FIX: Use 'market' type and define conditionality in params
+            sl_params = {
+                "triggerPrice": new_stop, "clientOrderId": sl_trail_cid,
+                'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
+            }
+            await self.exchange.create_order(symbol, 'market', "buy", qty_left, None, params=sl_params)
             
             await self.db.update_position(pid, stop_price=new_stop, sl_trail_cid=sl_trail_cid)
             pos["stop_price"] = new_stop
