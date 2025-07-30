@@ -470,21 +470,22 @@ class LiveTrader:
                 sig.symbol, "sell", intended_size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
             
-            # --- FINAL, ROBUST CONFIRMATION LOOP ---
-            # Trust the initial response if it gives a fill amount.
-            executed_size = entry_order.get('filled', 0.0)
+            # --- DEFINITIVE FIX: Safely handle the 'filled' key which can be None ---
+            # The `or 0.0` idiom correctly handles the case where the value is None.
+            executed_size = float(entry_order.get('filled') or 0.0)
 
             if executed_size <= 0:
                 LOG.info("Initial response showed no fill, starting confirmation loop for %s...", sig.symbol)
-                for i in range(10):
+                for i in range(10): # Loop for up to 5 seconds
                     await asyncio.sleep(0.5)
                     order_status = await self.exchange.fetch_order(entry_order['id'], sig.symbol)
                     
-                    # This is the critical fix: check if order_status is not None
-                    if order_status and order_status.get('status') == 'closed' and order_status.get('filled', 0) > 0:
-                        executed_size = order_status.get('filled')
-                        LOG.info("Confirmation loop successful. Executed size: %s", executed_size)
-                        break
+                    if order_status:
+                        filled_amount = float(order_status.get('filled') or 0.0)
+                        if order_status.get('status') == 'closed' and filled_amount > 0:
+                            executed_size = filled_amount
+                            LOG.info("Confirmation loop successful. Executed size: %s", executed_size)
+                            break
             
             if executed_size <= 0:
                 raise ccxt.ExchangeError(f"Entry order for {sig.symbol} was not filled after 5 seconds.")
