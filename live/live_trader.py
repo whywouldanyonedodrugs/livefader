@@ -252,6 +252,22 @@ class LiveTrader:
     def _cid(pid: int, tag: str) -> str:
         return f"bot_{pid}_{tag}"
 
+    # --- ADD THIS NEW HELPER METHOD ---
+    async def _all_open_orders(self, symbol: str) -> list:
+        """
+        Fetches all types of open orders (regular, conditional, TP/SL) for a symbol
+        by correctly using the Bybit V5 API parameters.
+        """
+        params_linear = {'category': 'linear'}
+        try:
+            active_orders = await self.exchange.fetch_open_orders(symbol, params=params_linear)
+            stop_orders = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'StopOrder'})
+            tpsl_orders = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'tpslOrder'})
+            return active_orders + stop_orders + tpsl_orders
+        except Exception as e:
+            LOG.warning("Could not fetch all open orders for %s: %s", symbol, e)
+            return [] # Return an empty list on failure to prevent crashes
+
     async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
@@ -433,34 +449,42 @@ class LiveTrader:
         )
 
         pid = await self.db.insert_position({
-            "symbol": sig.symbol, "side": "short", "size": intended_size, # Insert the intended size for now
+            "symbol": sig.symbol, "side": "short", "size": intended_size,
             "entry_price": entry, "stop_price": stop, "trailing_active": False,
             "atr": atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
             "exit_deadline": exit_deadline,
         })
 
         try:
+            # --- NEW: Robust Order Confirmation Logic ---
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
-            if not entry_order or entry_order.get('status') == 'rejected':
-                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} rejected.")
             
-            # --- NEW LOGIC: Capture the true executed size from the exchange ---
-            executed_size = entry_order.get('filled')
-            if not executed_size or executed_size <= 0:
-                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} was not filled.")
-
-            if abs(executed_size - intended_size) / intended_size > 0.05: # More than 5% difference
-                LOG.warning("Significant size discrepancy for %s. Intended: %s, Executed: %s", sig.symbol, intended_size, executed_size)
+            executed_size = 0.0
+            # Loop for up to 10 seconds to confirm the fill
+            for i in range(20): # 20 attempts * 0.5s sleep = 10 seconds
+                await asyncio.sleep(0.5)
+                order_status = await self.exchange.fetch_order(entry_order['id'], sig.symbol)
+                if order_status.get('status') == 'closed' and order_status.get('filled', 0) > 0:
+                    executed_size = order_status.get('filled')
+                    LOG.info("Entry order for %s confirmed filled. Executed size: %s", sig.symbol, executed_size)
+                    break
+            
+            if executed_size <= 0:
+                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} was not filled after 10 seconds.")
 
         except Exception as e:
             LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR_ENTRY")
+            # Attempt to cancel the potentially stuck order
+            try:
+                await self.exchange.cancel_order(entry_order['id'], sig.symbol)
+            except Exception as cancel_e:
+                LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
             return
 
         try:
-            # Use the REAL executed_size for all subsequent orders and DB updates
             sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
             await self.exchange.create_order(sig.symbol, 'market', "buy", executed_size, params=sl_params)
             
@@ -476,7 +500,6 @@ class LiveTrader:
                 tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP_FINAL"), 'reduceOnly': True, 'triggerDirection': 2}
                 await self.exchange.create_order(sig.symbol, 'market', "buy", qty, params=tp_params)
             
-            # Update the DB with the final status and the CORRECT executed size
             await self.db.update_position(pid, status="OPEN", size=executed_size)
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
@@ -484,7 +507,7 @@ class LiveTrader:
 
         except Exception as e:
             LOG.critical("NAKED POSITION: SL/TP placement failed for %s (pid %d): %s", sig.symbol, pid, e)
-            await self.db.update_position(pid, status="ERROR_NAKED", size=executed_size) # Store correct size even on failure
+            await self.db.update_position(pid, status="ERROR_NAKED", size=executed_size)
             try:
                 await self.exchange.create_market_order(
                     sig.symbol, 'buy', executed_size, params={'reduceOnly': True}
@@ -510,8 +533,10 @@ class LiveTrader:
             await asyncio.sleep(5)
 
     async def _update_single_position(self, pid: int, pos: Dict[str, Any]):
+        is_closed = False
         symbol = pos["symbol"]
-        orders = await self.exchange.fetch_open_orders(symbol)
+        # --- USE THE NEW HELPER METHOD HERE ---
+        orders = await self._all_open_orders(symbol)
         open_cids = {o.get("clientOrderId") for o in orders}
 
         if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
@@ -611,47 +636,79 @@ class LiveTrader:
     async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN_CLOSE"
-        active_stop_cid = self._cid(pid, "SL_TRAIL") if pos["trailing_active"] else self._cid(pid, "SL")
-        cids_to_check = [active_stop_cid]
-        if pos["trailing_active"] and self.cfg.get("FINAL_TP_ENABLED", False):
-            cids_to_check.append(self._cid(pid, "TP2"))
 
-        for cid in cids_to_check:
+        # --- Determine Exit Price & Reason ---
+        # This logic is still valuable for accurate PnL reporting.
+        # We try to find the exact fill data of the order that closed the position.
+        
+        # Define all possible order IDs that could have closed the trade
+        possible_closing_cids = []
+        if pos["trailing_active"]:
+            possible_closing_cids.append(self._cid(pid, "SL_TRAIL"))
+            if self.cfg.get("FINAL_TP_ENABLED", False):
+                possible_closing_cids.append(self._cid(pid, "TP2"))
+        else:
+            possible_closing_cids.append(self._cid(pid, "SL"))
+            if self.cfg.get("PARTIAL_TP_ENABLED", False):
+                possible_closing_cids.append(self._cid(pid, "TP1"))
+            elif self.cfg.get("FINAL_TP_ENABLED", False):
+                possible_closing_cids.append(self._cid(pid, "TP_FINAL"))
+
+        # Check the history for each possible closing order
+        for cid in possible_closing_cids:
             try:
-                order = await self.exchange.fetch_order_by_client_id(cid, symbol)
+                # fetch_order can find closed/filled orders
+                order = await self.exchange.fetch_order(clientOrderId=cid, symbol=symbol)
                 if order and order.get('status') == 'closed' and order.get('filled', 0) > 0:
-                    exit_price, exit_qty = order.get('average') or order.get('price'), order['filled']
-                    closing_order_type = "TP2" if "TP2" in cid else "SL"
-                    break
+                    exit_price = order.get('average') or order.get('price')
+                    exit_qty = order['filled']
+                    # Determine the closing reason from the CID
+                    if "TP" in cid: closing_order_type = "TP"
+                    elif "SL" in cid: closing_order_type = "SL"
+                    LOG.info(f"Position {pid} closed by order {cid} at avg price {exit_price}")
+                    break 
             except ccxt.OrderNotFound:
                 continue
             except Exception as e:
                 LOG.warning(f"Could not fetch closing order {cid} for PnL calc: {e}")
 
+        # Fallback to ticker price if we couldn't get the exact fill price
         if not exit_price:
+            LOG.warning(f"Could not determine exact fill price for {pid}. Using last market price for PnL.")
             ticker = await self.exchange.fetch_ticker(symbol)
             exit_price = ticker["last"]
-            exit_qty = pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7)) if pos["trailing_active"] else pos["size"]
+            # Estimate exit quantity based on position state
+            exit_qty = (
+                pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
+                if pos["trailing_active"] else pos["size"]
+            )
 
-        cids_to_cleanup = [self._cid(pid, "SL"), self._cid(pid, "TP1")]
-        if pos["trailing_active"]:
-            cids_to_cleanup.extend([self._cid(pid, "SL_TRAIL"), self._cid(pid, "TP2")])
-        
+        # --- Bullet-Proof Cleanup Protocol ---
+        # Unconditionally cancel ALL orders for this symbol to ensure a clean slate.
         try:
-            open_orders = await self.exchange.fetch_open_orders(symbol)
-            order_ids_to_cancel = [o['id'] for o in open_orders if o.get('clientOrderId') in cids_to_cleanup]
-            if order_ids_to_cancel:
-                await self.exchange.cancel_orders(order_ids_to_cancel, symbol)
+            LOG.info("Finalizing position %d for %s. Cancelling all related orders.", pid, symbol)
+            await self.exchange.cancel_all_orders(symbol, params={'category': 'linear'})
         except Exception as e:
-            LOG.warning(f"Precise order cleanup for position {pid} failed: {e}. Falling back to cancel_all_orders.")
-            await self.exchange.cancel_all_orders(symbol)
-
+            LOG.warning(f"Final cleanup for position {pid} failed: {e}. The exchange's reduceOnly should prevent issues.")
+        
+        # --- Database and State Update ---
+        # Record the final fill that closed the position
         await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, datetime.now(timezone.utc))
-        all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
-        total_pnl = sum((pos["entry_price"] - float(f['price'])) * float(f['qty']) for f in all_fills if f['price'] and f['qty'])
 
-        await self.db.update_position(pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=total_pnl)
+        # Fetch ALL fills for this position to calculate total PnL accurately
+        all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
+        total_pnl = 0
+        entry_price = pos["entry_price"]
+        for fill in all_fills:
+            if fill['price'] is not None and fill['qty'] is not None:
+                # For a short, PnL = (entry - exit) * quantity
+                total_pnl += (entry_price - float(fill['price'])) * float(fill['qty'])
+
+        await self.db.update_position(
+            pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=total_pnl
+        )
         await self.risk.on_trade_close(total_pnl, self.tg)
+        
         del self.open_positions[pid]
         self.last_exit[symbol] = datetime.now(timezone.utc)
         await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
