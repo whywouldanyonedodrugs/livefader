@@ -467,22 +467,25 @@ class LiveTrader:
         executed_size = 0.0
         client_order_id = self._cid(pid, "ENTRY")
         try:
+            # --- DEFINITIVE FIX based on expert analysis ---
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size, 
                 params={"clientOrderId": client_order_id, "category": "linear"}
             )
             
+            # 1. Trust both 'filled' and 'info.cumExecQty' from the initial response.
             executed_size = float(
                 entry_order.get('filled') or 
                 entry_order.get('info', {}).get('cumExecQty') or 
                 0.0
             )
 
+            # 2. If still no fill, confirm using the robust fetch_order with clientOrderId.
             if executed_size <= 0:
                 LOG.info("Initial response showed no fill, confirming via clientOrderId for %s...", sig.symbol)
-                for i in range(10):
+                for i in range(10): # Loop for up to 5 seconds
                     await asyncio.sleep(0.5)
-                    # --- DEFINITIVE FIX: Use the correct ccxt syntax ---
+                    # Use fetch_order with the clientOrderId and the mandatory 'category' parameter
                     order_status = await self.exchange.fetch_order(client_order_id, sig.symbol, params={'category': 'linear'})
                     
                     if order_status:
@@ -499,26 +502,26 @@ class LiveTrader:
             LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR_ENTRY")
             try:
-                # Use the clientOrderId to cancel, which is more reliable
                 await self.exchange.cancel_order(client_order_id, sig.symbol, params={'category': 'linear'})
             except Exception as cancel_e:
                 LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
             return
 
         try:
-            sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
+            # 3. Use the correct, specific order types for SL/TP and include 'category'.
+            sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'}
             await self.exchange.create_order(sig.symbol, 'STOP_MARKET', "buy", executed_size, params=sl_params)
             
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
                 tp_price = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = executed_size * self.cfg["PARTIAL_TP_PCT"]
-                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
+                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'}
                 await self.exchange.create_order(sig.symbol, 'TAKE_PROFIT_MARKET', "buy", qty, params=tp_params)
             
             elif self.cfg.get("FINAL_TP_ENABLED", False):
                 tp_price = entry - self.cfg["FINAL_TP_ATR_MULT"] * atr
                 qty = executed_size
-                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP_FINAL"), 'reduceOnly': True, 'triggerDirection': 2}
+                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP_FINAL"), 'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'}
                 await self.exchange.create_order(sig.symbol, 'TAKE_PROFIT_MARKET', "buy", qty, params=tp_params)
             
             await self.db.update_position(pid, status="OPEN", size=executed_size)
