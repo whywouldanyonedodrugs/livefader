@@ -777,23 +777,54 @@ class LiveTrader:
             }, indent=2))
 
     async def _resume(self):
+        """
+        On startup, load state from DB and reconcile with actual
+        exchange positions to detect and handle orphans.
+        Includes a "clean slate" protocol to cancel all old open orders.
+        """
         LOG.info("--> Resuming state...")
+
+        # --- NEW: Clean Slate Protocol ---
+        LOG.info("Step 1: Cancelling all old open orders for tracked symbols...")
+        cancelled_count = 0
+        for sym in self.symbols:
+            try:
+                await self.exchange.cancel_all_orders(sym)
+                # A small sleep to be nice to the API rate limiter
+                await asyncio.sleep(0.1)
+                cancelled_count += 1
+            except Exception as e:
+                LOG.warning("Could not cancel old orders for %s: %s", sym, e)
+        LOG.info("...Clean slate protocol complete. Checked %d symbols.", cancelled_count)
+        # --- END OF NEW LOGIC ---
+
+        LOG.info("Step 2: Fetching peak equity from DB...")
         peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
         self.peak_equity = float(peak) if peak is not None else 0.0
-        LOG.info("...Initial peak equity: $%.2f", self.peak_equity)
+        LOG.info("...Initial peak equity loaded: $%.2f", self.peak_equity)
 
+        LOG.info("Step 3: Fetching open positions from the EXCHANGE...")
         try:
             exchange_positions = await self.exchange.fetch_positions()
-            open_exchange_positions = {p['info']['symbol']: p for p in exchange_positions if float(p['info']['size']) > 0}
+            open_exchange_positions = {
+                p['info']['symbol']: p for p in exchange_positions if float(p['info']['size']) > 0
+            }
+            LOG.info("...Success! Found %d positions on the exchange.", len(open_exchange_positions))
         except Exception as e:
             LOG.error("Could not fetch exchange positions on startup: %s. Exiting.", e)
             sys.exit(1)
 
+        LOG.info("Step 4: Fetching 'OPEN' positions from the DATABASE...")
         db_positions = {r["symbol"]: dict(r) for r in await self.db.fetch_open_positions()}
+        LOG.info("...Success! Found %d 'OPEN' positions in the database.", len(db_positions))
         
+        LOG.info("Step 5: Reconciling DB and exchange positions...")
         for symbol, pos_data in open_exchange_positions.items():
             if symbol not in db_positions:
-                msg = f"🚨 ORPHAN DETECTED: {symbol} on exchange but not in DB. Forcing close."
+                msg = (
+                    f"🚨 ORPHAN DETECTED: Position for {symbol} exists on the exchange "
+                    f"but not in the database. Forcing immediate close to manage risk."
+                )
                 LOG.warning(msg)
                 await self.tg.send(msg)
                 try:
@@ -801,35 +832,57 @@ class LiveTrader:
                     size = float(pos_data['info']['size'])
                     await self.exchange.create_market_order(symbol, side, size, params={'reduceOnly': True})
                 except Exception as e:
-                    LOG.error("Failed to force-close orphan %s: %s", symbol, e)
+                    LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
 
         for symbol, pos_row in db_positions.items():
             if symbol not in open_exchange_positions:
-                msg = f"DB/EXCHANGE MISMATCH: {symbol} 'OPEN' in DB but not on exchange. Marking closed."
+                pid = pos_row["id"]
+                msg = (
+                    f"DB/EXCHANGE MISMATCH: Position {pid} for {symbol} is 'OPEN' in DB "
+                    f"but not found on exchange. Marking as closed."
+                )
                 LOG.warning(msg)
-                await self.db.update_position(pos_row["id"], status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=0)
+                await self.db.update_position(
+                    pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=0
+                )
 
         for symbol, db_pos in db_positions.items():
             if symbol in open_exchange_positions:
                 ex_pos = open_exchange_positions[symbol]
-                if abs(float(db_pos['size']) - float(ex_pos['info']['size'])) > 1e-9:
-                    msg = f"🚨 SIZE MISMATCH for {symbol}. DB: {db_pos['size']}, Exch: {ex_pos['info']['size']}. Flagging."
+                db_size = float(db_pos['size'])
+                ex_size = float(ex_pos['info']['size'])
+                
+                if abs(db_size - ex_size) > 1e-9:
+                    pid = db_pos["id"]
+                    msg = (
+                        f"🚨 SIZE MISMATCH on resume for {symbol} (pid {pid}): "
+                        f"DB size is {db_size}, Exchange size is {ex_size}. "
+                        f"Flagging for manual review."
+                    )
                     LOG.critical(msg)
                     await self.tg.send(msg)
-                    await self.db.update_position(db_pos["id"], status="SIZE_MISMATCH")
+                    await self.db.update_position(pid, status="SIZE_MISMATCH")
+                    del db_positions[symbol]
 
+        LOG.info("...Reconciliation complete.")
+
+        LOG.info("Step 6: Loading final reconciled positions into memory...")
         final_open_rows = await self.db.fetch_open_positions()
         for r in final_open_rows:
             self.open_positions[r["id"]] = dict(r)
-            LOG.info("...Resumed open position for %s (ID: %d)", r["symbol"], r["id"])
+            LOG.info("...Successfully resumed and verified open position for %s (ID: %d)", r["symbol"], r["id"])
 
-        cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS))
+        LOG.info("Step 7: Loading recent exit timestamps for cooldowns...")
+        cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS",
+                        cfg.SYMBOL_COOLDOWN_HOURS))
         rows = await self.db.pool.fetch(
-            "SELECT symbol, closed_at FROM positions WHERE status='CLOSED' AND closed_at > NOW() - $1::interval",
+            "SELECT symbol, closed_at FROM positions "
+            "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
             timedelta(hours=cd_h),
         )
         for r in rows:
             self.last_exit[r["symbol"]] = r["closed_at"]
+        
         LOG.info("<-- Resume complete.")
 
     async def run(self):
