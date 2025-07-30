@@ -416,10 +416,11 @@ class LiveTrader:
 
     async def _open_position(self, sig: Signal):
         """
-        A robust hybrid entry method.
-        1. Places a simple market order.
-        2. Uses a confirmation loop to ensure the position exists on the exchange.
-        3. Proceeds with custom, bot-managed SL and partial TP logic.
+        A robust and hardened hybrid entry method.
+        1. Places a market order.
+        2. Confirms the position exists on the exchange.
+        3. Tries to persist to DB and place SL/TP.
+        4. If step 3 fails for ANY reason, it performs an emergency market-close.
         """
         # --- 1. Pre-flight checks and size calculation ---
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
@@ -437,13 +438,11 @@ class LiveTrader:
         bal = await self._fetch_platform_balance()
         free_usdt = bal["free"]["USDT"]
         risk_amt = await self._risk_amount(free_usdt)
-
         stop_price_signal = sig.entry + self.cfg["SL_ATR_MULT"] * sig.atr
         stop_dist = abs(sig.entry - stop_price_signal)
         if stop_dist == 0:
             LOG.warning("VETO: Stop distance is zero for %s. Skipping.", sig.symbol)
             return
-
         intended_size = risk_amt / stop_dist
 
         try:
@@ -451,9 +450,8 @@ class LiveTrader:
         except Exception:
             return
 
-        # --- 2. Place a simple market order ---
+        # --- 2. Place market order and confirm position ---
         client_order_id = self._cid(0, "ENTRY")
-        order = None
         try:
             order = await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size,
@@ -464,10 +462,7 @@ class LiveTrader:
             LOG.error("Initial market order placement for %s failed immediately: %s", sig.symbol, e)
             return
 
-        # --- 3. Robust confirmation loop ---
-        actual_size = 0.0
-        actual_entry_price = 0.0
-        live_position = None
+        actual_size, actual_entry_price, live_position = 0.0, 0.0, None
         CONFIRMATION_ATTEMPTS = 20
         for i in range(CONFIRMATION_ATTEMPTS):
             await asyncio.sleep(0.5)
@@ -487,25 +482,28 @@ class LiveTrader:
             LOG.error("ENTRY FAILED for %s: Position did not appear on exchange after %d attempts.", sig.symbol, CONFIRMATION_ATTEMPTS)
             return
 
-        # --- 4. Persist to DB and place bot-managed SL/TP orders ---
-        pid = await self.db.insert_position({
-            "symbol": sig.symbol, "side": "short", "size": actual_size,
-            "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
-            "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
-        })
-
+        # --- 3. Persist to DB and place SL/TP (CRITICAL BLOCK) ---
         try:
-            # FIX 1.6: Calculate final SL based on the ACTUAL entry price
+            # FIX: Restore the exit_deadline calculation and key
+            exit_deadline = (
+                datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
+                if self.cfg.get("TIME_EXIT_ENABLED", True) else None
+            )
+
+            pid = await self.db.insert_position({
+                "symbol": sig.symbol, "side": "short", "size": actual_size,
+                "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
+                "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
+                "exit_deadline": exit_deadline, # <-- RESTORED
+            })
+
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
-            
-            # FIX 1.2 & 1.3: Use correct order type and add category
             sl_params = {"triggerPrice": stop_price_actual, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'}
             await self.exchange.create_order(sig.symbol, 'STOP_MARKET', "buy", actual_size, params=sl_params)
 
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
                 tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
                 qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
-                # FIX 1.2 & 1.3: Use correct order type and add category
                 tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'}
                 await self.exchange.create_order(sig.symbol, 'TAKE_PROFIT_MARKET', "buy", qty, params=tp_params)
             
@@ -515,17 +513,17 @@ class LiveTrader:
             await self.tg.send(f"🚀 Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}")
 
         except Exception as e:
-            LOG.critical("NAKED POSITION: SL/TP placement failed for %s (pid %d): %s", sig.symbol, pid, e)
-            await self.db.update_position(pid, status="ERROR_NAKED")
+            # HARDENED: If any part of the DB write or SL/TP placement fails, panic-close the position.
+            msg = f"🚨 CRITICAL: Failed to persist or protect position for {sig.symbol} due to: {e}. Triggering emergency close."
+            LOG.critical(msg)
+            await self.tg.send(msg)
             try:
                 await self.exchange.create_market_order(
                     sig.symbol, 'buy', actual_size, params={'reduceOnly': True, 'category': 'linear'}
                 )
-                msg = f"🚨 CRITICAL: Failed to set SL/TP for {sig.symbol}. Position has been emergency closed."
-                LOG.warning(msg)
-                await self.tg.send(msg)
+                LOG.warning("Emergency close for %s was successful.", sig.symbol)
             except Exception as close_e:
-                msg = f"🚨 !!! NAKED POSITION for {sig.symbol}. Manual intervention REQUIRED. Close error: {close_e}"
+                msg = f"🚨 !!! FAILED TO EMERGENCY CLOSE {sig.symbol}. Manual intervention REQUIRED. Close error: {close_e}"
                 LOG.critical(msg)
                 await self.tg.send(msg)
 
