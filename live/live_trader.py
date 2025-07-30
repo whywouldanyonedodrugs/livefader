@@ -7,6 +7,7 @@ accidentally deleted, fixing the startup crash.
 
 from __future__ import annotations
 
+import secrets
 import asyncio
 import dataclasses
 import json
@@ -40,6 +41,17 @@ from .telegram import TelegramBot
 
 from pydantic import Field, Extra, ValidationError
 from pydantic_settings import BaseSettings
+
+def create_unique_cid(tag: str) -> str:
+    """Creates a globally unique client order ID for one-shot orders like entry."""
+    timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # The random hex makes it unique even if called in the same millisecond.
+    random_suffix = secrets.token_hex(2)
+    return f"bot_{tag}_{timestamp_ms}_{random_suffix}"[:36]
+
+def create_stable_cid(pid: int, tag: str) -> str:
+    """Creates a stable, repeatable client order ID for manageable orders like SL/TP."""
+    return f"bot_{pid}_{tag}"[:36]
 
 @dataclasses.dataclass
 class Signal:
@@ -181,6 +193,13 @@ class LiveTrader:
         return ex
 
     @staticmethod
+    def _cid(pid: int, tag: str) -> str:
+        """Creates a unique, valid client order ID."""
+        timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        # Bybit V5 requires clientOrderId to be 36 chars or less.
+        return f"bot_{pid}_{tag}_{timestamp_ms}"[:36]
+
+    @staticmethod
     def _load_symbols():
         return SYMBOLS_PATH.read_text().split()
 
@@ -247,13 +266,6 @@ class LiveTrader:
         if mode == "PERCENT":
             return free_usdt * self.cfg["RISK_PCT"]
         return float(self.cfg["FIXED_RISK_USDT"])
-
-    @staticmethod
-    def _cid(pid: int, tag: str) -> str:
-        """Generates a unique client order ID, truncated to 36 characters."""
-        timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        # Bybit V5 requires clientOrderId to be 36 chars or less.
-        return f"bot_{pid}_{tag}_{timestamp_ms}"[:36]
 
     # --- NEW, CORRECTED HELPER METHODS ---
     async def _fetch_by_cid(self, cid: str, symbol: str):
@@ -417,12 +429,13 @@ class LiveTrader:
     async def _open_position(self, sig: Signal):
         """
         A robust and hardened hybrid entry method.
-        1. Places a market order.
+        1. Places a market order with a globally unique CID.
         2. Confirms the position exists on the exchange.
-        3. Tries to persist to DB and place SL/TP using the correct V5 syntax.
-        4. If step 3 fails for ANY reason, it performs an emergency market-close.
+        3. Persists to DB to get a position ID (pid).
+        4. Places protective orders using stable CIDs based on the pid.
+        5. If any step fails, it performs an emergency market-close.
         """
-        # --- Steps 1 & 2: Pre-checks, order placement, and confirmation (These are correct) ---
+        # --- 1. Pre-flight checks and size calculation ---
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
             return
 
@@ -450,17 +463,19 @@ class LiveTrader:
         except Exception:
             return
 
-        client_order_id = self._cid(0, "ENTRY")
+        # --- 2. Place market order with a UNIQUE CID ---
+        entry_cid = create_unique_cid(f"ENTRY_{sig.symbol}")
         try:
-            order = await self.exchange.create_market_order(
+            await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size,
-                params={"clientOrderId": client_order_id, "category": "linear"}
+                params={"clientOrderId": entry_cid, "category": "linear"}
             )
-            LOG.info("Market order sent for %s. Order ID: %s", sig.symbol, order.get('id'))
+            LOG.info("Market order sent for %s. Entry CID: %s", sig.symbol, entry_cid)
         except Exception as e:
             LOG.error("Initial market order placement for %s failed immediately: %s", sig.symbol, e)
             return
 
+        # --- 3. Robust confirmation loop ---
         actual_size, actual_entry_price, live_position = 0.0, 0.0, None
         CONFIRMATION_ATTEMPTS = 20
         for i in range(CONFIRMATION_ATTEMPTS):
@@ -481,7 +496,7 @@ class LiveTrader:
             LOG.error("ENTRY FAILED for %s: Position did not appear on exchange after %d attempts.", sig.symbol, CONFIRMATION_ATTEMPTS)
             return
 
-        # --- Step 3: Persist to DB and place SL/TP (CRITICAL BLOCK) ---
+        # --- 4. Persist to DB and place protective orders (CRITICAL BLOCK) ---
         try:
             exit_deadline = (
                 datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
@@ -492,42 +507,43 @@ class LiveTrader:
                 "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
                 "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
                 "exit_deadline": exit_deadline,
+                "entry_cid": entry_cid
             })
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
             
-            # FIX: Use 'market' type and make it conditional with triggerPrice
-            sl_params = {
-                "triggerPrice": stop_price_actual, 
-                "clientOrderId": self._cid(pid, "SL"), 
-                'reduceOnly': True, 
-                'triggerDirection': 1, # Trigger when price rises (for a short)
-                'category': 'linear',
-                'orderFilter': 'StopOrder' # Recommended for clarity
-            }
-            await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=sl_params)
+            # Use STABLE CIDs for manageable orders
+            sl_cid = create_stable_cid(pid, "SL")
+            tp1_cid = create_stable_cid(pid, "TP1")
+
+            await self.exchange.create_order(
+                sig.symbol, 'stop_market', "buy", actual_size, None,
+                params={
+                    "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
+                    'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
+                }
+            )
 
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
                 tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
                 qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
-                # FIX: Use 'market' type and make it conditional with triggerPrice
-                tp_params = {
-                    "triggerPrice": tp_price, 
-                    "clientOrderId": self._cid(pid, "TP1"), 
-                    'reduceOnly': True, 
-                    'triggerDirection': 2, # Trigger when price falls (for a short)
-                    'category': 'linear',
-                    'orderFilter': 'tpslOrder' # Recommended for clarity
-                }
-                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, None, params=tp_params)
+                await self.exchange.create_order(
+                    sig.symbol, 'take_profit_market', "buy", qty, None,
+                    params={
+                        "triggerPrice": tp_price, "clientOrderId": tp1_cid,
+                        'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
+                    }
+                )
             
-            await self.db.update_position(pid, status="OPEN", stop_price=stop_price_actual)
+            await self.db.update_position(
+                pid, status="OPEN", stop_price=stop_price_actual,
+                sl_cid=sl_cid, tp1_cid=tp1_cid
+            )
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
             await self.tg.send(f"🚀 Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}")
 
         except Exception as e:
-            # This safety net remains crucial
             msg = f"🚨 CRITICAL: Failed to persist or protect position for {sig.symbol} due to: {e}. Triggering emergency close."
             LOG.critical(msg)
             await self.tg.send(msg)
@@ -554,9 +570,7 @@ class LiveTrader:
             await asyncio.sleep(5)
 
     async def _update_single_position(self, pid: int, pos: Dict[str, Any]):
-        is_closed = False
         symbol = pos["symbol"]
-        # --- USE THE NEW HELPER METHOD HERE ---
         orders = await self._all_open_orders(symbol)
         open_cids = {o.get("clientOrderId") for o in orders}
 
@@ -567,16 +581,17 @@ class LiveTrader:
                 await self._force_close_position(pid, pos, tag="TIME_EXIT")
                 return
 
-        if self.cfg.get("PARTIAL_TP_ENABLED", False) and (not pos["trailing_active"]) and self._cid(pid, "TP1") not in open_cids:
+        if self.cfg.get("PARTIAL_TP_ENABLED", False) and not pos["trailing_active"] and pos.get("tp1_cid") not in open_cids:
             fill_price = None
             try:
-                o = await self.exchange.fetch_order_by_client_id(self._cid(pid, "TP1"), symbol)
-                fill_price = o.get("average") or o.get("price")
+                o = await self._fetch_by_cid(pos["tp1_cid"], symbol)
+                if o and o.get('status') == 'closed':
+                    fill_price = o.get('average') or o.get('price')
             except Exception as e:
-                LOG.warning("Failed to fetch TP1 fill price %s", e)
+                LOG.warning("Failed to fetch TP1 fill price for %s: %s", pos["tp1_cid"], e)
 
             await self.db.add_fill(
-                pid, "TP1", fill_price, pos["size"] * self.cfg["PARTIAL_TP_PCT"], datetime.now(timezone.utc)
+                pid, "TP1", fill_price, float(pos["size"]) * self.cfg["PARTIAL_TP_PCT"], datetime.now(timezone.utc)
             )
             await self.db.update_position(pid, trailing_active=True)
             pos["trailing_active"] = True
@@ -586,10 +601,11 @@ class LiveTrader:
         if pos["trailing_active"]:
             await self._trail_stop(pid, pos)
 
-        active_stop_cid = self._cid(pid, "SL_TRAIL") if pos["trailing_active"] else self._cid(pid, "SL")
+        active_stop_cid = pos.get("sl_trail_cid") if pos["trailing_active"] else pos.get("sl_cid")
         is_closed = active_stop_cid not in open_cids
+        
         if not is_closed and pos["trailing_active"] and self.cfg.get("FINAL_TP_ENABLED", False):
-             if self._cid(pid, "TP2") not in open_cids:
+            if pos.get("tp2_cid") not in open_cids:
                 is_closed = True
 
         if is_closed:
@@ -598,11 +614,13 @@ class LiveTrader:
     async def _activate_trailing(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
         try:
-            await self.exchange.cancel_order_by_client_id(self._cid(pid, "SL"), symbol)
+            # FIX: Use the stored CID from the position data
+            if pos.get("sl_cid"):
+                await self._cancel_by_cid(pos["sl_cid"], symbol)
         except ccxt.OrderNotFound:
             pass
         except Exception as e:
-            LOG.warning(f"Could not cancel original SL for {pid}: {e}")
+            LOG.warning(f"Could not cancel original SL for {pid} ({pos.get('sl_cid')}): {e}")
 
         await self._trail_stop(pid, pos, first=True)
 
@@ -619,71 +637,60 @@ class LiveTrader:
 
     async def _trail_stop(self, pid: int, pos: Dict[str, Any], first: bool = False):
         symbol = pos["symbol"]
-        price = (await self.exchange.fetch_ticker(symbol))["last"]
-        atr = pos["atr"]
+        price = float((await self.exchange.fetch_ticker(symbol))["last"])
+        atr = float(pos["atr"])
+        stop_price = float(pos["stop_price"])
+
         new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
-        is_favorable_move = new_stop < pos["stop_price"]
+        is_favorable_move = stop_price == 0 or new_stop < stop_price
         min_move_required = price * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
-        is_significant_move = (pos["stop_price"] - new_stop) > min_move_required
+        is_significant_move = abs(stop_price - new_stop) > min_move_required
 
         if first or (is_favorable_move and is_significant_move):
-            qty_left = pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
+            qty_left = float(pos["size"]) * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
+            
+            sl_trail_cid = create_stable_cid(pid, "SL_TRAIL")
+
             try:
-                await self._cancel_by_cid(self._cid(pid, "SL_TRAIL"), symbol)
+                if not first and pos.get("sl_trail_cid"):
+                    await self._cancel_by_cid(pos["sl_trail_cid"], symbol)
             except ccxt.OrderNotFound:
                 pass
             except Exception as e:
-                LOG.warning("Trail cancel failed for %s: %s. Will retry on next tick.", symbol, e)
+                LOG.warning("Trail cancel failed for %s: %s. Will retry.", symbol, e)
                 return
             
-            # FIX: Use 'market' type and make it conditional with triggerPrice
-            sl_params = {
-                "triggerPrice": new_stop, 
-                "clientOrderId": self._cid(pid, "SL_TRAIL"), 
-                'reduceOnly': True, 
-                'triggerDirection': 1, # Trigger when price rises (for a short)
-                'category': 'linear',
-                'orderFilter': 'StopOrder'
-            }
-            await self.exchange.create_order(symbol, 'market', "buy", qty_left, None, params=sl_params)
+            await self.exchange.create_order(
+                symbol, 'stop_market', "buy", qty_left, None,
+                params={
+                    "triggerPrice": new_stop, "clientOrderId": sl_trail_cid,
+                    'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
+                }
+            )
             
-            await self.db.update_position(pid, stop_price=new_stop)
+            await self.db.update_position(pid, stop_price=new_stop, sl_trail_cid=sl_trail_cid)
             pos["stop_price"] = new_stop
+            pos["sl_trail_cid"] = sl_trail_cid
             LOG.info("Trail updated %s to %.4f", symbol, new_stop)
             
     async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN_CLOSE"
 
-        # --- Determine Exit Price & Reason ---
-        # This logic is still valuable for accurate PnL reporting.
-        # We try to find the exact fill data of the order that closed the position.
+        possible_closing_cids = [
+            pos.get("sl_cid"), pos.get("tp1_cid"), 
+            pos.get("sl_trail_cid"), pos.get("tp2_cid")
+        ]
         
-        # Define all possible order IDs that could have closed the trade
-        possible_closing_cids = []
-        if pos["trailing_active"]:
-            possible_closing_cids.append(self._cid(pid, "SL_TRAIL"))
-            if self.cfg.get("FINAL_TP_ENABLED", False):
-                possible_closing_cids.append(self._cid(pid, "TP2"))
-        else:
-            possible_closing_cids.append(self._cid(pid, "SL"))
-            if self.cfg.get("PARTIAL_TP_ENABLED", False):
-                possible_closing_cids.append(self._cid(pid, "TP1"))
-            elif self.cfg.get("FINAL_TP_ENABLED", False):
-                possible_closing_cids.append(self._cid(pid, "TP_FINAL"))
-
-        # Check the history for each possible closing order
-        for cid in possible_closing_cids:
+        for cid in filter(None, possible_closing_cids):
             try:
-                # fetch_order can find closed/filled orders
-                order = await self.exchange.fetch_order_by_client_id(cid, symbol, params={"category": "linear"})
+                # FIX: Use the correct helper function
+                order = await self._fetch_by_cid(cid, symbol)
                 if order and order.get('status') == 'closed' and order.get('filled', 0) > 0:
                     exit_price = order.get('average') or order.get('price')
                     exit_qty = order['filled']
-                    # Determine the closing reason from the CID
                     if "TP" in cid: closing_order_type = "TP"
                     elif "SL" in cid: closing_order_type = "SL"
-                    LOG.info(f"Position {pid} closed by order {cid} at avg price {exit_price}")
                     break 
             except ccxt.OrderNotFound:
                 continue
@@ -716,10 +723,11 @@ class LiveTrader:
         # Fetch ALL fills for this position to calculate total PnL accurately
         all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
         total_pnl = 0
-        entry_price = pos["entry_price"]
+        # FIX: Cast entry_price to float before math
+        entry_price = float(pos["entry_price"])
         for fill in all_fills:
             if fill['price'] is not None and fill['qty'] is not None:
-                # For a short, PnL = (entry - exit) * quantity
+                # FIX: Cast Decimal from DB to float
                 total_pnl += (entry_price - float(fill['price'])) * float(fill['qty'])
 
         await self.db.update_position(
@@ -735,14 +743,19 @@ class LiveTrader:
         symbol = pos["symbol"]
         try:
             await self.exchange.cancel_all_orders(symbol)
-            await self.exchange.create_market_order(symbol, "buy", pos["size"], params={'reduceOnly': True})
+            # FIX: Cast size to float
+            await self.exchange.create_market_order(symbol, "buy", float(pos["size"]), params={'reduceOnly': True})
         except Exception as e:
             LOG.warning("Force-close order issue on %s: %s", symbol, e)
 
-        last_price = (await self.exchange.fetch_ticker(symbol))["last"]
-        pnl = (pos["entry_price"] - last_price) * pos["size"]
+        # FIX: Cast all values to float before math
+        last_price = float((await self.exchange.fetch_ticker(symbol))["last"])
+        entry_price = float(pos["entry_price"])
+        size = float(pos["size"])
+        pnl = (entry_price - last_price) * size
+        
         await self.db.update_position(pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl)
-        await self.db.add_fill(pid, tag, last_price, pos["size"], datetime.now(timezone.utc))
+        await self.db.add_fill(pid, tag, last_price, size, datetime.now(timezone.utc))
         await self.risk.on_trade_close(pnl, self.tg)
         self.last_exit[symbol] = datetime.now(timezone.utc)
         del self.open_positions[pid]
