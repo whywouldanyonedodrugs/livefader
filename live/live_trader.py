@@ -455,15 +455,15 @@ class LiveTrader:
             "exit_deadline": exit_deadline,
         })
 
+        # --- NEW: Robust Entry and Confirmation Logic ---
+        entry_order = None # Initialize to None before the try block
         try:
-            # --- NEW: Robust Order Confirmation Logic ---
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
             
             executed_size = 0.0
-            # Loop for up to 10 seconds to confirm the fill
-            for i in range(20): # 20 attempts * 0.5s sleep = 10 seconds
+            for i in range(20):
                 await asyncio.sleep(0.5)
                 order_status = await self.exchange.fetch_order(entry_order['id'], sig.symbol)
                 if order_status.get('status') == 'closed' and order_status.get('filled', 0) > 0:
@@ -477,11 +477,12 @@ class LiveTrader:
         except Exception as e:
             LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR_ENTRY")
-            # Attempt to cancel the potentially stuck order
-            try:
-                await self.exchange.cancel_order(entry_order['id'], sig.symbol)
-            except Exception as cancel_e:
-                LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
+            # Now we can safely check if entry_order exists before trying to cancel it
+            if entry_order and entry_order.get('id'):
+                try:
+                    await self.exchange.cancel_order(entry_order['id'], sig.symbol)
+                except Exception as cancel_e:
+                    LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
             return
 
         try:
