@@ -779,23 +779,28 @@ class LiveTrader:
     async def _resume(self):
         """
         On startup, load state from DB and reconcile with actual
-        exchange positions. Includes a highly efficient "clean slate" protocol
-        that correctly groups orders by symbol before cancellation.
+        exchange positions. Includes a definitive "clean slate" protocol that
+        correctly fetches all order types using the proper CCXT parameters.
         """
         LOG.info("--> Resuming state...")
 
         # --- FINAL, CORRECTED: Clean Slate Protocol ---
         LOG.info("Step 1: Fetching and cancelling all old open orders...")
         try:
-            # 1. Fetch all open regular and conditional orders.
+            # 1. Fetch all open REGULAR orders (Limit/Market).
             regular_orders = await self.exchange.fetch_open_orders()
-            conditional_orders = await self.exchange.fetch_open_orders(params={'orderFilter': 'StopOrder'})
+
+            # 2. Fetch all open CONDITIONAL orders (Stop Loss/Take Profit)
+            # The correct CCXT parameter to fetch conditional orders is {'stop': True}.
+            conditional_orders = await self.exchange.fetch_open_orders(params={'stop': True})
+            
             all_open_orders = regular_orders + conditional_orders
 
             if all_open_orders:
-                # 2. Group the orders by symbol.
+                # Group the found orders by their symbol.
                 orders_by_symbol = defaultdict(list)
                 for order in all_open_orders:
+                    # Only act on symbols the bot is configured to trade.
                     if order['symbol'] in self.symbols:
                         orders_by_symbol[order['symbol']].append(order['id'])
 
@@ -803,10 +808,14 @@ class LiveTrader:
                     LOG.info("Found %d symbols with a total of %d leftover orders. Cancelling now...", 
                              len(orders_by_symbol), len(all_open_orders))
                     
-                    # 3. Loop through each symbol and cancel its specific orders.
+                    # Loop through each symbol and cancel its specific orders.
+                    # This is required because cancel_orders is a per-symbol endpoint on Bybit.
+                    cancel_tasks = []
                     for symbol, order_ids in orders_by_symbol.items():
-                        LOG.debug("Cancelling %d orders for %s...", len(order_ids), symbol)
-                        await self.exchange.cancel_orders(order_ids, symbol)
+                        LOG.debug("Queueing cancellation for %d orders for %s...", len(order_ids), symbol)
+                        cancel_tasks.append(self.exchange.cancel_orders(order_ids, symbol))
+                    
+                    await asyncio.gather(*cancel_tasks, return_exceptions=True)
                     
                     LOG.info("...Successfully cancelled old orders.")
                 else:
