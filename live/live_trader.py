@@ -486,7 +486,7 @@ class LiveTrader:
                 for i in range(10): # Loop for up to 5 seconds
                     await asyncio.sleep(0.5)
                     # Use fetch_order with the clientOrderId and the mandatory 'category' parameter
-                    order_status = await self.exchange.fetch_order(client_order_id, sig.symbol, params={'category': 'linear'})
+                    order_status = await self.exchange.fetch_order_by_client_id(client_order_id, sig.symbol, {"category": "linear"})
                     
                     if order_status:
                         filled_amount = float(order_status.get('filled') or order_status.get('info', {}).get('cumExecQty') or 0.0)
@@ -502,7 +502,7 @@ class LiveTrader:
             LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR_ENTRY")
             try:
-                await self.exchange.cancel_order(client_order_id, sig.symbol, params={'category': 'linear'})
+                await self.exchange.cancel_order_by_client_id(client_order_id, sig.symbol, {"category": "linear"})
             except Exception as cancel_e:
                 LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
             return
@@ -682,7 +682,7 @@ class LiveTrader:
         for cid in possible_closing_cids:
             try:
                 # fetch_order can find closed/filled orders
-                order = await self.exchange.fetch_order(clientOrderId=cid, symbol=symbol)
+                order = await self.exchange.fetch_order_by_client_id(cid, symbol, params={"category": "linear"})
                 if order and order.get('status') == 'closed' and order.get('filled', 0) > 0:
                     exit_price = order.get('average') or order.get('price')
                     exit_qty = order['filled']
