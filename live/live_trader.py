@@ -780,48 +780,61 @@ class LiveTrader:
         """
         On startup, load state from DB and reconcile with actual
         exchange positions. Includes a definitive "clean slate" protocol that
-        correctly fetches all order types using the proper CCXT parameters.
+        correctly fetches all order types using the proper V5 API parameters.
         """
         LOG.info("--> Resuming state...")
 
         # --- FINAL, CORRECTED: Clean Slate Protocol ---
         LOG.info("Step 1: Fetching and cancelling all old open orders...")
         try:
-            # 1. Fetch all open REGULAR orders (Limit/Market).
-            regular_orders = await self.exchange.fetch_open_orders()
-
-            # 2. Fetch all open CONDITIONAL orders (Stop Loss/Take Profit)
-            # The correct CCXT parameter to fetch conditional orders is {'stop': True}.
-            conditional_orders = await self.exchange.fetch_open_orders(params={'stop': True})
+            # Bybit's V5 API requires fetching different order types separately.
+            # We fetch all of them to ensure a truly clean slate.
             
-            all_open_orders = regular_orders + conditional_orders
+            # 1. Define the parameters for each type of order we need to fetch.
+            fetch_params = [
+                {'category': 'linear'},                                  # Regular open orders
+                {'category': 'linear', 'orderFilter': 'StopOrder'},      # Conditional Stop/Trigger orders
+                {'category': 'linear', 'orderFilter': 'tpslOrder'},      # Position-linked TP/SL orders
+            ]
+
+            # 2. Fetch all order types concurrently.
+            all_orders_lists = await asyncio.gather(
+                self.exchange.fetch_open_orders(params=fetch_params[0]),
+                self.exchange.fetch_open_orders(params=fetch_params[1]),
+                self.exchange.fetch_open_orders(params=fetch_params[2]),
+                return_exceptions=True
+            )
+
+            # 3. Combine the results into a single list.
+            all_open_orders = []
+            for result in all_orders_lists:
+                if isinstance(result, list):
+                    all_open_orders.extend(result)
 
             if all_open_orders:
-                # Group the found orders by their symbol.
+                # 4. Group the found orders by their symbol.
+                # We do NOT filter by symbols.txt, to ensure we cancel truly orphaned orders.
                 orders_by_symbol = defaultdict(list)
                 for order in all_open_orders:
-                    # Only act on symbols the bot is configured to trade.
-                    if order['symbol'] in self.symbols:
-                        orders_by_symbol[order['symbol']].append(order['id'])
+                    orders_by_symbol[order['symbol']].append(order['id'])
 
                 if orders_by_symbol:
-                    LOG.info("Found %d symbols with a total of %d leftover orders. Cancelling now...", 
-                             len(orders_by_symbol), len(all_open_orders))
+                    LOG.info("Found %d leftover orders across %d symbols. Cancelling all...", 
+                             len(all_open_orders), len(orders_by_symbol))
                     
-                    # Loop through each symbol and cancel its specific orders.
-                    # This is required because cancel_orders is a per-symbol endpoint on Bybit.
-                    cancel_tasks = []
-                    for symbol, order_ids in orders_by_symbol.items():
-                        LOG.debug("Queueing cancellation for %d orders for %s...", len(order_ids), symbol)
-                        cancel_tasks.append(self.exchange.cancel_orders(order_ids, symbol))
-                    
+                    # 5. Loop through each symbol and issue a single cancel_all_orders command.
+                    # This is efficient and robust.
+                    cancel_tasks = [
+                        self.exchange.cancel_all_orders(symbol, params={'category': 'linear'}) 
+                        for symbol in orders_by_symbol.keys()
+                    ]
                     await asyncio.gather(*cancel_tasks, return_exceptions=True)
                     
                     LOG.info("...Successfully cancelled old orders.")
                 else:
-                    LOG.info("...No old open orders found for tracked symbols. Clean slate confirmed.")
+                    LOG.info("...No old open orders found. Clean slate confirmed.")
             else:
-                LOG.info("...No old open orders found for tracked symbols. Clean slate confirmed.")
+                LOG.info("...No old open orders found. Clean slate confirmed.")
 
         except Exception as e:
             LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
