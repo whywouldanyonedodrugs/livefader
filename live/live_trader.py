@@ -779,42 +779,44 @@ class LiveTrader:
     async def _resume(self):
         """
         On startup, load state from DB and reconcile with actual
-        exchange positions. Includes a robust "clean slate" protocol that
-        explicitly fetches and cancels ALL order types (regular and conditional).
+        exchange positions. Includes a highly efficient "clean slate" protocol
+        that correctly groups orders by symbol before cancellation.
         """
         LOG.info("--> Resuming state...")
 
         # --- FINAL, CORRECTED: Clean Slate Protocol ---
         LOG.info("Step 1: Fetching and cancelling all old open orders...")
         try:
-            # Bybit's API separates regular and conditional orders. We must check both.
-            
-            # 1. Fetch ALL open REGULAR orders (Limit/Market)
+            # 1. Fetch all open regular and conditional orders.
             regular_orders = await self.exchange.fetch_open_orders()
-
-            # 2. Fetch ALL open CONDITIONAL orders (Stop Loss/Take Profit)
-            # We pass a parameter to tell CCXT to fetch the 'StopOrder' category.
             conditional_orders = await self.exchange.fetch_open_orders(params={'orderFilter': 'StopOrder'})
-            
             all_open_orders = regular_orders + conditional_orders
 
             if all_open_orders:
-                LOG.info("Found %d old open orders to cancel. Cancelling now...", len(all_open_orders))
-                
-                # Create a list of order IDs and symbols to cancel
-                orders_to_cancel = [{'id': o['id'], 'symbol': o['symbol']} for o in all_open_orders]
-                
-                # Use the cancel_orders method to batch-cancel them
-                await self.exchange.cancel_orders(orders_to_cancel)
-                
-                LOG.info("...Successfully cancelled %d old orders.", len(all_open_orders))
+                # 2. Group the orders by symbol.
+                orders_by_symbol = defaultdict(list)
+                for order in all_open_orders:
+                    if order['symbol'] in self.symbols:
+                        orders_by_symbol[order['symbol']].append(order['id'])
+
+                if orders_by_symbol:
+                    LOG.info("Found %d symbols with a total of %d leftover orders. Cancelling now...", 
+                             len(orders_by_symbol), len(all_open_orders))
+                    
+                    # 3. Loop through each symbol and cancel its specific orders.
+                    for symbol, order_ids in orders_by_symbol.items():
+                        LOG.debug("Cancelling %d orders for %s...", len(order_ids), symbol)
+                        await self.exchange.cancel_orders(order_ids, symbol)
+                    
+                    LOG.info("...Successfully cancelled old orders.")
+                else:
+                    LOG.info("...No old open orders found for tracked symbols. Clean slate confirmed.")
             else:
                 LOG.info("...No old open orders found for tracked symbols. Clean slate confirmed.")
 
         except Exception as e:
             LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
             traceback.print_exc()
-            # We will continue, but this is a high-risk situation.
 
         # --- END OF NEW LOGIC ---
 
