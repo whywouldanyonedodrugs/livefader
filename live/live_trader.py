@@ -250,8 +250,10 @@ class LiveTrader:
 
     @staticmethod
     def _cid(pid: int, tag: str) -> str:
+        """Generates a unique client order ID, truncated to 36 characters."""
         timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        return f"bot_{pid}_{tag}_{timestamp_ms}"
+        # Bybit V5 requires clientOrderId to be 36 chars or less.
+        return f"bot_{pid}_{tag}_{timestamp_ms}"[:36]
 
     # --- NEW, CORRECTED HELPER METHODS ---
     async def _fetch_by_cid(self, cid: str, symbol: str):
@@ -413,130 +415,111 @@ class LiveTrader:
         return None
 
     async def _open_position(self, sig: Signal):
+        """
+        A robust hybrid entry method.
+        1. Places a simple market order.
+        2. Uses a confirmation loop to ensure the position exists on the exchange.
+        3. Proceeds with custom, bot-managed SL and partial TP logic.
+        """
+        # --- 1. Pre-flight checks and size calculation ---
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
             return
 
-        cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
-        last_x = self.last_exit.get(sig.symbol)
-        if last_x and datetime.now(timezone.utc) - last_x < timedelta(hours=cd_h):
-            LOG.debug("Cool-down veto on %s", sig.symbol)
+        try:
+            positions = await self.exchange.fetch_positions(symbols=[sig.symbol])
+            if positions and positions[0] and float(positions[0].get('info', {}).get('size', 0)) > 0:
+                LOG.warning("Skipping entry for %s, pre-flight check found existing exchange position.", sig.symbol)
+                return
+        except Exception as e:
+            LOG.error("Could not perform pre-flight position check for %s: %s", sig.symbol, e)
             return
 
         bal = await self._fetch_platform_balance()
         free_usdt = bal["free"]["USDT"]
         risk_amt = await self._risk_amount(free_usdt)
 
-        entry = sig.entry
-        atr = sig.atr
-        stop = entry + self.cfg["SL_ATR_MULT"] * atr
-        slippage_buffer = entry * self.cfg.get("SLIPPAGE_BUFFER_PCT", 0.0)
-        effective_entry_price = entry + slippage_buffer
-        stop_dist = abs(effective_entry_price - stop)
-
+        stop_price_signal = sig.entry + self.cfg["SL_ATR_MULT"] * sig.atr
+        stop_dist = abs(sig.entry - stop_price_signal)
         if stop_dist == 0:
             LOG.warning("VETO: Stop distance is zero for %s. Skipping.", sig.symbol)
             return
 
-        if (stop_dist < self.cfg["MIN_STOP_DIST_USD"] or (stop_dist / entry) < self.cfg["MIN_STOP_DIST_PCT"]):
-            LOG.info("EXEC_ATR veto %s – stop %.4f < min dist", sig.symbol, stop_dist)
-            return
-
         intended_size = risk_amt / stop_dist
-
-        try:
-            market = self.exchange.market(sig.symbol)
-            min_cost = market.get('limits', {}).get('cost', {}).get('min')
-            if min_cost is None:
-                min_cost = self.cfg.get("MIN_NOTIONAL", 0.01)
-
-            if (intended_size * entry) < min_cost:
-                LOG.warning("VETO: Order for %s size %s costs less than exchange minimum of %s.", sig.symbol, intended_size, min_cost)
-                return
-        except Exception as e:
-            LOG.error("Error during size validation for %s: %s", sig.symbol, e)
-            traceback.print_exc()
-            return
 
         try:
             await self._ensure_leverage(sig.symbol)
         except Exception:
             return
 
-        exit_deadline = (
-            datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
-            if self.cfg.get("TIME_EXIT_ENABLED", True) else None
-        )
-
-        pid = await self.db.insert_position({
-            "symbol": sig.symbol, "side": "short", "size": intended_size,
-            "entry_price": entry, "stop_price": stop, "trailing_active": False,
-            "atr": atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
-            "exit_deadline": exit_deadline,
-        })
-
-        executed_size = 0.0
-        client_order_id = self._cid(pid, "ENTRY")
+        # --- 2. Place a simple market order ---
+        client_order_id = self._cid(0, "ENTRY")
+        order = None
         try:
-            entry_order = await self.exchange.create_market_order(
-                sig.symbol, "sell", intended_size, 
+            order = await self.exchange.create_market_order(
+                sig.symbol, "sell", intended_size,
                 params={"clientOrderId": client_order_id, "category": "linear"}
             )
-            
-            executed_size = float(
-                entry_order.get('filled') or 
-                entry_order.get('info', {}).get('cumExecQty') or 
-                0.0
-            )
-
-            if executed_size <= 0:
-                LOG.info("Initial response showed no fill, confirming via clientOrderId for %s...", sig.symbol)
-                for i in range(10):
-                    await asyncio.sleep(0.5)
-                    order_status = await self._fetch_by_cid(client_order_id, sig.symbol)
-                    
-                    if order_status:
-                        filled_amount = float(order_status.get('filled') or order_status.get('info', {}).get('cumExecQty') or 0.0)
-                        if order_status.get('status') == 'closed' and filled_amount > 0:
-                            executed_size = filled_amount
-                            LOG.info("Confirmation loop successful. Executed size: %s", executed_size)
-                            break
-            
-            if executed_size <= 0:
-                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} was not filled after 5 seconds.")
-
+            LOG.info("Market order sent for %s. Order ID: %s", sig.symbol, order.get('id'))
         except Exception as e:
-            LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
-            await self.db.update_position(pid, status="ERROR_ENTRY")
-            await self._cancel_by_cid(client_order_id, sig.symbol)
+            LOG.error("Initial market order placement for %s failed immediately: %s", sig.symbol, e)
             return
 
+        # --- 3. Robust confirmation loop ---
+        actual_size = 0.0
+        actual_entry_price = 0.0
+        live_position = None
+        CONFIRMATION_ATTEMPTS = 20
+        for i in range(CONFIRMATION_ATTEMPTS):
+            await asyncio.sleep(0.5)
+            try:
+                positions = await self.exchange.fetch_positions(symbols=[sig.symbol])
+                pos = next((p for p in positions if p.get('info', {}).get('symbol') == sig.symbol), None)
+                if pos and float(pos.get('info', {}).get('size', 0)) > 0:
+                    live_position = pos
+                    actual_size = float(live_position['info']['size'])
+                    actual_entry_price = float(live_position['info']['avgPrice'])
+                    LOG.info(f"ENTRY CONFIRMED for {sig.symbol}. Exchange reports size: {actual_size} @ {actual_entry_price}")
+                    break
+            except Exception as e:
+                LOG.warning("Confirmation loop check failed for %s (attempt %d/%d): %s", sig.symbol, i + 1, CONFIRMATION_ATTEMPTS, e)
+        
+        if not live_position:
+            LOG.error("ENTRY FAILED for %s: Position did not appear on exchange after %d attempts.", sig.symbol, CONFIRMATION_ATTEMPTS)
+            return
+
+        # --- 4. Persist to DB and place bot-managed SL/TP orders ---
+        pid = await self.db.insert_position({
+            "symbol": sig.symbol, "side": "short", "size": actual_size,
+            "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
+            "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
+        })
+
         try:
-            sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'}
-            await self.exchange.create_order(sig.symbol, 'STOP_MARKET', "buy", executed_size, params=sl_params)
+            # FIX 1.6: Calculate final SL based on the ACTUAL entry price
+            stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
             
+            # FIX 1.2 & 1.3: Use correct order type and add category
+            sl_params = {"triggerPrice": stop_price_actual, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'}
+            await self.exchange.create_order(sig.symbol, 'STOP_MARKET', "buy", actual_size, params=sl_params)
+
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
-                tp_price = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
-                qty = executed_size * self.cfg["PARTIAL_TP_PCT"]
+                tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
+                qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
+                # FIX 1.2 & 1.3: Use correct order type and add category
                 tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'}
                 await self.exchange.create_order(sig.symbol, 'TAKE_PROFIT_MARKET', "buy", qty, params=tp_params)
             
-            elif self.cfg.get("FINAL_TP_ENABLED", False):
-                tp_price = entry - self.cfg["FINAL_TP_ATR_MULT"] * atr
-                qty = executed_size
-                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP_FINAL"), 'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'}
-                await self.exchange.create_order(sig.symbol, 'TAKE_PROFIT_MARKET', "buy", qty, params=tp_params)
-            
-            await self.db.update_position(pid, status="OPEN", size=executed_size)
+            await self.db.update_position(pid, status="OPEN", stop_price=stop_price_actual)
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
-            await self.tg.send(f"🚀 Opened {sig.symbol} short {executed_size:.3f} @ {entry:.4f}")
+            await self.tg.send(f"🚀 Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}")
 
         except Exception as e:
             LOG.critical("NAKED POSITION: SL/TP placement failed for %s (pid %d): %s", sig.symbol, pid, e)
-            await self.db.update_position(pid, status="ERROR_NAKED", size=executed_size)
+            await self.db.update_position(pid, status="ERROR_NAKED")
             try:
                 await self.exchange.create_market_order(
-                    sig.symbol, 'buy', executed_size, params={'reduceOnly': True, 'category': 'linear'}
+                    sig.symbol, 'buy', actual_size, params={'reduceOnly': True, 'category': 'linear'}
                 )
                 msg = f"🚨 CRITICAL: Failed to set SL/TP for {sig.symbol}. Position has been emergency closed."
                 LOG.warning(msg)
@@ -623,41 +606,39 @@ class LiveTrader:
                 LOG.error(f"Failed to place final TP2 order for {pid}: {e}")
 
     async def _trail_stop(self, pid: int, pos: Dict[str, Any], first: bool = False):
-        symbol = pos["symbol"]
-        price = (await self.exchange.fetch_ticker(symbol))["last"]
-        atr = pos["atr"]
-        new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
-        is_favorable_move = new_stop < pos["stop_price"]
-        min_move_required = price * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
-        is_significant_move = (pos["stop_price"] - new_stop) > min_move_required
+            symbol = pos["symbol"]
+            price = (await self.exchange.fetch_ticker(symbol))["last"]
+            atr = pos["atr"]
+            new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
+            is_favorable_move = new_stop < pos["stop_price"]
+            min_move_required = price * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
+            is_significant_move = (pos["stop_price"] - new_stop) > min_move_required
 
-        if first or (is_favorable_move and is_significant_move):
-            qty_left = pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
-            try:
-                await self.exchange.cancel_order_by_client_id(self._cid(pid, "SL_TRAIL"), symbol)
-            except ccxt.OrderNotFound:
-                pass
-            except Exception as e:
-                LOG.warning("Trail cancel failed for %s: %s. Will retry.", symbol, e)
-                return
-            
-            # Correctly create a separate BUY order, conditional on the triggerPrice (your new SL)
-            sl_params = {"triggerPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL"), 'reduceOnly': True, 'triggerDirection': 1}
-            await self.exchange.create_order(
-                symbol, 'market', "buy", qty_left, params=sl_params
-            )
-            await self.db.update_position(pid, stop_price=new_stop)
-            pos["stop_price"] = new_stop
-            LOG.info("Trail updated %s to %.4f", symbol, new_stop)
-            
-            # --- BUG FIX: Use 'market' as the order type ---
-            await self.exchange.create_order(
-                symbol, 'market', "buy", qty_left,
-                params={"stopPrice": new_stop, "clientOrderId": self._cid(pid, "SL_TRAIL"), 'reduceOnly': True, 'triggerDirection': 1}
-            )
-            await self.db.update_position(pid, stop_price=new_stop)
-            pos["stop_price"] = new_stop
-            LOG.info("Trail updated %s to %.4f", symbol, new_stop)
+            if first or (is_favorable_move and is_significant_move):
+                qty_left = pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
+                try:
+                    # Use the generic cancel with CID, it's more robust
+                    await self._cancel_by_cid(self._cid(pid, "SL_TRAIL"), symbol)
+                except ccxt.OrderNotFound:
+                    pass # This is fine, means it was already cancelled or filled
+                except Exception as e:
+                    LOG.warning("Trail cancel failed for %s: %s. Will retry on next tick.", symbol, e)
+                    return
+                
+                # FIX 1.5: Removed the duplicated create_order call. This is the only one.
+                # FIX 1.2 & 1.3: Use 'STOP_MARKET' and add 'category':'linear'
+                sl_params = {
+                    "triggerPrice": new_stop, 
+                    "clientOrderId": self._cid(pid, "SL_TRAIL"), 
+                    'reduceOnly': True, 
+                    'triggerDirection': 1,
+                    'category': 'linear'
+                }
+                await self.exchange.create_order(symbol, 'STOP_MARKET', "buy", qty_left, params=sl_params)
+                
+                await self.db.update_position(pid, stop_price=new_stop)
+                pos["stop_price"] = new_stop
+                LOG.info("Trail updated %s to %.4f", symbol, new_stop)
             
     async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
@@ -772,6 +753,7 @@ class LiveTrader:
                 for sym in self.symbols:
                     if self.paused or not self.risk.can_trade():
                         break
+                    
                     if sym in open_symbols:
                         continue
 
@@ -781,6 +763,18 @@ class LiveTrader:
                         continue
 
                     async with self.symbol_locks[sym]:
+                        # FIX 1.4: This is the single, correct pre-flight check location
+                        try:
+                            positions = await self.exchange.fetch_positions(symbols=[sym])
+                            if positions and positions[0] and float(positions[0].get('info', {}).get('size', 0)) > 0:
+                                LOG.info("Skipping scan for %s, pre-flight check found position already exists on exchange.", sym)
+                                if sym not in open_symbols:
+                                    LOG.warning("ORPHAN POSITION DETECTED for %s during pre-flight check! Reconciliation needed.", sym)
+                                continue
+                        except Exception as e:
+                            LOG.error("Could not perform pre-flight position check for %s: %s", sym, e)
+                            continue
+
                         signal = await self._scan_symbol_for_signal(sym)
                         if signal:
                             age = (datetime.utcnow().date() - self._listing_dates_cache[sym]).days if sym in self._listing_dates_cache else None
@@ -794,6 +788,7 @@ class LiveTrader:
                                 open_symbols.add(sym)
                             else:
                                 LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
+                    
                     await asyncio.sleep(0.5)
 
             except Exception as e:
