@@ -250,7 +250,15 @@ class LiveTrader:
 
     @staticmethod
     def _cid(pid: int, tag: str) -> str:
-        return f"bot_{pid}_{tag}"
+        """
+        Creates a unique clientOrderId. Appends a millisecond timestamp
+        to the PID and tag to ensure uniqueness across restarts and prevent
+        "OrderLinkedID is duplicate" errors.
+        """
+        # Get the current time in milliseconds
+        timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        # Create a unique ID that is also short enough for the exchange
+        return f"bot_{pid}_{tag}_{timestamp_ms}"
 
     # --- ADD THIS NEW HELPER METHOD ---
     async def _all_open_orders(self, symbol: str) -> list:
