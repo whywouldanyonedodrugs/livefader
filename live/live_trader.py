@@ -779,23 +779,36 @@ class LiveTrader:
     async def _resume(self):
         """
         On startup, load state from DB and reconcile with actual
-        exchange positions to detect and handle orphans.
-        Includes a "clean slate" protocol to cancel all old open orders.
+        exchange positions. Includes a highly efficient "clean slate" protocol.
         """
         LOG.info("--> Resuming state...")
 
-        # --- NEW: Clean Slate Protocol ---
-        LOG.info("Step 1: Cancelling all old open orders for tracked symbols...")
-        cancelled_count = 0
-        for sym in self.symbols:
-            try:
-                await self.exchange.cancel_all_orders(sym)
-                # A small sleep to be nice to the API rate limiter
-                await asyncio.sleep(0.1)
-                cancelled_count += 1
-            except Exception as e:
-                LOG.warning("Could not cancel old orders for %s: %s", sym, e)
-        LOG.info("...Clean slate protocol complete. Checked %d symbols.", cancelled_count)
+        # --- NEW: Efficient Clean Slate Protocol ---
+        LOG.info("Step 1: Fetching and cancelling all old open orders...")
+        try:
+            # 1. Fetch ALL open orders in a single API call.
+            all_open_orders = await self.exchange.fetch_open_orders()
+            
+            # 2. Filter for orders that the bot is supposed to be managing.
+            orders_to_cancel = [
+                {'id': order['id'], 'symbol': order['symbol']}
+                for order in all_open_orders
+                if order['symbol'] in self.symbols
+            ]
+
+            if orders_to_cancel:
+                LOG.info("Found %d old open orders to cancel. Cancelling now...", len(orders_to_cancel))
+                # 3. Cancel all relevant orders in a single batch request.
+                await self.exchange.cancel_orders(orders_to_cancel)
+                LOG.info("...Successfully cancelled %d old orders.", len(orders_to_cancel))
+            else:
+                LOG.info("...No old open orders found for tracked symbols. Clean slate confirmed.")
+
+        except Exception as e:
+            LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
+            # Depending on severity, you might want to exit if the slate cannot be cleaned.
+            # For now, we will log the error and continue.
+
         # --- END OF NEW LOGIC ---
 
         LOG.info("Step 2: Fetching peak equity from DB...")
