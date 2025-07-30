@@ -406,7 +406,7 @@ class LiveTrader:
             LOG.info("EXEC_ATR veto %s – stop %.4f < min dist", sig.symbol, stop_dist)
             return
 
-        size = risk_amt / stop_dist
+        intended_size = risk_amt / stop_dist
 
         try:
             market = self.exchange.market(sig.symbol)
@@ -414,8 +414,8 @@ class LiveTrader:
             if min_cost is None:
                 min_cost = self.cfg.get("MIN_NOTIONAL", 0.01)
 
-            if (size * entry) < min_cost:
-                LOG.warning("VETO: Order for %s size %s costs less than exchange minimum of %s.", sig.symbol, size, min_cost)
+            if (intended_size * entry) < min_cost:
+                LOG.warning("VETO: Order for %s size %s costs less than exchange minimum of %s.", sig.symbol, intended_size, min_cost)
                 return
         except Exception as e:
             LOG.error("Error during size validation for %s: %s", sig.symbol, e)
@@ -433,7 +433,7 @@ class LiveTrader:
         )
 
         pid = await self.db.insert_position({
-            "symbol": sig.symbol, "side": "short", "size": size,
+            "symbol": sig.symbol, "side": "short", "size": intended_size, # Insert the intended size for now
             "entry_price": entry, "stop_price": stop, "trailing_active": False,
             "atr": atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
             "exit_deadline": exit_deadline,
@@ -441,48 +441,53 @@ class LiveTrader:
 
         try:
             entry_order = await self.exchange.create_market_order(
-                sig.symbol, "sell", size, params={"clientOrderId": self._cid(pid, "ENTRY")}
+                sig.symbol, "sell", intended_size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
             if not entry_order or entry_order.get('status') == 'rejected':
                 raise ccxt.ExchangeError(f"Entry order for {sig.symbol} rejected.")
+            
+            # --- NEW LOGIC: Capture the true executed size from the exchange ---
+            executed_size = entry_order.get('filled')
+            if not executed_size or executed_size <= 0:
+                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} was not filled.")
+
+            if abs(executed_size - intended_size) / intended_size > 0.05: # More than 5% difference
+                LOG.warning("Significant size discrepancy for %s. Intended: %s, Executed: %s", sig.symbol, intended_size, executed_size)
+
         except Exception as e:
             LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR_ENTRY")
             return
 
         try:
-            # Always place the Stop-Loss
+            # Use the REAL executed_size for all subsequent orders and DB updates
             sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
-            await self.exchange.create_order(sig.symbol, 'market', "buy", size, params=sl_params)
+            await self.exchange.create_order(sig.symbol, 'market', "buy", executed_size, params=sl_params)
             
-            # --- NEW, CORRECTED TAKE-PROFIT LOGIC ---
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
-                # Logic for Partial Take-Profit
                 tp_price = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
-                qty = size * self.cfg["PARTIAL_TP_PCT"]
+                qty = executed_size * self.cfg["PARTIAL_TP_PCT"]
                 tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
                 await self.exchange.create_order(sig.symbol, 'market', "buy", qty, params=tp_params)
             
             elif self.cfg.get("FINAL_TP_ENABLED", False):
-                # Logic for a single, Full-Size Take-Profit
                 tp_price = entry - self.cfg["FINAL_TP_ATR_MULT"] * atr
-                qty = size # Use the full position size
+                qty = executed_size
                 tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP_FINAL"), 'reduceOnly': True, 'triggerDirection': 2}
                 await self.exchange.create_order(sig.symbol, 'market', "buy", qty, params=tp_params)
             
-            # If both are False, no TP order is placed.
-            
-            await self.db.update_position(pid, status="OPEN")
+            # Update the DB with the final status and the CORRECT executed size
+            await self.db.update_position(pid, status="OPEN", size=executed_size)
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
-            await self.tg.send(f"🚀 Opened {sig.symbol} short {size:.3f} @ {entry:.4f}")
+            await self.tg.send(f"🚀 Opened {sig.symbol} short {executed_size:.3f} @ {entry:.4f}")
 
         except Exception as e:
             LOG.critical("NAKED POSITION: SL/TP placement failed for %s (pid %d): %s", sig.symbol, pid, e)
-            await self.db.update_position(pid, status="ERROR_NAKED")
+            await self.db.update_position(pid, status="ERROR_NAKED", size=executed_size) # Store correct size even on failure
             try:
                 await self.exchange.create_market_order(
-                    sig.symbol, 'buy', size, params={'reduceOnly': True}
+                    sig.symbol, 'buy', executed_size, params={'reduceOnly': True}
                 )
                 msg = f"🚨 CRITICAL: Failed to set SL/TP for {sig.symbol}. Position has been emergency closed."
                 LOG.warning(msg)
