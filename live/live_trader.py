@@ -432,7 +432,7 @@ class LiveTrader:
         1. Places a market order with a globally unique CID.
         2. Confirms the position exists on the exchange.
         3. Persists to DB to get a position ID (pid).
-        4. Places protective orders using the correct V5 syntax (market type + triggerPrice).
+        4. Places protective orders (SL and either Partial or Final TP) using stable CIDs.
         5. If any step fails, it performs an emergency market-close.
         """
         # --- Steps 1, 2, and 3 (Pre-checks, Entry Order, Confirmation) are correct and remain unchanged ---
@@ -485,7 +485,7 @@ class LiveTrader:
                     live_position = pos
                     actual_size = float(live_position['info']['size'])
                     actual_entry_price = float(live_position['info']['avgPrice'])
-                    LOG.info(f"ENTRY CONFIRMED for %s. Exchange reports size: {actual_size} @ {actual_entry_price}")
+                    LOG.info(f"ENTRY CONFIRMED for %s. Exchange reports size: {actual_size} @ {actual_entry_price}", sig.symbol)
                     break
             except Exception as e:
                 LOG.warning("Confirmation loop check failed for %s (attempt %d/%d): %s", sig.symbol, i + 1, CONFIRMATION_ATTEMPTS, e)
@@ -510,28 +510,44 @@ class LiveTrader:
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
             sl_cid = create_stable_cid(pid, "SL")
-            tp1_cid = create_stable_cid(pid, "TP1")
+            
+            await self.exchange.create_order(
+                sig.symbol, 'market', "buy", actual_size, None,
+                params={
+                    "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
+                    'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
+                }
+            )
 
-            # FIX: Use 'market' type and define conditionality in params
-            sl_params = {
-                "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
-                'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
-            }
-            await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=sl_params)
+            # --- FIX: ADDED THE ELIF BLOCK TO HANDLE FINAL TP ---
+            tp1_cid = None
+            tp_final_cid = None
 
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
+                tp1_cid = create_stable_cid(pid, "TP1")
                 tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
                 qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
-                # FIX: Use 'market' type and define conditionality in params
-                tp_params = {
-                    "triggerPrice": tp_price, "clientOrderId": tp1_cid,
-                    'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
-                }
-                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, None, params=tp_params)
+                await self.exchange.create_order(
+                    sig.symbol, 'market', "buy", qty, None,
+                    params={
+                        "triggerPrice": tp_price, "clientOrderId": tp1_cid,
+                        'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
+                    }
+                )
+            elif self.cfg.get("FINAL_TP_ENABLED", False):
+                tp_final_cid = create_stable_cid(pid, "TP_FINAL")
+                tp_price = actual_entry_price - self.cfg["FINAL_TP_ATR_MULT"] * sig.atr
+                await self.exchange.create_order(
+                    sig.symbol, 'market', "buy", actual_size, None,
+                    params={
+                        "triggerPrice": tp_price, "clientOrderId": tp_final_cid,
+                        'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
+                    }
+                )
             
             await self.db.update_position(
                 pid, status="OPEN", stop_price=stop_price_actual,
-                sl_cid=sl_cid, tp1_cid=tp1_cid
+                sl_cid=sl_cid, tp1_cid=tp1_cid, tp_final_cid=tp_final_cid
             )
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
