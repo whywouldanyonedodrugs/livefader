@@ -463,33 +463,40 @@ class LiveTrader:
             "exit_deadline": exit_deadline,
         })
 
+        entry_order = None
         executed_size = 0.0
         try:
-            # --- NEW, ROBUST: Trust the initial response, then verify ---
             entry_order = await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size, params={"clientOrderId": self._cid(pid, "ENTRY")}
             )
             
-            # Trust the initial 'filled' amount if it exists.
+            # --- FINAL, ROBUST CONFIRMATION LOOP ---
+            # Trust the initial response if it gives a fill amount.
             executed_size = entry_order.get('filled', 0.0)
 
-            # If the initial response shows no fill, start a short confirmation loop.
             if executed_size <= 0:
                 LOG.info("Initial response showed no fill, starting confirmation loop for %s...", sig.symbol)
-                for i in range(10): # Loop for up to 5 seconds
+                for i in range(10):
                     await asyncio.sleep(0.5)
                     order_status = await self.exchange.fetch_order(entry_order['id'], sig.symbol)
-                    if order_status.get('status') == 'closed' and order_status.get('filled', 0) > 0:
+                    
+                    # This is the critical fix: check if order_status is not None
+                    if order_status and order_status.get('status') == 'closed' and order_status.get('filled', 0) > 0:
                         executed_size = order_status.get('filled')
                         LOG.info("Confirmation loop successful. Executed size: %s", executed_size)
                         break
             
             if executed_size <= 0:
-                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} was not filled.")
+                raise ccxt.ExchangeError(f"Entry order for {sig.symbol} was not filled after 5 seconds.")
 
         except Exception as e:
             LOG.error("ENTRY FAILED for %s (pid %d): %s. Position will not be opened.", sig.symbol, pid, e)
             await self.db.update_position(pid, status="ERROR_ENTRY")
+            if entry_order and entry_order.get('id'):
+                try:
+                    await self.exchange.cancel_order(entry_order['id'], sig.symbol)
+                except Exception as cancel_e:
+                    LOG.warning("Could not cancel potentially stuck entry order for %s: %s", sig.symbol, cancel_e)
             return
 
         try:
