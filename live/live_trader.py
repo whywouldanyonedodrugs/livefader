@@ -451,16 +451,26 @@ class LiveTrader:
             return
 
         try:
-            # Correctly create a separate BUY order, conditional on the triggerPrice (your SL)
+            # Always place the Stop-Loss
             sl_params = {"triggerPrice": stop, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1}
             await self.exchange.create_order(sig.symbol, 'market', "buy", size, params=sl_params)
             
-            if self.cfg.get("PARTIAL_TP_ENABLED", True):
-                tp1 = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
+            # --- NEW, CORRECTED TAKE-PROFIT LOGIC ---
+            if self.cfg.get("PARTIAL_TP_ENABLED", False):
+                # Logic for Partial Take-Profit
+                tp_price = entry - self.cfg["PARTIAL_TP_ATR_MULT"] * atr
                 qty = size * self.cfg["PARTIAL_TP_PCT"]
-                # Correctly create a separate BUY order, conditional on the triggerPrice (your TP1)
-                tp_params = {"triggerPrice": tp1, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
+                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2}
                 await self.exchange.create_order(sig.symbol, 'market', "buy", qty, params=tp_params)
+            
+            elif self.cfg.get("FINAL_TP_ENABLED", False):
+                # Logic for a single, Full-Size Take-Profit
+                tp_price = entry - self.cfg["FINAL_TP_ATR_MULT"] * atr
+                qty = size # Use the full position size
+                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP_FINAL"), 'reduceOnly': True, 'triggerDirection': 2}
+                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, params=tp_params)
+            
+            # If both are False, no TP order is placed.
             
             await self.db.update_position(pid, status="OPEN")
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
