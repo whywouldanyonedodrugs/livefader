@@ -419,10 +419,10 @@ class LiveTrader:
         A robust and hardened hybrid entry method.
         1. Places a market order.
         2. Confirms the position exists on the exchange.
-        3. Tries to persist to DB and place SL/TP.
+        3. Tries to persist to DB and place SL/TP using the correct V5 syntax.
         4. If step 3 fails for ANY reason, it performs an emergency market-close.
         """
-        # --- 1. Pre-flight checks and size calculation ---
+        # --- Steps 1 & 2: Pre-checks, order placement, and confirmation (These are correct) ---
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
             return
 
@@ -450,7 +450,6 @@ class LiveTrader:
         except Exception:
             return
 
-        # --- 2. Place market order and confirm position ---
         client_order_id = self._cid(0, "ENTRY")
         try:
             order = await self.exchange.create_market_order(
@@ -482,30 +481,45 @@ class LiveTrader:
             LOG.error("ENTRY FAILED for %s: Position did not appear on exchange after %d attempts.", sig.symbol, CONFIRMATION_ATTEMPTS)
             return
 
-        # --- 3. Persist to DB and place SL/TP (CRITICAL BLOCK) ---
+        # --- Step 3: Persist to DB and place SL/TP (CRITICAL BLOCK) ---
         try:
-            # FIX: Restore the exit_deadline calculation and key
             exit_deadline = (
                 datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
                 if self.cfg.get("TIME_EXIT_ENABLED", True) else None
             )
-
             pid = await self.db.insert_position({
                 "symbol": sig.symbol, "side": "short", "size": actual_size,
                 "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
                 "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
-                "exit_deadline": exit_deadline, # <-- RESTORED
+                "exit_deadline": exit_deadline,
             })
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
-            sl_params = {"triggerPrice": stop_price_actual, "clientOrderId": self._cid(pid, "SL"), 'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'}
-            await self.exchange.create_order(sig.symbol, 'STOP_MARKET', "buy", actual_size, params=sl_params)
+            
+            # FIX: Use 'market' type and make it conditional with triggerPrice
+            sl_params = {
+                "triggerPrice": stop_price_actual, 
+                "clientOrderId": self._cid(pid, "SL"), 
+                'reduceOnly': True, 
+                'triggerDirection': 1, # Trigger when price rises (for a short)
+                'category': 'linear',
+                'orderFilter': 'StopOrder' # Recommended for clarity
+            }
+            await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=sl_params)
 
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
                 tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
                 qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
-                tp_params = {"triggerPrice": tp_price, "clientOrderId": self._cid(pid, "TP1"), 'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'}
-                await self.exchange.create_order(sig.symbol, 'TAKE_PROFIT_MARKET', "buy", qty, params=tp_params)
+                # FIX: Use 'market' type and make it conditional with triggerPrice
+                tp_params = {
+                    "triggerPrice": tp_price, 
+                    "clientOrderId": self._cid(pid, "TP1"), 
+                    'reduceOnly': True, 
+                    'triggerDirection': 2, # Trigger when price falls (for a short)
+                    'category': 'linear',
+                    'orderFilter': 'tpslOrder' # Recommended for clarity
+                }
+                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, None, params=tp_params)
             
             await self.db.update_position(pid, status="OPEN", stop_price=stop_price_actual)
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
@@ -513,7 +527,7 @@ class LiveTrader:
             await self.tg.send(f"🚀 Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}")
 
         except Exception as e:
-            # HARDENED: If any part of the DB write or SL/TP placement fails, panic-close the position.
+            # This safety net remains crucial
             msg = f"🚨 CRITICAL: Failed to persist or protect position for {sig.symbol} due to: {e}. Triggering emergency close."
             LOG.critical(msg)
             await self.tg.send(msg)
@@ -604,39 +618,38 @@ class LiveTrader:
                 LOG.error(f"Failed to place final TP2 order for {pid}: {e}")
 
     async def _trail_stop(self, pid: int, pos: Dict[str, Any], first: bool = False):
-            symbol = pos["symbol"]
-            price = (await self.exchange.fetch_ticker(symbol))["last"]
-            atr = pos["atr"]
-            new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
-            is_favorable_move = new_stop < pos["stop_price"]
-            min_move_required = price * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
-            is_significant_move = (pos["stop_price"] - new_stop) > min_move_required
+        symbol = pos["symbol"]
+        price = (await self.exchange.fetch_ticker(symbol))["last"]
+        atr = pos["atr"]
+        new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
+        is_favorable_move = new_stop < pos["stop_price"]
+        min_move_required = price * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
+        is_significant_move = (pos["stop_price"] - new_stop) > min_move_required
 
-            if first or (is_favorable_move and is_significant_move):
-                qty_left = pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
-                try:
-                    # Use the generic cancel with CID, it's more robust
-                    await self._cancel_by_cid(self._cid(pid, "SL_TRAIL"), symbol)
-                except ccxt.OrderNotFound:
-                    pass # This is fine, means it was already cancelled or filled
-                except Exception as e:
-                    LOG.warning("Trail cancel failed for %s: %s. Will retry on next tick.", symbol, e)
-                    return
-                
-                # FIX 1.5: Removed the duplicated create_order call. This is the only one.
-                # FIX 1.2 & 1.3: Use 'STOP_MARKET' and add 'category':'linear'
-                sl_params = {
-                    "triggerPrice": new_stop, 
-                    "clientOrderId": self._cid(pid, "SL_TRAIL"), 
-                    'reduceOnly': True, 
-                    'triggerDirection': 1,
-                    'category': 'linear'
-                }
-                await self.exchange.create_order(symbol, 'STOP_MARKET', "buy", qty_left, params=sl_params)
-                
-                await self.db.update_position(pid, stop_price=new_stop)
-                pos["stop_price"] = new_stop
-                LOG.info("Trail updated %s to %.4f", symbol, new_stop)
+        if first or (is_favorable_move and is_significant_move):
+            qty_left = pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
+            try:
+                await self._cancel_by_cid(self._cid(pid, "SL_TRAIL"), symbol)
+            except ccxt.OrderNotFound:
+                pass
+            except Exception as e:
+                LOG.warning("Trail cancel failed for %s: %s. Will retry on next tick.", symbol, e)
+                return
+            
+            # FIX: Use 'market' type and make it conditional with triggerPrice
+            sl_params = {
+                "triggerPrice": new_stop, 
+                "clientOrderId": self._cid(pid, "SL_TRAIL"), 
+                'reduceOnly': True, 
+                'triggerDirection': 1, # Trigger when price rises (for a short)
+                'category': 'linear',
+                'orderFilter': 'StopOrder'
+            }
+            await self.exchange.create_order(symbol, 'market', "buy", qty_left, None, params=sl_params)
+            
+            await self.db.update_position(pid, stop_price=new_stop)
+            pos["stop_price"] = new_stop
+            LOG.info("Trail updated %s to %.4f", symbol, new_stop)
             
     async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
