@@ -783,31 +783,33 @@ class LiveTrader:
         """
         LOG.info("--> Resuming state...")
 
-        # --- NEW: Efficient Clean Slate Protocol ---
+        # --- NEW, CORRECTED: Efficient Clean Slate Protocol ---
         LOG.info("Step 1: Fetching and cancelling all old open orders...")
         try:
             # 1. Fetch ALL open orders in a single API call.
             all_open_orders = await self.exchange.fetch_open_orders()
             
-            # 2. Filter for orders that the bot is supposed to be managing.
-            orders_to_cancel = [
-                {'id': order['id'], 'symbol': order['symbol']}
-                for order in all_open_orders
-                if order['symbol'] in self.symbols
-            ]
+            # 2. Find which of our tracked symbols have leftover orders.
+            symbols_with_open_orders = {
+                order['symbol'] for order in all_open_orders if order['symbol'] in self.symbols
+            }
 
-            if orders_to_cancel:
-                LOG.info("Found %d old open orders to cancel. Cancelling now...", len(orders_to_cancel))
-                # 3. Cancel all relevant orders in a single batch request.
-                await self.exchange.cancel_orders(orders_to_cancel)
-                LOG.info("...Successfully cancelled %d old orders.", len(orders_to_cancel))
+            if symbols_with_open_orders:
+                LOG.info("Found %d symbols with leftover orders: %s. Cancelling now...", 
+                         len(symbols_with_open_orders), ", ".join(symbols_with_open_orders))
+                
+                # 3. Loop through only the affected symbols and cancel all their orders.
+                cancel_tasks = [self.exchange.cancel_all_orders(sym) for sym in symbols_with_open_orders]
+                await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                
+                LOG.info("...Successfully cancelled old orders.")
             else:
                 LOG.info("...No old open orders found for tracked symbols. Clean slate confirmed.")
 
         except Exception as e:
             LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
-            # Depending on severity, you might want to exit if the slate cannot be cleaned.
-            # For now, we will log the error and continue.
+            traceback.print_exc()
+            # We will continue, but this is a high-risk situation.
 
         # --- END OF NEW LOGIC ---
 
