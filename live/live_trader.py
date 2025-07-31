@@ -285,6 +285,22 @@ class LiveTrader:
         except Exception as e:
             LOG.error("Failed to cancel order %s for %s: %s", cid, symbol, e)
 
+    async def _all_open_orders(self, symbol: str) -> list:
+        """
+        Fetches all types of open orders (regular, conditional, TP/SL) for a specific symbol
+        by correctly using the Bybit V5 API parameters.
+        """
+        params_linear = {'category': 'linear'}
+        try:
+            # Fetch orders for the specific symbol passed as an argument
+            active_orders = await self.exchange.fetch_open_orders(symbol, params=params_linear)
+            stop_orders = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'StopOrder'})
+            tpsl_orders = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'tpslOrder'})
+            return active_orders + stop_orders + tpsl_orders
+        except Exception as e:
+            LOG.warning("Could not fetch all open orders for %s: %s", symbol, e)
+            return [] # Return an empty list on failure to prevent crashes
+
     async def _all_open_orders_for_all_symbols(self) -> list:
         """
         Fetches all types of open orders (regular, conditional, TP/SL) for all symbols.
