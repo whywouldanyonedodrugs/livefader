@@ -285,21 +285,19 @@ class LiveTrader:
         except Exception as e:
             LOG.error("Failed to cancel order %s for %s: %s", cid, symbol, e)
 
-    # --- ADD THIS NEW HELPER METHOD ---
-    async def _all_open_orders(self, symbol: str) -> list:
+    async def _all_open_orders_for_all_symbols(self) -> list:
         """
-        Fetches all types of open orders (regular, conditional, TP/SL) for a symbol
-        by correctly using the Bybit V5 API parameters.
+        Fetches all types of open orders (regular, conditional, TP/SL) for all symbols.
         """
         params_linear = {'category': 'linear'}
         try:
-            active_orders = await self.exchange.fetch_open_orders(symbol, params=params_linear)
-            stop_orders = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'StopOrder'})
-            tpsl_orders = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'tpslOrder'})
+            active_orders = await self.exchange.fetch_open_orders(params=params_linear)
+            stop_orders = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'StopOrder'})
+            tpsl_orders = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'tpslOrder'})
             return active_orders + stop_orders + tpsl_orders
         except Exception as e:
-            LOG.warning("Could not fetch all open orders for %s: %s", symbol, e)
-            return [] # Return an empty list on failure to prevent crashes
+            LOG.warning("Could not fetch all open orders for all symbols: %s", e)
+            return []
 
     async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
@@ -889,97 +887,36 @@ class LiveTrader:
 
     async def _resume(self):
         """
-        On startup, load state from DB and reconcile with actual
-        exchange positions. Includes a definitive "clean slate" protocol that
-        correctly fetches all order types using the proper V5 API parameters.
+        On startup, intelligently load state from DB and reconcile with the exchange.
+        This version identifies valid positions FIRST, then cleans up only true orphans,
+        and includes all necessary reconciliation checks.
         """
-        LOG.info("--> Resuming state...")
+        LOG.info("--> Resuming state with intelligent reconciliation...")
 
-        # --- FINAL, CORRECTED: Clean Slate Protocol ---
-        LOG.info("Step 1: Fetching and cancelling all old open orders...")
-        try:
-            # Bybit's V5 API requires fetching different order types separately.
-            # We fetch all of them to ensure a truly clean slate.
-            
-            # 1. Define the parameters for each type of order we need to fetch.
-            fetch_params = [
-                {'category': 'linear'},                                  # Regular open orders
-                {'category': 'linear', 'orderFilter': 'StopOrder'},      # Conditional Stop/Trigger orders
-                {'category': 'linear', 'orderFilter': 'tpslOrder'},      # Position-linked TP/SL orders
-            ]
-
-            # 2. Fetch all order types concurrently.
-            all_orders_lists = await asyncio.gather(
-                self.exchange.fetch_open_orders(params=fetch_params[0]),
-                self.exchange.fetch_open_orders(params=fetch_params[1]),
-                self.exchange.fetch_open_orders(params=fetch_params[2]),
-                return_exceptions=True
-            )
-
-            # 3. Combine the results into a single list.
-            all_open_orders = []
-            for result in all_orders_lists:
-                if isinstance(result, list):
-                    all_open_orders.extend(result)
-
-            if all_open_orders:
-                # 4. Group the found orders by their symbol.
-                # We do NOT filter by symbols.txt, to ensure we cancel truly orphaned orders.
-                orders_by_symbol = defaultdict(list)
-                for order in all_open_orders:
-                    orders_by_symbol[order['symbol']].append(order['id'])
-
-                if orders_by_symbol:
-                    LOG.info("Found %d leftover orders across %d symbols. Cancelling all...", 
-                             len(all_open_orders), len(orders_by_symbol))
-                    
-                    # 5. Loop through each symbol and issue a single cancel_all_orders command.
-                    # This is efficient and robust.
-                    cancel_tasks = [
-                        self.exchange.cancel_all_orders(symbol, params={'category': 'linear'}) 
-                        for symbol in orders_by_symbol.keys()
-                    ]
-                    await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                    
-                    LOG.info("...Successfully cancelled old orders.")
-                else:
-                    LOG.info("...No old open orders found. Clean slate confirmed.")
-            else:
-                LOG.info("...No old open orders found. Clean slate confirmed.")
-
-        except Exception as e:
-            LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
-            traceback.print_exc()
-
-        # --- END OF NEW LOGIC ---
-
-        LOG.info("Step 2: Fetching peak equity from DB...")
-        peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
-        self.peak_equity = float(peak) if peak is not None else 0.0
-        LOG.info("...Initial peak equity loaded: $%.2f", self.peak_equity)
-
-        LOG.info("Step 3: Fetching open positions from the EXCHANGE...")
+        # --- STEP 1: Fetch current state from both Exchange and Database ---
+        LOG.info("Step 1: Fetching open positions from EXCHANGE and DATABASE...")
         try:
             exchange_positions = await self.exchange.fetch_positions()
             open_exchange_positions = {
-                p['info']['symbol']: p for p in exchange_positions if float(p['info']['size']) > 0
+                p['info']['symbol']: p for p in exchange_positions if float(p['info'].get('size', 0)) > 0
             }
             LOG.info("...Success! Found %d positions on the exchange.", len(open_exchange_positions))
         except Exception as e:
-            LOG.error("Could not fetch exchange positions on startup: %s. Exiting.", e)
+            LOG.error("CRITICAL: Could not fetch exchange positions on startup: %s. Exiting.", e)
             sys.exit(1)
 
-        LOG.info("Step 4: Fetching 'OPEN' positions from the DATABASE...")
-        db_positions = {r["symbol"]: dict(r) for r in await self.db.fetch_open_positions()}
+        db_positions_rows = await self.db.fetch_open_positions()
+        db_positions = {r["symbol"]: dict(r) for r in db_positions_rows}
         LOG.info("...Success! Found %d 'OPEN' positions in the database.", len(db_positions))
+
+        # --- STEP 2: Reconcile positions and identify all VALID client order IDs ---
+        LOG.info("Step 2: Reconciling positions and identifying valid protective orders...")
+        valid_cids = set()
         
-        LOG.info("Step 5: Reconciling DB and exchange positions...")
+        # Check for orphan positions on the exchange
         for symbol, pos_data in open_exchange_positions.items():
             if symbol not in db_positions:
-                msg = (
-                    f"🚨 ORPHAN DETECTED: Position for {symbol} exists on the exchange "
-                    f"but not in the database. Forcing immediate close to manage risk."
-                )
+                msg = f"🚨 ORPHAN DETECTED: Position for {symbol} exists on exchange but not in DB. Closing immediately."
                 LOG.warning(msg)
                 await self.tg.send(msg)
                 try:
@@ -989,47 +926,76 @@ class LiveTrader:
                 except Exception as e:
                     LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
 
-        for symbol, pos_row in db_positions.items():
+        # Check for DB/exchange mismatches and build the "safe list" of CIDs
+        for symbol, pos_row in list(db_positions.items()):
             if symbol not in open_exchange_positions:
                 pid = pos_row["id"]
-                msg = (
-                    f"DB/EXCHANGE MISMATCH: Position {pid} for {symbol} is 'OPEN' in DB "
-                    f"but not found on exchange. Marking as closed."
-                )
-                LOG.warning(msg)
-                await self.db.update_position(
-                    pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=0
-                )
+                LOG.warning(f"DB/EXCHANGE MISMATCH: Position {pid} for {symbol} is 'OPEN' in DB but not on exchange. Marking as closed.")
+                await self.db.update_position(pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=0)
+                del db_positions[symbol] # Remove from our list of valid positions
+                continue
 
-        for symbol, db_pos in db_positions.items():
-            if symbol in open_exchange_positions:
-                ex_pos = open_exchange_positions[symbol]
-                db_size = float(db_pos['size'])
-                ex_size = float(ex_pos['info']['size'])
+            # RESTORED: Check for size mismatches
+            ex_pos = open_exchange_positions[symbol]
+            db_size = float(pos_row['size'])
+            ex_size = float(ex_pos['info']['size'])
+            if abs(db_size - ex_size) > 1e-9:
+                pid = pos_row["id"]
+                msg = (f"🚨 SIZE MISMATCH on resume for {symbol} (pid {pid}): DB size is {db_size}, Exchange size is {ex_size}. Flagging for manual review.")
+                LOG.critical(msg)
+                await self.tg.send(msg)
+                await self.db.update_position(pid, status="SIZE_MISMATCH")
+                del db_positions[symbol] # This position is unsafe, don't treat its orders as valid
+                continue
+
+            # If we reach here, the position is valid. Add its CIDs to the safe list.
+            LOG.debug("Identified valid CIDs for position %s to preserve.", symbol)
+            if pos_row.get("sl_cid"): valid_cids.add(pos_row["sl_cid"])
+            if pos_row.get("tp1_cid"): valid_cids.add(pos_row["tp1_cid"])
+            if pos_row.get("tp_final_cid"): valid_cids.add(pos_row["tp_final_cid"])
+            if pos_row.get("sl_trail_cid"): valid_cids.add(pos_row["sl_trail_cid"])
+
+        LOG.info("...Identified %d CIDs belonging to valid positions.", len(valid_cids))
+
+        # --- STEP 3: Perform the INTELLIGENT Clean Slate Protocol ---
+        LOG.info("Step 3: Fetching all open orders to clean up ORPHANS ONLY...")
+        try:
+            # This helper function is more efficient than fetching for each symbol
+            all_open_orders = await self._all_open_orders_for_all_symbols()
+            
+            cancel_tasks = []
+            for order in all_open_orders:
+                cid = order.get("clientOrderId")
+                if cid and cid.startswith("bot_") and cid not in valid_cids:
+                    LOG.warning("Found orphaned order %s for symbol %s. Scheduling for cancellation.", cid, order['symbol'])
+                    cancel_tasks.append(self.exchange.cancel_order(order['id'], order['symbol'], params={'category': 'linear'}))
+            
+            if cancel_tasks:
+                LOG.info("Cancelling %d orphaned orders...", len(cancel_tasks))
+                await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                LOG.info("...Orphaned order cleanup complete.")
+            else:
+                LOG.info("...No orphaned orders found to cancel.")
                 
-                if abs(db_size - ex_size) > 1e-9:
-                    pid = db_pos["id"]
-                    msg = (
-                        f"🚨 SIZE MISMATCH on resume for {symbol} (pid {pid}): "
-                        f"DB size is {db_size}, Exchange size is {ex_size}. "
-                        f"Flagging for manual review."
-                    )
-                    LOG.critical(msg)
-                    await self.tg.send(msg)
-                    await self.db.update_position(pid, status="SIZE_MISMATCH")
-                    del db_positions[symbol]
+        except Exception as e:
+            LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
+            traceback.print_exc()
 
-        LOG.info("...Reconciliation complete.")
-
-        LOG.info("Step 6: Loading final reconciled positions into memory...")
+        # --- STEP 4: Load final state into memory ---
+        LOG.info("Step 4: Loading final reconciled positions into memory...")
+        # We re-fetch from the DB to get the most up-to-date state after reconciliation
         final_open_rows = await self.db.fetch_open_positions()
         for r in final_open_rows:
             self.open_positions[r["id"]] = dict(r)
             LOG.info("...Successfully resumed and verified open position for %s (ID: %d)", r["symbol"], r["id"])
 
-        LOG.info("Step 7: Loading recent exit timestamps for cooldowns...")
-        cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS",
-                        cfg.SYMBOL_COOLDOWN_HOURS))
+        LOG.info("Step 5: Fetching peak equity from DB...")
+        peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
+        self.peak_equity = float(peak) if peak is not None else 0.0
+        LOG.info("...Initial peak equity loaded: $%.2f", self.peak_equity)
+
+        LOG.info("Step 6: Loading recent exit timestamps for cooldowns...")
+        cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS))
         rows = await self.db.pool.fetch(
             "SELECT symbol, closed_at FROM positions "
             "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
