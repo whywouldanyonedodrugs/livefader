@@ -519,21 +519,19 @@ class LiveTrader:
                 "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
                 "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
                 "exit_deadline": exit_deadline,
-                "entry_cid": entry_cid
+                "entry_cid": create_unique_cid(f"ENTRY_{sig.symbol}")
             })
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
             sl_cid = create_stable_cid(pid, "SL")
             
-            await self.exchange.create_order(
-                sig.symbol, 'market', "buy", actual_size, None,
-                params={
-                    "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
-                    'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
-                }
-            )
+            # FIX: Add closeOnTrigger to the SL params
+            sl_params = {
+                "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
+                'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 1, 'category': 'linear'
+            }
+            await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=sl_params)
 
-            # --- FIX: ADDED THE ELIF BLOCK TO HANDLE FINAL TP ---
             tp1_cid = None
             tp_final_cid = None
 
@@ -541,23 +539,21 @@ class LiveTrader:
                 tp1_cid = create_stable_cid(pid, "TP1")
                 tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
                 qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
-                await self.exchange.create_order(
-                    sig.symbol, 'market', "buy", qty, None,
-                    params={
-                        "triggerPrice": tp_price, "clientOrderId": tp1_cid,
-                        'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
-                    }
-                )
+                # FIX: Add closeOnTrigger to the TP params
+                tp_params = {
+                    "triggerPrice": tp_price, "clientOrderId": tp1_cid,
+                    'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 2, 'category': 'linear'
+                }
+                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, None, params=tp_params)
             elif self.cfg.get("FINAL_TP_ENABLED", False):
                 tp_final_cid = create_stable_cid(pid, "TP_FINAL")
                 tp_price = actual_entry_price - self.cfg["FINAL_TP_ATR_MULT"] * sig.atr
-                await self.exchange.create_order(
-                    sig.symbol, 'market', "buy", actual_size, None,
-                    params={
-                        "triggerPrice": tp_price, "clientOrderId": tp_final_cid,
-                        'reduceOnly': True, 'triggerDirection': 2, 'category': 'linear'
-                    }
-                )
+                # FIX: Add closeOnTrigger to the TP params
+                tp_params = {
+                    "triggerPrice": tp_price, "clientOrderId": tp_final_cid,
+                    'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 2, 'category': 'linear'
+                }
+                await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=tp_params)
             
             await self.db.update_position(
                 pid, status="OPEN", stop_price=stop_price_actual,
@@ -595,6 +591,27 @@ class LiveTrader:
 
     async def _update_single_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
+
+        # --- FIX: BOT-SIDE SAFETY NET ---
+        # First, check the ultimate source of truth: the position size.
+        try:
+            positions = await self.exchange.fetch_positions(symbols=[symbol])
+            position_size = 0.0
+            if positions and positions[0]:
+                position_size = float(positions[0].get('info', {}).get('size', 0))
+            
+            if position_size == 0:
+                LOG.info("Position size for %s is 0. Trade is closed. Finalizing...", symbol)
+                # The position is closed on the exchange, for any reason.
+                # Trigger our finalization logic to clean up and record the PnL.
+                await self._finalize_position(pid, pos)
+                return # Stop further processing for this closed position
+        except Exception as e:
+            LOG.error("Could not fetch position size for %s during update: %s", symbol, e)
+            # Don't proceed if we can't confirm the position state
+            return
+        # --- END OF SAFETY NET ---
+
         orders = await self._all_open_orders(symbol)
         open_cids = {o.get("clientOrderId") for o in orders}
 
@@ -672,7 +689,6 @@ class LiveTrader:
 
         if first or (is_favorable_move and is_significant_move):
             qty_left = float(pos["size"]) * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
-            
             sl_trail_cid = create_stable_cid(pid, "SL_TRAIL")
 
             try:
@@ -684,10 +700,10 @@ class LiveTrader:
                 LOG.warning("Trail cancel failed for %s: %s. Will retry.", symbol, e)
                 return
             
-            # FIX: Use 'market' type and define conditionality in params
+            # FIX: Add closeOnTrigger to the trailing SL params
             sl_params = {
                 "triggerPrice": new_stop, "clientOrderId": sl_trail_cid,
-                'reduceOnly': True, 'triggerDirection': 1, 'category': 'linear'
+                'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 1, 'category': 'linear'
             }
             await self.exchange.create_order(symbol, 'market', "buy", qty_left, None, params=sl_params)
             
