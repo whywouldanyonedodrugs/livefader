@@ -951,7 +951,6 @@ class LiveTrader:
                 current_market_regime = await self.regime_detector.get_current_regime()
                 LOG.info("Starting new scan cycle for %d symbols with market regime: %s", len(self.symbols), current_market_regime)
 
-                LOG.info("Starting new scan cycle for %d symbols...", len(self.symbols))
                 equity = await self.db.latest_equity() or 0.0
                 open_positions_count = len(self.open_positions)
                 open_symbols = {p['symbol'] for p in self.open_positions.values()}
