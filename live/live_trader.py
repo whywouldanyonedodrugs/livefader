@@ -42,6 +42,108 @@ from .telegram import TelegramBot
 from pydantic import Field, Extra, ValidationError
 from pydantic_settings import BaseSettings
 
+def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
+    """Calculates a Triangular Moving Average (TMA). Helper function."""
+    # This is a simplified and faster version of TMA
+    return series.rolling(window=period, min_periods=period).mean().rolling(window=period, min_periods=period).mean()
+
+class RegimeDetector:
+    """
+    Calculates and caches the market regime based on a live benchmark asset.
+    """
+    def __init__(self, exchange, config: dict):
+        self.exchange = exchange
+        self.cfg = config
+        self.benchmark_symbol = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
+        self.cache_duration = timedelta(minutes=self.cfg.get("REGIME_CACHE_MINUTES", 60))
+        self.cached_regime = "UNKNOWN"
+        self.last_calculation_time = None
+        LOG.info("RegimeDetector initialized for benchmark %s with a %d-minute cache.", self.benchmark_symbol, self.cfg.get("REGIME_CACHE_MINUTES", 60))
+
+    async def _fetch_benchmark_data(self) -> pd.DataFrame | None:
+        """Fetches the last ~500 days of daily OHLCV data for the benchmark symbol."""
+        try:
+            # Fetch enough data for the long-term TMA and Markov model
+            ohlcv = await self.exchange.fetch_ohlcv(self.benchmark_symbol, '1d', limit=500)
+            if len(ohlcv) < 200: # Need at least ~200 days for meaningful calculation
+                LOG.warning("Not enough historical data for benchmark %s to calculate regime. Found %d bars.", self.benchmark_symbol, len(ohlcv))
+                return None
+            
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+            df.set_index('timestamp', inplace=True)
+            return df
+        except Exception as e:
+            LOG.error("Failed to fetch benchmark data for regime detection: %s", e)
+            return None
+
+    def _calculate_vol_regime(self, daily_returns: pd.Series) -> pd.Series:
+        """Calculates the volatility regime using a Markov Switching Model."""
+        try:
+            model = sm.tsa.MarkovRegression(daily_returns.dropna(), k_regimes=2, switching_variance=True)
+            results = model.fit(disp=False)
+            low_vol_regime_idx = np.argmin(results.params[-2:])
+            vol_regimes = np.where(results.smoothed_marginal_probabilities[low_vol_regime_idx] > 0.5, "LOW_VOL", "HIGH_VOL")
+            # Return as a pandas Series with the same index as the input
+            return pd.Series(vol_regimes, index=daily_returns.dropna().index, name="vol_regime")
+        except Exception as e:
+            LOG.warning("Could not fit Markov model for volatility regime: %s. Defaulting to UNKNOWN.", e)
+            return pd.Series("UNKNOWN", index=daily_returns.index, name="vol_regime")
+
+    def _calculate_trend_regime(self, df_daily: pd.DataFrame) -> pd.Series:
+        """Calculates the trend regime using a TMA and Keltner Channel."""
+        df_daily['tma'] = triangular_moving_average(df_daily['close'], self.cfg.get("REGIME_MA_PERIOD", 100))
+        atr_series = ta.atr(df_daily, period=self.cfg.get("REGIME_ATR_PERIOD", 20))
+        df_daily['keltner_upper'] = df_daily['tma'] + (atr_series * self.cfg.get("REGIME_ATR_MULT", 2.0))
+        df_daily['keltner_lower'] = df_daily['tma'] - (atr_series * self.cfg.get("REGIME_ATR_MULT", 2.0))
+        df_daily.dropna(inplace=True)
+
+        trend = pd.Series(np.nan, index=df_daily.index, dtype="object")
+        for i in range(1, len(df_daily)):
+            if df_daily['close'].iloc[i] > df_daily['keltner_upper'].iloc[i]:
+                trend.iloc[i] = "BULL"
+            elif df_daily['close'].iloc[i] < df_daily['keltner_lower'].iloc[i]:
+                trend.iloc[i] = "BEAR"
+            else:
+                trend.iloc[i] = trend.iloc[i-1] # Carry forward the previous trend
+        
+        return trend.ffill().bfill()
+
+    async def get_current_regime(self) -> str:
+        """The main public method to get the current market regime, using a cache."""
+        now = datetime.now(timezone.utc)
+        if self.last_calculation_time and (now - self.last_calculation_time) < self.cache_duration:
+            return self.cached_regime
+
+        LOG.info("Regime cache expired or empty. Calculating new market regime...")
+        self.last_calculation_time = now # Update time immediately to prevent re-entry
+
+        df_daily = await self._fetch_benchmark_data()
+        if df_daily is None:
+            self.cached_regime = "UNKNOWN"
+            return self.cached_regime
+
+        daily_returns = df_daily['close'].pct_change()
+        
+        vol_regime = self._calculate_vol_regime(daily_returns)
+        df_daily['vol_regime'] = vol_regime
+        
+        trend_regime = self._calculate_trend_regime(df_daily)
+        df_daily['trend_regime'] = trend_regime
+        
+        df_daily.dropna(subset=['vol_regime', 'trend_regime'], inplace=True)
+        
+        if df_daily.empty:
+            LOG.warning("Regime calculation resulted in an empty DataFrame. Cannot determine regime.")
+            self.cached_regime = "UNKNOWN"
+            return self.cached_regime
+
+        latest_regime = f"{df_daily['trend_regime'].iloc[-1]}_{df_daily['vol_regime'].iloc[-1]}"
+        self.cached_regime = latest_regime
+        
+        LOG.info("New market regime calculated: %s", self.cached_regime)
+        return self.cached_regime
+
 def create_unique_cid(tag: str) -> str:
     """Creates a globally unique client order ID for one-shot orders like entry."""
     timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -62,6 +164,10 @@ class Signal:
     ret_30d: float
     adx: float
     vwap_consolidated: bool
+    market_regime: str
+    atr_pct: float
+    price_boom_pct: float
+    price_slowdown_pct: float
 
 LISTING_PATH = Path("listing_dates.json")
 
@@ -167,6 +273,7 @@ class LiveTrader:
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
+        self.regime_detector = RegimeDetector(self.exchange, self.cfg)
         self.risk = RiskManager(self.cfg)
         self.exchange = ExchangeProxy(self._init_ccxt())
         self.symbols = self._load_symbols()
@@ -388,6 +495,8 @@ class LiveTrader:
             price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
             price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
 
+            atr_pct = (last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0
+
             ema_filter_enabled = self.cfg.get("EMA_FILTER_ENABLED", True)
             if ema_filter_enabled:
                 ema_down = last['ema_fast'] < last['ema_slow']
@@ -432,6 +541,11 @@ class LiveTrader:
                     symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
                     rsi=float(last['rsi']), adx=float(last['adx']), ret_30d=float(ret_30d),
                     vwap_consolidated=bool(last['vwap_consolidated'])
+                    market_regime=market_regime, # Pass the regime we received
+                    atr_pct=(last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0    
+                    price_boom_pct=boom_ret_pct,
+                    price_slowdown_pct=slowdown_ret_pct
+                                    
                 )
         except ccxt.BadSymbol:
             LOG.warning("Could not scan %s: Invalid symbol on exchange.", symbol)
@@ -507,6 +621,9 @@ class LiveTrader:
         if not live_position:
             LOG.error("ENTRY FAILED for %s: Position did not appear on exchange after %d attempts.", sig.symbol, CONFIRMATION_ATTEMPTS)
             return
+        
+        slippage_usd = (sig.entry - actual_entry_price) * actual_size
+        LOG.info("Slippage for %s entry: $%.4f", sig.symbol, slippage_usd)
 
         # --- Step 4: Persist to DB and place protective orders (CRITICAL BLOCK) ---
         try:
@@ -519,7 +636,14 @@ class LiveTrader:
                 "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
                 "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
                 "exit_deadline": exit_deadline,
-                "entry_cid": create_unique_cid(f"ENTRY_{sig.symbol}")
+                "entry_cid": create_unique_cid(f"ENTRY_{sig.symbol}"),
+                # --- ADD THE NEW DATA TO BE SAVED ---
+                "market_regime_at_entry": sig.market_regime,
+                "slippage_usd": slippage_usd,
+                "rsi_at_entry": sig.rsi,
+                "atr_pct_at_entry": sig.atr_pct,
+                "price_boom_pct_at_entry": sig.price_boom_pct,
+                "price_slowdown_pct_at_entry": sig.price_slowdown_pct
             })
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
@@ -716,6 +840,11 @@ class LiveTrader:
         symbol = pos["symbol"]
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN_CLOSE"
 
+        closed_at = datetime.now(timezone.utc)
+        opened_at = pos["opened_at"]
+        holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
+        exit_reason = closing_order_type # e.g., "SL", "TP", "UNKNOWN_CLOSE"
+
         possible_closing_cids = [
             pos.get("sl_cid"), pos.get("tp1_cid"), 
             pos.get("sl_trail_cid"), pos.get("tp2_cid")
@@ -770,13 +899,16 @@ class LiveTrader:
                 total_pnl += (entry_price - float(fill['price'])) * float(fill['qty'])
 
         await self.db.update_position(
-            pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=total_pnl
+            pid, status="CLOSED", closed_at=closed_at, pnl=total_pnl,
+            # --- ADD THE NEW DATA ---
+            holding_minutes=holding_minutes,
+            exit_reason=exit_reason
         )
         await self.risk.on_trade_close(total_pnl, self.tg)
         
         del self.open_positions[pid]
         self.last_exit[symbol] = datetime.now(timezone.utc)
-        await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
+        await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")     
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
         symbol = pos["symbol"]
@@ -808,6 +940,9 @@ class LiveTrader:
                     await asyncio.sleep(5)
                     continue
 
+                current_market_regime = await self.regime_detector.get_current_regime()
+                LOG.info("Starting new scan cycle for %d symbols with market regime: %s", len(self.symbols), current_market_regime)
+
                 LOG.info("Starting new scan cycle for %d symbols...", len(self.symbols))
                 equity = await self.db.latest_equity() or 0.0
                 open_positions_count = len(self.open_positions)
@@ -838,7 +973,7 @@ class LiveTrader:
                             LOG.error("Could not perform pre-flight position check for %s: %s", sym, e)
                             continue
 
-                        signal = await self._scan_symbol_for_signal(sym)
+                        signal = await self._scan_symbol_for_signal(sym, current_market_regime)
                         if signal:
                             age = (datetime.utcnow().date() - self._listing_dates_cache[sym]).days if sym in self._listing_dates_cache else None
                             ok, vetoes = filters.evaluate(

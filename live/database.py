@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger(__name__)
 
+# --- MODIFIED: Added all new columns to the table creation script ---
 TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS positions (
     id SERIAL PRIMARY KEY,
@@ -21,7 +22,21 @@ CREATE TABLE IF NOT EXISTS positions (
     opened_at TIMESTAMPTZ,
     exit_deadline TIMESTAMPTZ,
     closed_at TIMESTAMPTZ,
-    pnl NUMERIC
+    pnl NUMERIC,
+    -- New columns for data analysis
+    entry_cid VARCHAR(36),
+    sl_cid VARCHAR(36),
+    tp1_cid VARCHAR(36),
+    tp_final_cid VARCHAR(36),
+    sl_trail_cid VARCHAR(36),
+    market_regime_at_entry TEXT,
+    slippage_usd FLOAT,
+    rsi_at_entry FLOAT,
+    atr_pct_at_entry FLOAT,
+    price_boom_pct_at_entry FLOAT,
+    price_slowdown_pct_at_entry FLOAT,
+    exit_reason TEXT,
+    holding_minutes FLOAT
 );
 CREATE TABLE IF NOT EXISTS fills (
     id SERIAL PRIMARY KEY,
@@ -67,18 +82,35 @@ class DB:
         async with self.pool.acquire() as conn:
             await conn.execute(TABLES_SQL)
 
+    # --- MODIFIED: Updated to handle all new data fields ---
     @db_retry
     async def insert_position(self, data: Dict[str, Any]) -> int:
-        q = """INSERT INTO positions(symbol,side,size,entry_price,stop_price,
-                 trailing_active,atr,status,opened_at, exit_deadline)
-               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id"""
-        return await self.pool.fetchval(
-            q,
-            data["symbol"], data["side"], data["size"],
-            data["entry_price"], data["stop_price"], data["trailing_active"],
-            data["atr"], data["status"], data["opened_at"], data["exit_deadline"]
+        # This query now includes all the new fields.
+        # Using .get() provides a default of None if a key is missing,
+        # which is safe for columns that allow NULL values.
+        query = """
+            INSERT INTO positions (
+                symbol, side, size, entry_price, stop_price, trailing_active,
+                atr, status, opened_at, exit_deadline, entry_cid,
+                market_regime_at_entry, slippage_usd, rsi_at_entry, atr_pct_at_entry,
+                price_boom_pct_at_entry, price_slowdown_pct_at_entry
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            RETURNING id
+        """
+        pid = await self.pool.fetchval(
+            query,
+            data.get("symbol"), data.get("side"), data.get("size"), data.get("entry_price"),
+            data.get("stop_price"), data.get("trailing_active", False),
+            data.get("atr"), data.get("status"), data.get("opened_at"),
+            data.get("exit_deadline"), data.get("entry_cid"),
+            data.get("market_regime_at_entry"), data.get("slippage_usd"),
+            data.get("rsi_at_entry"), data.get("atr_pct_at_entry"),
+            data.get("price_boom_pct_at_entry"), data.get("price_slowdown_pct_at_entry")
         )
+        return pid
 
+    # --- UNCHANGED: This function is already perfect ---
     @db_retry
     async def update_position(self, pid: int, **fields):
         sets = ",".join(f"{k}=${i+2}" for i, k in enumerate(fields))
@@ -86,6 +118,7 @@ class DB:
             f"UPDATE positions SET {sets} WHERE id=$1", pid, *fields.values()
         )
 
+    # --- UNCHANGED: The rest of the file is correct ---
     @db_retry
     async def add_fill(self, pid: int, fill_type: str, price: Optional[float], qty: float, ts: datetime):
         await self.pool.execute(

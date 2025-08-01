@@ -136,3 +136,21 @@ ENTRY_ORDER_TYPE  = "MARKET"        # or "MARKET"
 
 # ─── Re‑entry cool‑down per symbol ──────────────────────────────────────────
 SYMBOL_COOLDOWN_HOURS = 4    # skip new signals for the same symbol during X h
+
+      
+# ── market regime detection ──────────────────────────────────────────────────
+# Parameters for the live market regime detector.
+
+# The benchmark asset to determine the overall market state (e.g., BTCUSDT, ETHUSDT).
+REGIME_BENCHMARK_SYMBOL: "BTCUSDT"
+
+# How many minutes to cache the calculated regime before re-calculating.
+# A value of 60 means it will run the calculation at most once per hour.
+REGIME_CACHE_MINUTES: 60
+
+# --- Parameters for the Trend Regime (TMA + Keltner Channel) ---
+REGIME_MA_PERIOD: 100       # Long-term moving average period.
+REGIME_ATR_PERIOD: 20       # ATR period for Keltner Channel width.
+REGIME_ATR_MULT: 2.0        # ATR multiplier for the Keltner bands.
+
+    
