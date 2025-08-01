@@ -25,6 +25,8 @@ import aiohttp
 import asyncpg
 import ccxt.async_support as ccxt
 import pandas as pd
+import numpy as np
+import statsmodels.api as sm
 import yaml
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
