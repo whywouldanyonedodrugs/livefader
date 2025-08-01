@@ -539,14 +539,15 @@ class LiveTrader:
                 LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, last['close'])
                 return Signal(
                     symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
-                    rsi=float(last['rsi']), adx=float(last['adx']), ret_30d=float(ret_30d),
-                    vwap_consolidated=bool(last['vwap_consolidated'])
-                    market_regime=market_regime, # Pass the regime we received
-                    atr_pct=(last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0    
+                    rsi=float(last['rsi']), adx=float(last['adx']), ret_30d=float(ret_30d), # <--- COMMA IS NOW CORRECTLY ADDED
+                    vwap_consolidated=bool(last['vwap_consolidated']),
+                    market_regime=market_regime,
+                    atr_pct=atr_pct,
                     price_boom_pct=boom_ret_pct,
                     price_slowdown_pct=slowdown_ret_pct
-                                    
                 )
+            return None
+
         except ccxt.BadSymbol:
             LOG.warning("Could not scan %s: Invalid symbol on exchange.", symbol)
         except Exception as e:
