@@ -1038,6 +1038,16 @@ class LiveTrader:
         if root == "/pause":
             self.paused = True
             await self.tg.send("⏸ Paused")
+
+        elif root == "/report" and len(parts) == 2:
+            period = parts[1].lower() # e.g., 'daily', 'weekly', '6h'
+            if period in ['6h', 'daily', 'weekly', 'monthly']:
+                await self.tg.send(f"Generating on-demand '{period}' report...")
+                summary_text = await self._generate_summary_report(period)
+                await self.tg.send(summary_text)
+            else:
+                await self.tg.send(f"Unknown period '{period}'. Use: 6h, daily, weekly, monthly.")        
+
         elif root == "/resume":
             if self.risk.can_trade():
                 self.paused = False
@@ -1202,7 +1212,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 Bot online v3.0")
+        await self.tg.send("🤖 Bot online v5.0")
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -1210,6 +1220,7 @@ class LiveTrader:
                 tg.create_task(self._manage_positions_loop())
                 tg.create_task(self._telegram_loop())
                 tg.create_task(self._equity_loop())
+                tg.create_task(self._reporting_loop())
             LOG.info("All tasks finished gracefully.")
         except* (asyncio.CancelledError, KeyboardInterrupt):
             LOG.info("Shutdown signal received. Closing connections...")
@@ -1220,6 +1231,121 @@ class LiveTrader:
             await self.tg.close()
             LOG.info("Bot shut down cleanly.")
 
+    async def _generate_summary_report(self, period: str) -> str:
+        """
+        Queries the database for a given period, calculates KPIs, and returns a formatted summary string.
+        
+        Args:
+            period: A string like '6h', 'daily', 'weekly', or 'monthly'.
+        """
+        now = datetime.now(timezone.utc)
+        period_map = {
+            '6h': timedelta(hours=6),
+            'daily': timedelta(days=1),
+            'weekly': timedelta(weeks=1),
+            'monthly': timedelta(days=30) # Approximation for monthly
+        }
+        
+        if period not in period_map:
+            return f"Error: Unknown report period '{period}'."
+
+        start_time = now - period_map[period]
+        LOG.info("Generating %s summary report for trades closed since %s", period, start_time.isoformat())
+
+        try:
+            query = """
+                SELECT
+                    pnl
+                FROM positions
+                WHERE status = 'CLOSED' AND closed_at >= $1
+            """
+            records = await self.db.pool.fetch(query, start_time)
+
+            if not records:
+                return f"📊 *{period.capitalize()} Report*\n\nNo trades were closed in the last {period}."
+
+            total_trades = len(records)
+            pnl_values = [float(r['pnl']) for r in records if r['pnl'] is not None]
+            
+            wins = [p for p in pnl_values if p > 0]
+            losses = [p for p in pnl_values if p < 0]
+            
+            win_count = len(wins)
+            loss_count = len(losses)
+            
+            win_rate = (win_count / total_trades) * 100 if total_trades > 0 else 0
+            total_pnl = sum(pnl_values)
+            
+            gross_profit = sum(wins)
+            gross_loss = abs(sum(losses))
+            
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+            
+            avg_win = sum(wins) / win_count if win_count > 0 else 0
+            avg_loss = sum(losses) / loss_count if loss_count > 0 else 0
+            
+            expectancy = (avg_win * (win_rate / 100)) - (abs(avg_loss) * (1 - (win_rate / 100)))
+
+            # Using MarkdownV2 for formatting
+            report_lines = [
+                f"📊 *{period.capitalize()} Performance Summary*",
+                f"```{'-'*25}",
+                f" Period: Last {period}",
+                f" Total Closed Trades: {total_trades}",
+                f" Total PnL: {total_pnl:+.2f} USDT",
+                f"",
+                f" Win Rate: {win_rate:.2f}% ({win_count} W / {loss_count} L)",
+                f" Profit Factor: {profit_factor:.2f}",
+                f" Expectancy/Trade: {expectancy:+.2f} USDT",
+                f"",
+                f" Avg Win:  {avg_win:+.2f} USDT",
+                f" Avg Loss: {avg_loss:+.2f} USDT",
+                f"```{'-'*25}",
+            ]
+            
+            return "\n".join(report_lines)
+
+        except Exception as e:
+            LOG.error("Failed to generate summary report: %s", e)
+            return f"Error: Could not generate {period} report. Check logs."
+
+    async def _reporting_loop(self):
+        """A background loop that sends scheduled reports to Telegram."""
+        LOG.info("Reporting loop started.")
+        last_report_sent = {} # Stores the last time a report was sent for a period
+
+        while True:
+            await asyncio.sleep(60 * 5) # Check every 5 minutes
+            now = datetime.now(timezone.utc)
+            
+            periods_to_check = {
+                '6h': now.hour % 6 == 0,
+                'daily': now.hour == 0,
+                'weekly': now.weekday() == 0 and now.hour == 0, # Monday morning
+            }
+            
+            for period, should_send in periods_to_check.items():
+                # To prevent spam on restart, we check if the last report for this period
+                # was already sent within the current time window.
+                last_sent_date = last_report_sent.get(period)
+                
+                # For daily/weekly, we just check the date. For 6h, we check the hour block.
+                is_already_sent = False
+                if period in ['daily', 'weekly'] and last_sent_date == now.date():
+                    is_already_sent = True
+                elif period == '6h' and last_sent_date == (now.date(), now.hour // 6):
+                    is_already_sent = True
+
+                if should_send and not is_already_sent:
+                    LOG.info("Triggering scheduled '%s' report.", period)
+                    summary_text = await self._generate_summary_report(period)
+                    await self.tg.send(summary_text)
+                    
+                    # Mark as sent for this time window
+                    if period in ['daily', 'weekly']:
+                        last_report_sent[period] = now.date()
+                    elif period == '6h':
+                        last_report_sent[period] = (now.date(), now.hour // 6)
 
 ###############################################################################
 # 6 ▸ ENTRYPOINT ##############################################################
