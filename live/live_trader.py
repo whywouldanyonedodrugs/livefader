@@ -429,7 +429,7 @@ class LiveTrader:
             LOG.warning("Could not fetch all open orders for all symbols: %s", e)
             return []
 
-    async def _scan_symbol_for_signal(self, symbol: str) -> Optional[Signal]:
+    async def _scan_symbol_for_signal(self, symbol: str, market_regime: str) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
             base_tf = self.cfg.get('TIMEFRAME', '5m')
