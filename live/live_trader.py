@@ -159,17 +159,30 @@ def create_stable_cid(pid: int, tag: str) -> str:
 
 @dataclasses.dataclass
 class Signal:
+    # Core Signal Info
     symbol: str
     entry: float
     atr: float
+    
+    # Core Indicators
     rsi: float
-    ret_30d: float
     adx: float
-    vwap_consolidated: bool
-    market_regime: str
     atr_pct: float
+    market_regime: str
+    
+    # Strategy Filter Values
     price_boom_pct: float
     price_slowdown_pct: float
+    vwap_dev_pct: float
+    ret_30d: float
+    ema_fast: float
+    ema_slow: float
+    listing_age_days: int
+    
+    # Contextual Info
+    session_tag: str
+    day_of_week: int
+    hour_of_day: int
 
 LISTING_PATH = Path("listing_dates.json")
 
@@ -497,12 +510,22 @@ class LiveTrader:
             if df5.empty: return None
 
             last = df5.iloc[-1]
+            now_utc = datetime.now(timezone.utc)
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
             price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
             price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
 
             atr_pct = (last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0
+
+            listing_age_days = (now_utc.date() - self._listing_dates_cache[symbol]).days if symbol in self._listing_dates_cache else -1
+            hour_of_day = now_utc.hour
+            day_of_week = now_utc.weekday() # Monday is 0, Sunday is 6
+
+            session_tag = "UNKNOWN"
+            if 0 <= hour_of_day < 8: session_tag = "ASIA"
+            elif 8 <= hour_of_day < 16: session_tag = "EUROPE"
+            else: session_tag = "US"
 
             ema_filter_enabled = self.cfg.get("EMA_FILTER_ENABLED", True)
             if ema_filter_enabled:
@@ -542,16 +565,22 @@ class LiveTrader:
                 f"====================================================\n"
             )
 
-            if price_boom and price_slowdown and ema_down:
+            if price_boom and price_slowdown and ema_down: # Your existing signal condition
                 LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, last['close'])
                 return Signal(
                     symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
-                    rsi=float(last['rsi']), adx=float(last['adx']), ret_30d=float(ret_30d), # <--- COMMA IS NOW CORRECTLY ADDED
-                    vwap_consolidated=bool(last['vwap_consolidated']),
+                    rsi=float(last['rsi']), adx=float(last['adx']), atr_pct=atr_pct,
                     market_regime=market_regime,
-                    atr_pct=atr_pct,
                     price_boom_pct=boom_ret_pct,
-                    price_slowdown_pct=slowdown_ret_pct
+                    price_slowdown_pct=slowdown_ret_pct,
+                    vwap_dev_pct=float(last.get('vwap_dev', 0.0)),
+                    ret_30d=ret_30d,
+                    ema_fast=float(last['ema_fast']),
+                    ema_slow=float(last['ema_slow']),
+                    listing_age_days=listing_age_days,
+                    session_tag=session_tag,
+                    day_of_week=day_of_week,
+                    hour_of_day=hour_of_day
                 )
             return None
 
@@ -631,7 +660,16 @@ class LiveTrader:
             return
         
         slippage_usd = (sig.entry - actual_entry_price) * actual_size
+        risk_usd = await self._risk_amount(free_usdt) # Capture the intended risk amount
         LOG.info("Slippage for %s entry: $%.4f", sig.symbol, slippage_usd)
+
+        config_snapshot = {
+            "SL_ATR_MULT": self.cfg.get("SL_ATR_MULT"),
+            "FINAL_TP_ATR_MULT": self.cfg.get("FINAL_TP_ATR_MULT"),
+            "PARTIAL_TP_ATR_MULT": self.cfg.get("PARTIAL_TP_ATR_MULT"),
+            "PARTIAL_TP_PCT": self.cfg.get("PARTIAL_TP_PCT")
+        }
+
 
         # --- Step 4: Persist to DB and place protective orders (CRITICAL BLOCK) ---
         try:
@@ -641,17 +679,26 @@ class LiveTrader:
             )
             pid = await self.db.insert_position({
                 "symbol": sig.symbol, "side": "short", "size": actual_size,
-                "entry_price": actual_entry_price, "stop_price": 0, "trailing_active": False,
-                "atr": sig.atr, "status": "PENDING", "opened_at": datetime.now(timezone.utc),
-                "exit_deadline": exit_deadline,
-                "entry_cid": create_unique_cid(f"ENTRY_{sig.symbol}"),
-                # --- ADD THE NEW DATA TO BE SAVED ---
-                "market_regime_at_entry": sig.market_regime,
+                "entry_price": actual_entry_price, "atr": sig.atr,
+                "status": "PENDING", "opened_at": datetime.now(timezone.utc),
+                # --- ALL NEW DATA ---
+                "risk_usd": risk_usd,
                 "slippage_usd": slippage_usd,
+                "market_regime_at_entry": sig.market_regime,
                 "rsi_at_entry": sig.rsi,
+                "adx_at_entry": sig.adx,
                 "atr_pct_at_entry": sig.atr_pct,
                 "price_boom_pct_at_entry": sig.price_boom_pct,
-                "price_slowdown_pct_at_entry": sig.price_slowdown_pct
+                "price_slowdown_pct_at_entry": sig.price_slowdown_pct,
+                "vwap_dev_pct_at_entry": sig.vwap_dev_pct,
+                "ret_30d_at_entry": sig.ret_30d,
+                "ema_fast_at_entry": sig.ema_fast,
+                "ema_slow_at_entry": sig.ema_slow,
+                "listing_age_days_at_entry": sig.listing_age_days,
+                "session_tag_at_entry": sig.session_tag,
+                "day_of_week_at_entry": sig.day_of_week,
+                "hour_of_day_at_entry": sig.hour_of_day,
+                "config_snapshot": json.dumps(config_snapshot) # Convert dict to JSON string
             })
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
@@ -846,77 +893,114 @@ class LiveTrader:
             
     async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
-        exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN_CLOSE"
+        exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
 
-        closed_at = datetime.now(timezone.utc)
-        opened_at = pos["opened_at"]
-        holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
-        exit_reason = closing_order_type # e.g., "SL", "TP", "UNKNOWN_CLOSE"
-
+        # --- 1. Determine the Exit Reason and Price ---
+        # First, try to find the exact closing order to get the precise exit reason.
         possible_closing_cids = [
             pos.get("sl_cid"), pos.get("tp1_cid"), 
-            pos.get("sl_trail_cid"), pos.get("tp2_cid")
+            pos.get("tp_final_cid"), pos.get("sl_trail_cid")
         ]
         
         for cid in filter(None, possible_closing_cids):
             try:
-                # FIX: Use the correct helper function
                 order = await self._fetch_by_cid(cid, symbol)
                 if order and order.get('status') == 'closed' and order.get('filled', 0) > 0:
-                    exit_price = order.get('average') or order.get('price')
-                    exit_qty = order['filled']
+                    exit_price = float(order.get('average') or order.get('price'))
+                    exit_qty = float(order['filled'])
                     if "TP" in cid: closing_order_type = "TP"
                     elif "SL" in cid: closing_order_type = "SL"
+                    LOG.info(f"Position {pid} closed by order {cid} at avg price {exit_price}")
                     break 
             except ccxt.OrderNotFound:
                 continue
             except Exception as e:
                 LOG.warning(f"Could not fetch closing order {cid} for PnL calc: {e}")
 
-        # Fallback to ticker price if we couldn't get the exact fill price
+        # Fallback to ticker price if we couldn't find the exact closing order
         if not exit_price:
             LOG.warning(f"Could not determine exact fill price for {pid}. Using last market price for PnL.")
             ticker = await self.exchange.fetch_ticker(symbol)
-            exit_price = ticker["last"]
-            # Estimate exit quantity based on position state
-            exit_qty = (
-                pos["size"] * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
-                if pos["trailing_active"] else pos["size"]
-            )
+            exit_price = float(ticker["last"])
+            exit_qty = float(pos["size"]) # Fallback to full size
+            closing_order_type = "FALLBACK" # Mark this as a fallback exit
 
-        # --- Bullet-Proof Cleanup Protocol ---
+        # --- 2. Perform Post-Trade Calculations ---
+        closed_at = datetime.now(timezone.utc)
+        opened_at = pos["opened_at"]
+        holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
+        
+        entry_price_float = float(pos["entry_price"])
+        pnl_pct = ((entry_price_float / exit_price) - 1) * 100 if exit_price > 0 else 0.0
+
+        # Initialize metrics to 0 in case the data fetch fails
+        mae_usd, mfe_usd, mae_over_atr, mfe_over_atr, realized_vol_during_trade = 0, 0, 0, 0, 0
+        
+        try:
+            # Fetch 1-minute OHLCV data for the trade's duration to calculate MAE/MFE/Vol
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000))
+            if ohlcv:
+                trade_df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                trade_df['timestamp'] = pd.to_datetime(trade_df['timestamp'], unit='ms', utc=True)
+                # Filter for the exact duration of the trade
+                trade_df = trade_df[trade_df['timestamp'] <= closed_at]
+
+                if not trade_df.empty:
+                    high_during_trade = trade_df['high'].max()
+                    low_during_trade = trade_df['low'].min()
+                    
+                    # For a short position
+                    mae_usd = (high_during_trade - entry_price_float) * float(pos["size"])
+                    mfe_usd = (entry_price_float - low_during_trade) * float(pos["size"])
+                    
+                    atr_at_entry = float(pos["atr"])
+                    mae_over_atr = (high_during_trade - entry_price_float) / atr_at_entry if atr_at_entry > 0 else 0
+                    mfe_over_atr = (entry_price_float - low_during_trade) / atr_at_entry if atr_at_entry > 0 else 0
+                    
+                    # Annualized volatility of 1-minute returns during the trade
+                    realized_vol_during_trade = trade_df['close'].pct_change().std() * np.sqrt(365 * 24 * 60)
+        except Exception as e:
+            LOG.warning("Could not calculate MAE/MFE/Vol for %s: %s", symbol, e)
+
+        # --- 3. Finalize and Clean Up ---
         # Unconditionally cancel ALL orders for this symbol to ensure a clean slate.
         try:
             LOG.info("Finalizing position %d for %s. Cancelling all related orders.", pid, symbol)
             await self.exchange.cancel_all_orders(symbol, params={'category': 'linear'})
         except Exception as e:
-            LOG.warning(f"Final cleanup for position {pid} failed: {e}. The exchange's reduceOnly should prevent issues.")
+            LOG.warning(f"Final cleanup for position {pid} failed: {e}.")
         
-        # --- Database and State Update ---
         # Record the final fill that closed the position
-        await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, datetime.now(timezone.utc))
+        await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, closed_at)
 
         # Fetch ALL fills for this position to calculate total PnL accurately
         all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
         total_pnl = 0
-        # FIX: Cast entry_price to float before math
-        entry_price = float(pos["entry_price"])
         for fill in all_fills:
             if fill['price'] is not None and fill['qty'] is not None:
-                # FIX: Cast Decimal from DB to float
-                total_pnl += (entry_price - float(fill['price'])) * float(fill['qty'])
+                total_pnl += (entry_price_float - float(fill['price'])) * float(fill['qty'])
 
+        # --- 4. Persist All Data to the Database ---
         await self.db.update_position(
-            pid, status="CLOSED", closed_at=closed_at, pnl=total_pnl,
-            # --- ADD THE NEW DATA ---
+            pid, 
+            status="CLOSED", 
+            closed_at=closed_at, 
+            pnl=total_pnl,
+            exit_reason=closing_order_type, 
             holding_minutes=holding_minutes,
-            exit_reason=exit_reason
+            pnl_pct=pnl_pct, 
+            mae_usd=mae_usd, 
+            mfe_usd=mfe_usd,
+            mae_over_atr=mae_over_atr, 
+            mfe_over_atr=mfe_over_atr,
+            realized_vol_during_trade=realized_vol_during_trade
         )
+        
         await self.risk.on_trade_close(total_pnl, self.tg)
         
         del self.open_positions[pid]
-        self.last_exit[symbol] = datetime.now(timezone.utc)
-        await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")     
+        self.last_exit[symbol] = closed_at
+        await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
         symbol = pos["symbol"]

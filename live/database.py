@@ -31,12 +31,30 @@ CREATE TABLE IF NOT EXISTS positions (
     sl_trail_cid VARCHAR(36),
     market_regime_at_entry TEXT,
     slippage_usd FLOAT,
+    risk_usd FLOAT,
     rsi_at_entry FLOAT,
+    adx_at_entry FLOAT,
     atr_pct_at_entry FLOAT,
     price_boom_pct_at_entry FLOAT,
     price_slowdown_pct_at_entry FLOAT,
+    vwap_dev_pct_at_entry FLOAT,
+    ret_30d_at_entry FLOAT,
+    ema_fast_at_entry FLOAT,
+    ema_slow_at_entry FLOAT,
+    listing_age_days_at_entry INT,
+    session_tag_at_entry TEXT,
+    day_of_week_at_entry INT,
+    hour_of_day_at_entry INT,
+    config_snapshot JSONB,
     exit_reason TEXT,
-    holding_minutes FLOAT
+    holding_minutes FLOAT,
+    pnl_pct FLOAT,
+    mae_usd FLOAT,
+    mfe_usd FLOAT,
+    mae_over_atr FLOAT,
+    mfe_over_atr FLOAT,
+    realized_vol_during_trade FLOAT,
+    btc_beta_during_trade FLOAT
 );
 CREATE TABLE IF NOT EXISTS fills (
     id SERIAL PRIMARY KEY,
@@ -56,9 +74,9 @@ CREATE INDEX IF NOT EXISTS idx_positions_symbol_status ON positions (symbol, sta
 CREATE INDEX IF NOT EXISTS idx_positions_closed_at ON positions (closed_at);
 """
 DB_RETRYABLE_EXCEPTIONS = (
-    asyncpg.exceptions.InterfaceError,       # Connection errors
-    asyncpg.exceptions.DeadlockDetectedError,  # Deadlocks
-    asyncpg.exceptions.SerializationError,     # Transaction conflicts
+    asyncpg.exceptions.InterfaceError,
+    asyncpg.exceptions.DeadlockDetectedError,
+    asyncpg.exceptions.SerializationError,
 )
 
 db_retry = retry(
@@ -82,41 +100,26 @@ class DB:
         async with self.pool.acquire() as conn:
             await conn.execute(TABLES_SQL)
 
-    # --- MODIFIED: Updated to handle all new data fields ---
     @db_retry
     async def insert_position(self, data: Dict[str, Any]) -> int:
-        # This query now includes all the new fields.
-        # Using .get() provides a default of None if a key is missing,
-        # which is safe for columns that allow NULL values.
-        query = """
-            INSERT INTO positions (
-                symbol, side, size, entry_price, stop_price, trailing_active,
-                atr, status, opened_at, exit_deadline, entry_cid,
-                market_regime_at_entry, slippage_usd, rsi_at_entry, atr_pct_at_entry,
-                price_boom_pct_at_entry, price_slowdown_pct_at_entry
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        # This query is now dynamically built to handle all fields present in the data dict
+        columns = data.keys()
+        values_placeholder = ", ".join([f"${i+1}" for i in range(len(columns))])
+        query = f"""
+            INSERT INTO positions ({", ".join(columns)})
+            VALUES ({values_placeholder})
             RETURNING id
         """
-        pid = await self.pool.fetchval(
-            query,
-            data.get("symbol"), data.get("side"), data.get("size"), data.get("entry_price"),
-            data.get("stop_price"), data.get("trailing_active", False),
-            data.get("atr"), data.get("status"), data.get("opened_at"),
-            data.get("exit_deadline"), data.get("entry_cid"),
-            data.get("market_regime_at_entry"), data.get("slippage_usd"),
-            data.get("rsi_at_entry"), data.get("atr_pct_at_entry"),
-            data.get("price_boom_pct_at_entry"), data.get("price_slowdown_pct_at_entry")
-        )
-        return pid
+        return await self.pool.fetchval(query, *data.values())
 
-    # --- UNCHANGED: This function is already perfect ---
     @db_retry
     async def update_position(self, pid: int, **fields):
         sets = ",".join(f"{k}=${i+2}" for i, k in enumerate(fields))
         await self.pool.execute(
             f"UPDATE positions SET {sets} WHERE id=$1", pid, *fields.values()
         )
+
+    # ... (The rest of your database.py file is correct and does not need changes) ...
 
     # --- UNCHANGED: The rest of the file is correct ---
     @db_retry
