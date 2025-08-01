@@ -273,9 +273,14 @@ class LiveTrader:
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
-        self.regime_detector = RegimeDetector(self.exchange, self.cfg)
         self.risk = RiskManager(self.cfg)
+        
+        # FIX: Create self.exchange FIRST...
         self.exchange = ExchangeProxy(self._init_ccxt())
+        
+        # FIX: ...THEN create self.regime_detector, which depends on it.
+        self.regime_detector = RegimeDetector(self.exchange, self.cfg)
+
         self.symbols = self._load_symbols()
         self.open_positions: Dict[int, Dict[str, Any]] = {}
         self.peak_equity: float = 0.0
