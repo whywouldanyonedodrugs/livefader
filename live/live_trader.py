@@ -834,7 +834,6 @@ class LiveTrader:
     async def _activate_trailing(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
         try:
-            # FIX: Use the stored CID from the position data
             if pos.get("sl_cid"):
                 await self._cancel_by_cid(pos["sl_cid"], symbol)
         except ccxt.OrderNotFound:
@@ -842,16 +841,37 @@ class LiveTrader:
         except Exception as e:
             LOG.warning(f"Could not cancel original SL for {pid} ({pos.get('sl_cid')}): {e}")
 
+        # This places the first trailing stop order
         await self._trail_stop(pid, pos, first=True)
 
+        # FIX: Correctly create, use, and persist the TP2 client order ID
         if self.cfg.get("FINAL_TP_ENABLED", False):
             try:
-                final_tp_price = pos["entry_price"] - self.cfg["FINAL_TP_ATR_MULT"] * pos["atr"]
-                qty_left = pos["size"] * (1 - self.cfg["PARTIAL_TP_PCT"])
+                final_tp_price = float(pos["entry_price"]) - self.cfg["FINAL_TP_ATR_MULT"] * float(pos["atr"])
+                qty_left = float(pos["size"]) * (1 - self.cfg["PARTIAL_TP_PCT"])
+                
+                # 1. Create a stable, deterministic CID
+                tp2_cid = create_stable_cid(pid, "TP2")
+                
                 await self.exchange.create_order(
-                    symbol, "TAKE_PROFIT_MARKET", "buy", qty_left,
-                    params={"triggerPrice": final_tp_price, "clientOrderId": self._cid(pid, "TP2"), 'reduceOnly': True}
+                    symbol, "market", "buy", qty_left, None,
+                    params={
+                        "triggerPrice": final_tp_price, 
+                        "clientOrderId": tp2_cid, 
+                        'reduceOnly': True, 
+                        'closeOnTrigger': True, 
+                        'triggerDirection': 2, 
+                        'category': 'linear'
+                    }
                 )
+                
+                # 2. Persist the new CID to the database
+                await self.db.update_position(pid, tp2_cid=tp2_cid)
+                
+                # 3. Update the in-memory state to match
+                pos["tp2_cid"] = tp2_cid
+                LOG.info("Final Take Profit (TP2) placed for %s with CID %s", symbol, tp2_cid)
+
             except Exception as e:
                 LOG.error(f"Failed to place final TP2 order for {pid}: {e}")
 
@@ -896,16 +916,21 @@ class LiveTrader:
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
 
         # --- 1. Determine the Exit Reason and Price ---
-        # First, try to find the exact closing order to get the precise exit reason.
+        # FIX: Add tp2_cid to the list of possible closing orders
         possible_closing_cids = [
             pos.get("sl_cid"), pos.get("tp1_cid"), 
-            pos.get("tp_final_cid"), pos.get("sl_trail_cid")
+            pos.get("tp_final_cid"), pos.get("sl_trail_cid"),
+            pos.get("tp2_cid")
         ]
         
+        # FIX: Accept all valid "closed" statuses from the exchange
+        valid_closed_statuses = {"closed", "filled"}
+
         for cid in filter(None, possible_closing_cids):
             try:
                 order = await self._fetch_by_cid(cid, symbol)
-                if order and order.get('status') == 'closed' and order.get('filled', 0) > 0:
+                # Use case-insensitive check
+                if order and order.get('status') and order['status'].lower() in valid_closed_statuses:
                     exit_price = float(order.get('average') or order.get('price'))
                     exit_qty = float(order['filled'])
                     if "TP" in cid: closing_order_type = "TP"
@@ -1001,6 +1026,61 @@ class LiveTrader:
         del self.open_positions[pid]
         self.last_exit[symbol] = closed_at
         await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
+
+    async def _force_open_position(self, symbol: str):
+        """
+        Manually triggers a trade for a given symbol for testing purposes.
+        It runs a full scan to gather real data but bypasses the signal logic.
+        """
+        await self.tg.send(f"Received force open command for {symbol}. Attempting to generate signal data...")
+        LOG.info("Manual trade requested via Telegram for symbol: %s", symbol)
+
+        # --- Safety Check 1: Is a position already open? ---
+        if any(p['symbol'] == symbol for p in self.open_positions.values()):
+            msg = f"⚠️ Cannot force open {symbol}: A position is already open for this symbol."
+            LOG.warning(msg)
+            await self.tg.send(msg)
+            return
+
+        # --- Gather real-time data ---
+        try:
+            # We need the current market regime to run the scan
+            current_market_regime = await self.regime_detector.get_current_regime()
+            
+            # Run the scanner to get a fully populated Signal object with real data
+            signal = await self._scan_symbol_for_signal(symbol, current_market_regime)
+
+            if signal is None:
+                # This can happen if the exchange fails to return data for the symbol
+                msg = f"❌ Failed to force open {symbol}: Could not generate signal data. The symbol may be invalid or exchange data is unavailable."
+                LOG.error(msg)
+                await self.tg.send(msg)
+                return
+                
+            # --- Safety Check 2: Run the filters ---
+            # Even though we bypass the signal, we should still respect the main filters (max positions, etc.)
+            equity = await self.db.latest_equity() or 0.0
+            open_positions_count = len(self.open_positions)
+            ok, vetoes = filters.evaluate(
+                signal, listing_age_days=signal.listing_age_days,
+                open_positions=open_positions_count, equity=equity
+            )
+
+            if not ok:
+                msg = f"⚠️ VETOED force open for {symbol}: {' | '.join(vetoes)}"
+                LOG.warning(msg)
+                await self.tg.send(msg)
+                return
+
+            # --- Execute the trade ---
+            LOG.info("Bypassing signal conditions and proceeding to open position for %s.", symbol)
+            await self.tg.send(f"✅ Signal data generated for {symbol}. Proceeding with forced entry.")
+            await self._open_position(signal)
+
+        except Exception as e:
+            msg = f"❌ An unexpected error occurred during force open for {symbol}: {e}"
+            LOG.error(msg, exc_info=True)
+            await self.tg.send(msg)
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
         symbol = pos["symbol"]
@@ -1146,6 +1226,14 @@ class LiveTrader:
                 cast = val
             self.cfg[key] = cast
             await self.tg.send(f"✅ {key} set to {cast}")
+
+        elif root == "/open" and len(parts) == 2:
+            symbol = parts[1].upper() # e.g., BTCUSDT
+            # We run this as a background task so it doesn't block the Telegram loop
+            # while it fetches data and opens the trade.
+            asyncio.create_task(self._force_open_position(symbol))
+            return # Acknowledge the command immediately
+
         elif root == "/status":
             await self.tg.send(json.dumps({
                 "paused": self.paused,
