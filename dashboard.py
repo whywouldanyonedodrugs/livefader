@@ -64,75 +64,61 @@ class DashboardApp(App):
     @staticmethod
     def _ascii_ohlc_bars(
         ohlcv: list[list[float]],
-        rows: int = 15,
-        max_bars: int = 20,           # draws at most 20 bars → 20×5 columns
+        rows: int = 12,           # ← match chart_box height in CSS
+        max_bars: int = 20,       # at most 20 bars → 20×5 columns
     ) -> str:
         """
-        Classic OHLC bars (open tick left, stem, close tick right).
-
-        • One bar uses five columns:  “──│──”
-        • Up-bar   (close ≥ open) → bright_green
-        • Down-bar (close <  open) → bright_red
-        • Guarantee each stem is at least 2 rows tall, so bars never vanish.
+        Classic OHLC bars (──│──) in bright_green/bright_red.
+        Guarantees each stem is at least 2 rows tall so bars never vanish.
         """
-
-        # ————————————————————————————————————————————————
-        # 1) Early exit if not enough data
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # 2) Down-sample to at most max_bars
+        # 1) Down-sample
         stride = max(1, len(ohlcv) // max_bars)
         bars   = ohlcv[-stride * max_bars :: stride]
 
-        # 3) Find overall high/low and pad the range to avoid zero-height stems
-        hi = max(r[2] for r in bars)  # r = [ts, open, high, low, close, vol]
-        lo = min(r[3] for r in bars)
-        span = max(hi - lo, hi * 1e-8)             # avoid zero span
-        min_span_px = (rows - 1) * 0.25            # at least 25% of height
-        if span < min_span_px:
-            pad = (min_span_px - span) / 2
-            hi += pad
-            lo -= pad
-            span = hi - lo
+        # 2) Compute and pad overall range so stems aren't zero-height
+        hi   = max(r[2] for r in bars)
+        lo   = min(r[3] for r in bars)
+        span = max(hi - lo, hi * 1e-8)
+        min_px = (rows - 1) * 0.25
+        if span < min_px:
+            pad = (min_px - span) / 2
+            hi += pad; lo -= pad; span = hi - lo
 
-        # 4) Price → row mapper (0 = top row, rows-1 = bottom)
-        def y(price: float) -> int:
-            return int((hi - price) / span * (rows - 1))
+        # 3) Price→row (0=top, rows-1=bottom)
+        def y(p: float) -> int:
+            return int((hi - p) / span * (rows - 1))
 
-        # 5) Prepare an empty canvas
         width = 5 * len(bars)
         grid  = [[" "] * width for _ in range(rows)]
 
-        # 6) Draw each bar
-        for idx, (_, o, h, l, c, _) in enumerate(bars):
-            colour = "bright_green" if c >= o else "bright_red"
-            x_mid  = 5 * idx + 2  # center column of this bar’s 5-column slot
+        for i, (_, o, h, l, c, _) in enumerate(bars):
+            clr   = "bright_green" if c >= o else "bright_red"
+            x_mid = 5 * i + 2
 
-            # map OHLC to rows
             y_hi    = y(h)
             y_lo    = y(l)
             y_open  = y(o)
             y_close = y(c)
 
-            # ── ensure a minimum stem height of 2 rows ──
+            # ensure min‐2-row stem
             if y_hi == y_lo:
                 y_hi = max(0,        y_hi - 1)
                 y_lo = min(rows - 1, y_lo + 1)
-                # re-center open/close tick on the new stem
-                y_open  = y_close = (y_hi + y_lo) // 2
+                y_open = y_close = (y_hi + y_lo) // 2
 
-            # draw the vertical stem first
+            # draw stem
             for r in range(y_hi, y_lo + 1):
-                grid[r][x_mid] = f"[{colour}]│[/]"
+                grid[r][x_mid] = f"[{clr}]│[/]"
 
-            # draw the open tick (left)
-            grid[y_open][x_mid - 2] = f"[{colour}]──[/]"
+            # open tick (left)
+            grid[y_open][x_mid - 2] = f"[{clr}]──[/]"
 
-            # draw the close tick (right)
-            grid[y_close][x_mid + 2] = f"[{colour}]──[/]"
+            # close tick (right)
+            grid[y_close][x_mid + 2] = f"[{clr}]──[/]"
 
-        # 7) Flatten to a single markup string
         return "\n".join("".join(row) for row in grid)
 
     
@@ -220,10 +206,15 @@ class DashboardApp(App):
                                         # header / empty click
 
         # inside your on_data_table_row_highlighted or equivalent:
-        chart = DashboardApp._ascii_ohlc_bars(ohlcv, rows=15, max_bars=20)
         panel = self.query_one("#candle_chart")
+
+        # compute rows dynamically from panel’s height,
+        # minus 2 for top & bottom border (if needed)
+        rows = panel.size.height
+
+        chart = DashboardApp._ascii_ohlc_bars(ohlcv, rows=rows, max_bars=20)
         panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (OHLC)"
-        panel.update(Text.from_markup(chart))  # ← make sure to use from_markup
+        panel.update(Text.from_markup(chart))
 
 
     # ────────────────────────── compose ──────────────────────────
