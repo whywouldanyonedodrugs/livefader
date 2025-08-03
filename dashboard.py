@@ -190,7 +190,10 @@ class DashboardApp(App):
 
         # ── Live positions table ──
         open_tbl = self.query_one("#open_positions_table")
-        open_tbl.clear()                          # keep headers, drop rows only
+        open_tbl.clear()               # wipes headers + rows
+        open_tbl.add_columns(          # ← PUT THIS LINE BACK
+            "Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)"
+)
 
         # For each open position, pull a ticker individually and compute uPNL
         for pos in open_pos:
@@ -234,10 +237,9 @@ class DashboardApp(App):
         # ── Recent trades table ──
         recent_tbl = self.query_one("#recent_trades_table")
         recent_tbl.clear()
-        for r in recent:
-            recent_tbl.add_row(
-                r["symbol"], f"{r['pnl']:.2f}", r["exit_reason"], f"{r['holding_minutes']:.1f}"
-            )
+        recent_tbl.add_columns(        # ← PUT THIS LINE BACK
+            "Symbol", "PnL", "Exit Reason", "Hold (m)"
+        )
 
 if __name__ == "__main__":
     DashboardApp().run()
