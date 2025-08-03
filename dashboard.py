@@ -110,11 +110,16 @@ class DashboardApp(App):
             y_top, y_bot   = y(h), y(l)
             y_open, y_close = y(o), y(c)
 
+            # ── guarantee visible stem ──
+            if y_top == y_bot:                 # high == low (flat bar)
+                y_top  = max(0,     y_top - 1)
+                y_bot  = min(rows-1, y_bot + 1)
+
             # stem
             for r in range(y_top, y_bot + 1):
                 grid[r][x_mid] = f"[{style}]│[/]"
 
-            # ticks   (open left, close right)
+            # ticks (written after stem so they sit on top)
             grid[y_open ][x_mid - 2] = f"[{style}]──[/]"
             grid[y_close][x_mid + 2] = f"[{style}]──[/]"
 
