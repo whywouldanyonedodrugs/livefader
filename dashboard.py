@@ -79,6 +79,22 @@ class DashboardApp(App):
             rows.append(row)
         return "\n".join(rows)
 
+    # ── tiny helpers to avoid duplicate headers ─────────────────────────
+    @staticmethod
+    def _ensure_live_headers(table: DataTable) -> None:
+        """Add the 6 live-position columns once, if they’re missing."""
+        if table.column_count == 0:                 # ← no headers yet
+            table.add_columns(
+                "Symbol", "Side", "Size",
+                "Entry Price", "Current Price", "UPnL ($)"
+            )
+
+    @staticmethod
+    def _ensure_trade_headers(table: DataTable) -> None:
+        """Add the 4 recent-trade columns once, if they’re missing."""
+        if table.column_count == 0:
+            table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
+
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -190,10 +206,8 @@ class DashboardApp(App):
 
         # ── Live positions table ──
         open_tbl = self.query_one("#open_positions_table")
-        open_tbl.clear()               # wipes headers + rows
-        open_tbl.add_columns(          # ← PUT THIS LINE BACK
-            "Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)"
-)
+        open_tbl.clear()                     # wipe rows *and* headers
+        self._ensure_live_headers(open_tbl)  # ← add headers once
 
         # For each open position, pull a ticker individually and compute uPNL
         for pos in open_pos:
@@ -237,9 +251,15 @@ class DashboardApp(App):
         # ── Recent trades table ──
         recent_tbl = self.query_one("#recent_trades_table")
         recent_tbl.clear()
-        recent_tbl.add_columns(        # ← PUT THIS LINE BACK
-            "Symbol", "PnL", "Exit Reason", "Hold (m)"
-        )
+        self._ensure_trade_headers(recent_tbl)  
+        
+        for r in recent:
+            recent_tbl.add_row(
+                r["symbol"],
+                f"{r['pnl']:.2f}",
+                r["exit_reason"],
+                f"{r['holding_minutes']:.1f}",
+            ) # ← add headers once
 
 if __name__ == "__main__":
     DashboardApp().run()
