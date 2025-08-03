@@ -62,30 +62,25 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
     @staticmethod
-    def _ascii_ohlc_bars_one_char(
+    def _ascii_ohlc_bars_minimal(
         ohlcv: list[list[float]],
-        rows: int = 12,
-        max_bars: int = 20,       # at most 20 bars → width=20 chars
+        rows: int = 12,      # match your CSS chart_box height
+        max_bars: int = 20,  # at most 20 bars ⇒ width = bars*2 cols
     ) -> str:
         """
-        One-char-wide OHLC bar chart:
-        ┬ top of wick
-        │ middle of wick
-        ┴ bottom of wick
-        ├ open tick
-        ┤ close tick
-        ┼ flat candle (open==close)
+        One-col-per-bar OHLC "bar chart":
+        │ marks both high & low
+        ┼ marks the close
+        open is omitted (assumed = prior close)
         """
-
-        # 1) Not enough data?
-        if len(ohlcv) < 2:
+        if len(ohlcv) < 1:
             return "Not enough data."
 
-        # 2) Down-sample to ≤ max_bars
+        # 1) Downsample
         stride = max(1, len(ohlcv) // max_bars)
         bars   = ohlcv[-stride * max_bars :: stride]
 
-        # 3) Determine & pad the global high/low
+        # 2) Compute & pad range
         hi = max(r[2] for r in bars)
         lo = min(r[3] for r in bars)
         span = max(hi - lo, hi * 1e-8)
@@ -94,47 +89,37 @@ class DashboardApp(App):
             pad = (min_span - span) / 2
             hi += pad; lo -= pad; span = hi - lo
 
-        # 4) price → row mapper (0=top, rows-1=bottom)
+        # 3) Price → row mapper (0=top)
         def y(p: float) -> int:
             return int((hi - p) / span * (rows - 1))
 
-        width = len(bars)
+        # 4) Canvas: 2 cols per bar (one for the bar, one blank)
+        width = len(bars) * 2
         grid  = [[" "] * width for _ in range(rows)]
 
-        # 5) Draw each bar into a single column
+        # 5) Draw each bar
         for i, (_, o, h, l, c, _) in enumerate(bars):
-            col = "bright_green" if c >= o else "bright_red"
-
-            y_hi    = y(h)
-            y_lo    = y(l)
-            y_open  = y(o)
+            x      = i * 2
+            y_hi   = y(h)
+            y_lo   = y(l)
             y_close = y(c)
 
-            # ensure at least 2-row stem
+            # ensure at least two-row span if high==low
             if y_hi == y_lo:
                 y_hi = max(0,        y_hi - 1)
                 y_lo = min(rows - 1, y_lo + 1)
-                y_open = y_close = (y_hi + y_lo) // 2
+                y_close = (y_hi + y_lo) // 2
 
-            # 5a: draw the vertical wick
-            for r in range(y_hi, y_lo + 1):
-                char = (
-                    "┬" if r == y_hi and r != y_lo else
-                    "┴" if r == y_lo and r != y_hi else
-                    "┼" if y_hi == y_lo else
-                    "│"
-                )
-                grid[r][i] = f"[{col}]{char}[/]"
+            # mark high & low
+            grid[y_hi][x] = "│"
+            grid[y_lo][x] = "│"
 
-            # 5b: draw open/close ticks on top
-            if y_open == y_close:
-                # flat candle: already marked as ┼
-                continue
-            grid[y_open][i]  = f"[{col}]├[/]"
-            grid[y_close][i] = f"[{col}]┤[/]"
+            # mark close
+            grid[y_close][x] = "┼"
 
-        # 6) flatten to a markup string
+        # 6) Flatten
         return "\n".join("".join(row) for row in grid)
+
 
     
     @staticmethod
@@ -221,16 +206,17 @@ class DashboardApp(App):
                                         # header / empty click
 
         panel = self.query_one("#candle_chart")
-        rows  = panel.size.height
+        rows  = panel.size.height      # dynamically use the widget height
 
-        chart = DashboardApp._ascii_ohlc_bars_one_char(
+        chart = DashboardApp._ascii_ohlc_bars_minimal(
             ohlcv,
             rows=rows,
             max_bars=20,
         )
 
-        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (OHLC)"
-        panel.update(Text.from_markup(chart))
+        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (bars)"
+        panel.update(Text(chart))      # plain text is enough here
+
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
