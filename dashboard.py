@@ -61,17 +61,16 @@ class DashboardApp(App):
         # Last resort: return the spot pair so we at least draw a chart
         return f"{base}/USDT"
 
+    @staticmethod
     def _ascii_ohlc_bars(
         ohlcv: list[list[float]],
         rows: int = 15,
-        max_bars: int = 20,         # 20 bars ⇒ 20×5 = 100 chars max
+        max_bars: int = 20,          # 20 bars ⇒ 20 × 5 = 100 chars
     ) -> str:
         """
         Classic OHLC bar (open tick left, close tick right).
 
-        One bar = 5 text columns:
-            "─│ ─"   (open tick, stem, close tick)
-
+        Each bar occupies five columns:  “──│──”
         • Up-bar  → bright_green
         • Down-bar→ bright_red
         """
@@ -79,51 +78,53 @@ class DashboardApp(App):
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # ── 1) down-sample to ≤ max_bars ─────────────────────────────
+        # 1) down-sample so we never exceed `max_bars`
         stride = max(1, len(ohlcv) // max_bars)
         bars   = ohlcv[-stride * max_bars :: stride]
 
         hi = max(r[2] for r in bars)
         lo = min(r[3] for r in bars)
 
-        # Pad the range to be at least 25 % of widget height
-        target_span = (rows - 1) * 0.25
-        span = max(hi - lo, hi * 1e-8)           # avoid 0 span
-        if span < target_span:
-            pad = (target_span - span) / 2
+        # ensure the vertical span is at least 25 % of widget height
+        span        = max(hi - lo, hi * 1e-8)
+        min_span_px = (rows - 1) * 0.25
+        if span < min_span_px:
+            pad = (min_span_px - span) / 2
             hi += pad
             lo -= pad
             span = hi - lo
 
-        # map price → row
-        def y(p: float) -> int:
-            return int((hi - p) / span * (rows - 1))   # 0 = top
+        # map price → row (0 = top)
+        y = lambda p: int((hi - p) / span * (rows - 1))
 
-        width  = 5 * len(bars)
-        grid   = [[" "] * width for _ in range(rows)]
+        width = 5 * len(bars)
+        grid  = [[" "] * width for _ in range(rows)]
 
         for i, (_, o, h, l, c, _) in enumerate(bars):
-            up   = c >= o
-            style = "bright_green" if up else "bright_red"
+            style = "bright_green" if c >= o else "bright_red"
 
-            x_mid = 5 * i + 2                # columns: 0-1-2-3-4
-            y_top, y_bot   = y(h), y(l)
-            y_open, y_close = y(o), y(c)
+            x_mid = 5 * i + 2             # columns 0-1-2-3-4
+            y_hi, y_lo   = y(h), y(l)
+            y_open       = y(o)
+            y_close      = y(c)
 
-            # ── guarantee visible stem ──
-            if y_top == y_bot:                 # high == low (flat bar)
-                y_top  = max(0,     y_top - 1)
-                y_bot  = min(rows-1, y_bot + 1)
+            # ── guarantee a visible stem (≥2 rows) ──
+            if y_hi == y_lo:
+                y_hi = max(0, y_hi - 1)
+                y_lo = min(rows - 1, y_lo + 1)
+                # re-centre ticks on the widened stem
+                y_open  = y_close = (y_hi + y_lo) // 2
 
             # stem
-            for r in range(y_top, y_bot + 1):
+            for r in range(y_hi, y_lo + 1):
                 grid[r][x_mid] = f"[{style}]│[/]"
 
-            # ticks (written after stem so they sit on top)
+            # ticks (drawn after stem so they sit on top)
             grid[y_open ][x_mid - 2] = f"[{style}]──[/]"
             grid[y_close][x_mid + 2] = f"[{style}]──[/]"
 
         return "\n".join("".join(r) for r in grid)
+
 
     
     @staticmethod
