@@ -205,13 +205,16 @@ class DashboardApp(App):
         panel = self.query_one("#candle_chart")
         panel.border_title = f"{pair} – {len(ohlcv)}×15m (bars)"
 
-        # FIX: use a fixed chart height (8 rows of bars)
+        # draw an 8-row high bar chart
         chart = DashboardApp._ascii_ohlc_bars_minimal_colored(
             ohlcv,
             rows=8,
             max_bars=20,
         )
-        panel.update(Text.from_markup(chart), markup=False)
+
+        # Wrap your markup string in Text.from_markup, then update() with that Text.
+        panel.update(Text.from_markup(chart))
+
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
