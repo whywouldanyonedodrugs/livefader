@@ -11,6 +11,8 @@ from textual.timer import Timer
 from rich.text import Text
 from textual.message import Message
 from textual.events import Click
+from textual import on            # ← add this
+
 
 REFRESH_INTERVAL_SECONDS = 10  # dashboard update cadence
 
