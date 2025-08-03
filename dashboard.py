@@ -180,8 +180,8 @@ class DashboardApp(App):
 
                                         # header / empty click
 
-        chart  = self._ascii_candles(ohlcv)          # already 15-minute data
-        panel  = self.query_one("#candle_chart")     # ← NEW box
+        chart = DashboardApp._ascii_candles(ohlcv)     # ← change this line
+        panel = self.query_one("#candle_chart")
         panel.border_title = f"{pair} – {len(ohlcv)} × 15 m"
         panel.update(Text(chart, style="yellow"))
 
