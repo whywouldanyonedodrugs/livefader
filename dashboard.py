@@ -190,30 +190,50 @@ class DashboardApp(App):
 
         # ── Live positions table ──
         open_tbl = self.query_one("#open_positions_table")
-        open_tbl.clear()  # clears both headers & rows
-        open_tbl.add_columns("Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)")
+        open_tbl.clear()                          # keep headers, drop rows only
 
-        pair_keys = [self._db_sym_to_pair(p["symbol"]) for p in open_pos]
-        try:
-            tickers = await self.exchange.fetch_tickers(pair_keys) if pair_keys else {}
-        except Exception:
-            tickers = {}
+        # For each open position, pull a ticker individually and compute uPNL
+        for pos in open_pos:
+            # build a list of symbol strings to try with Bybit:
+            #   1) the perpetual form (BTCUSDT)
+            #   2) the spot-style form (BTC/USDT)
+            #   3) whatever string was stored in the DB
+            base  = pos["symbol"].replace("USDT", "").replace("/", "")
+            attempts = [
+                f"{base}USDT",          # Bybit perp
+                f"{base}/USDT",         # generic spot
+                pos["symbol"],          # stored value
+            ]
 
-        for p in open_pos:
-            pair = self._db_sym_to_pair(p["symbol"])
-            last = tickers.get(pair, {}).get("last", 0.0)
-            entry = float(p["entry_price"])
-            size  = float(p["size"])
-            upnl  = (entry - last) * size if p["side"].lower() == "short" else (last - entry) * size
+            last_price = 0.0
+            for sym in attempts:
+                try:
+                    tick = await self.exchange.fetch_ticker(sym)
+                    last_price = tick.get("last") or 0.0
+                except Exception:
+                    last_price = 0.0
+                if last_price:
+                    break   # stop at the first successful lookup
+
+            entry_price = float(pos["entry_price"])
+            size = float(pos["size"])
+            if pos["side"].lower() == "short":
+                upnl = (entry_price - last_price) * size
+            else:
+                upnl = (last_price - entry_price) * size
+
             open_tbl.add_row(
-                p["symbol"], p["side"], f"{size}",
-                f"{entry:.5f}", f"{last:.5f}", f"{upnl:+.2f}"
+                pos["symbol"],
+                pos["side"],
+                f"{size}",
+                f"{entry_price:.5f}",
+                f"{last_price:.5f}",
+                f"{upnl:+.2f}",
             )
 
         # ── Recent trades table ──
         recent_tbl = self.query_one("#recent_trades_table")
         recent_tbl.clear()
-        recent_tbl.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
         for r in recent:
             recent_tbl.add_row(
                 r["symbol"], f"{r['pnl']:.2f}", r["exit_reason"], f"{r['holding_minutes']:.1f}"
