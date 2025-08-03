@@ -40,6 +40,27 @@ class DashboardApp(App):
     # ────────────────────────── helpers ──────────────────────────
 
     @staticmethod
+    def _resolve_perp_symbol(exchange, raw: str) -> str:
+        """
+        Return a CCXT-recognised symbol for a USDT-perp.
+
+        • raw can be 'BTCUSDT', '1000TOSHIUSDT', 'BTC/USDT', etc.
+        • Result will be something like 'BTC/USDT:USDT' or unchanged if already OK.
+        """
+        raw = raw.upper().replace("/", "")
+        base = raw.replace("USDT", "")
+        # Most Bybit USDT-perps are shaped like 'BASE/USDT:USDT'
+        perp = f"{base}/USDT:USDT"
+        if perp in exchange.markets:
+            return perp
+        # Fallback to the raw value if CCXT already knows it
+        if raw in exchange.markets:
+            return exchange.markets[raw]["symbol"]
+        # Last resort: return the spot pair so we at least draw a chart
+        return f"{base}/USDT"
+
+
+    @staticmethod
     def _ascii_candles(ohlcv: list[list[float]], rows: int = 15) -> str:
         """
         Given a list of [ts, open, high, low, close, vol] rows (oldest→newest),
@@ -143,6 +164,9 @@ class DashboardApp(App):
             sym = table.get_cell_at((row_i, 0))             # first column = Symbol
         except Exception:
             return                                          # header / empty click
+
+        await self.exchange.load_markets()        # guarantees .markets is ready
+        pair = self._resolve_perp_symbol(self.exchange, raw_sym)
 
         pair  = self._db_sym_to_pair(sym)
         try:
