@@ -62,37 +62,38 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
 
-    @staticmethod
-    def _ascii_candles(ohlcv: list[list[float]], rows: int = 15) -> str:
+    def _ascii_candles(ohlcv: list[list[float]],
+                    rows: int = 15, max_cols: int = 40) -> str:
         """
-        Given a list of [ts, open, high, low, close, vol] rows (oldest→newest),
-        return a multiline string that looks like a mini candlestick chart.
+        Return an ASCII candlestick chart that never exceeds `max_cols` columns.
+        Each candle uses exactly one text column, so the output always fits.
         """
         if len(ohlcv) < 2:
             return "Not enough data."
-        highs  = [r[2] for r in ohlcv]
-        lows   = [r[3] for r in ohlcv]
-        h, l   = max(highs), min(lows)
-        if h == l:
-            h += 1e-8  # avoid div/0
 
-        # normalise to 0-rows scale
-        def y(price):
-            return int((price - l) / (h - l) * (rows - 1))
+        # ▸ down-sample to <= max_cols bars
+        step = max(1, len(ohlcv) // max_cols)
+        samples = ohlcv[-step * max_cols :: step]
 
-        grid = [["   "] * len(ohlcv) for _ in range(rows)]
-        for x, (_, o, hi, lo, c, _) in enumerate(ohlcv):
-            top, bot = y(hi), y(lo)
-            body_top, body_bot = y(max(o, c)), y(min(o, c))
-            col = "█" if c >= o else "░"
+        highs = [r[2] for r in samples]
+        lows  = [r[3] for r in samples]
+        hi, lo = max(highs), min(lows)
+        scale = rows - 1
+        y = lambda p: int((p - lo) / (hi - lo or 1e-9) * scale)
 
-            # wicks
-            for y_ in range(bot, top + 1):
-                grid[rows - 1 - y_][x] = "│ "
+        grid = [[" "] * len(samples) for _ in range(rows)]
 
+        for x, (_, o, h, l, c, _) in enumerate(samples):
+            top, bot = y(h), y(l)
+            body_t, body_b = y(max(o, c)), y(min(o, c))
+            body_char = "█" if c >= o else "░"
+
+            # wick
+            for r in range(bot, top + 1):
+                grid[scale - r][x] = "│"
             # body
-            for y_ in range(body_bot, body_top + 1):
-                grid[rows - 1 - y_][x] = f"{col} "
+            for r in range(body_b, body_t + 1):
+                grid[scale - r][x] = body_char
 
         return "\n".join("".join(row) for row in grid)
 
@@ -179,10 +180,10 @@ class DashboardApp(App):
 
                                         # header / empty click
 
-        chart = self._ascii_candles(ohlcv)
-        box   = self.query_one("#equity_chart")
-        box.border_title = f"{pair} – last 50×1 h"
-        box.update(Text(chart, style="yellow"))
+        chart  = self._ascii_candles(ohlcv)          # already 15-minute data
+        panel  = self.query_one("#candle_chart")     # ← NEW box
+        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m"
+        panel.update(Text(chart, style="yellow"))
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
@@ -195,6 +196,7 @@ class DashboardApp(App):
                 yield Static("", classes="kpi_box", id="kpi_profit_factor")
                 yield Static("", classes="kpi_box", id="kpi_open_positions")
             yield Static("", classes="chart_box", id="equity_chart")
+            yield Static("", classes="chart_box", id="candle_chart")
             yield Static("", classes="chart_box", id="regime_chart")
             yield Static("", classes="chart_box", id="session_chart")
             yield DataTable(id="open_positions_table")
@@ -210,6 +212,8 @@ class DashboardApp(App):
         self.exchange = None
 
     async def on_mount(self) -> None:
+        self.query_one("#candle_chart").border_title = "15-min Preview"
+
         if not self.db_dsn:
             self.query_one("#kpi_pnl").update("DB_DSN not set")
             return
