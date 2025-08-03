@@ -182,18 +182,17 @@ class DashboardApp(App):
         if not table.columns:
             table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
-    @on(DataTable.RowHighlighted)          # or RowSelected
+    @on(DataTable.RowHighlighted)
     async def on_data_table_row_highlighted(
         self, message: DataTable.RowHighlighted
     ) -> None:
         table = message.control
-        row_i = message.cursor_row
+        row   = message.cursor_row
         try:
-            raw_sym = table.get_cell_at((row_i, 0))   # first column = Symbol
+            raw_sym = table.get_cell_at((row, 0))
         except Exception:
-            return                                    # header / empty click
+            return
 
-        # build a valid Bybit symbol (perp or spot) and fetch 15-minute candles
         await self.exchange.load_markets()
         pair = self._resolve_perp_symbol(self.exchange, raw_sym)
 
@@ -203,21 +202,16 @@ class DashboardApp(App):
             self.query_one("#equity_chart").update(f"Failed to fetch OHLCV: {e}")
             return
 
-                                        # header / empty click
-
         panel = self.query_one("#candle_chart")
-        rows  = panel.size.height
+        panel.border_title = f"{pair} – {len(ohlcv)}×15m (bars)"
 
+        # FIX: use a fixed chart height (8 rows of bars)
         chart = DashboardApp._ascii_ohlc_bars_minimal_colored(
             ohlcv,
-            rows=rows,
+            rows=8,
             max_bars=20,
         )
-
-        panel.border_title = f"{pair} – {len(ohlcv)}×15m (bars)"
-        panel.update(Text.from_markup(chart))
-   # plain text is enough here
-
+        panel.update(Text.from_markup(chart), markup=False)
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
