@@ -62,25 +62,25 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
     @staticmethod
-    def _ascii_ohlc_bars_minimal(
+    def _ascii_ohlc_bars_minimal_colored(
         ohlcv: list[list[float]],
-        rows: int = 12,      # match your CSS chart_box height
-        max_bars: int = 20,  # at most 20 bars ⇒ width = bars*2 cols
+        rows: int = 12,      # match chart_box height
+        max_bars: int = 20,  # width = bars * 2
     ) -> str:
         """
-        One-col-per-bar OHLC "bar chart":
-        │ marks both high & low
-        ┼ marks the close
-        open is omitted (assumed = prior close)
+        One-col-per-bar OHLC chart:
+        │ marks high & low
+        ┼ marks close
+        Bars are colored green on upticks (close ≥ open), red on downticks.
         """
         if len(ohlcv) < 1:
             return "Not enough data."
 
-        # 1) Downsample
+        # 1) Down-sample
         stride = max(1, len(ohlcv) // max_bars)
         bars   = ohlcv[-stride * max_bars :: stride]
 
-        # 2) Compute & pad range
+        # 2) Global high/low & padding
         hi = max(r[2] for r in bars)
         lo = min(r[3] for r in bars)
         span = max(hi - lo, hi * 1e-8)
@@ -89,37 +89,37 @@ class DashboardApp(App):
             pad = (min_span - span) / 2
             hi += pad; lo -= pad; span = hi - lo
 
-        # 3) Price → row mapper (0=top)
+        # 3) Price→row mapper
         def y(p: float) -> int:
             return int((hi - p) / span * (rows - 1))
 
-        # 4) Canvas: 2 cols per bar (one for the bar, one blank)
+        # 4) Canvas (2 cols per bar)
         width = len(bars) * 2
         grid  = [[" "] * width for _ in range(rows)]
 
         # 5) Draw each bar
         for i, (_, o, h, l, c, _) in enumerate(bars):
             x      = i * 2
+            color  = "bright_green" if c >= o else "bright_red"
+
             y_hi   = y(h)
             y_lo   = y(l)
             y_close = y(c)
 
-            # ensure at least two-row span if high==low
+            # ensure 2-row stem if flat
             if y_hi == y_lo:
                 y_hi = max(0,        y_hi - 1)
                 y_lo = min(rows - 1, y_lo + 1)
                 y_close = (y_hi + y_lo) // 2
 
-            # mark high & low
-            grid[y_hi][x] = "│"
-            grid[y_lo][x] = "│"
+            # draw high & low (the “wick”)
+            grid[y_hi][x] = f"[{color}]│[/]"
+            grid[y_lo][x] = f"[{color}]│[/]"
 
-            # mark close
-            grid[y_close][x] = "┼"
+            # draw close (the “body”)
+            grid[y_close][x] = f"[{color}]┼[/]"
 
-        # 6) Flatten
         return "\n".join("".join(row) for row in grid)
-
 
     
     @staticmethod
@@ -206,16 +206,17 @@ class DashboardApp(App):
                                         # header / empty click
 
         panel = self.query_one("#candle_chart")
-        rows  = panel.size.height      # dynamically use the widget height
+        rows  = panel.size.height
 
-        chart = DashboardApp._ascii_ohlc_bars_minimal(
+        chart = DashboardApp._ascii_ohlc_bars_minimal_colored(
             ohlcv,
             rows=rows,
             max_bars=20,
         )
 
-        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (bars)"
-        panel.update(Text(chart))      # plain text is enough here
+        panel.border_title = f"{pair} – {len(ohlcv)}×15m (bars)"
+        panel.update(Text.from_markup(chart))
+   # plain text is enough here
 
 
     # ────────────────────────── compose ──────────────────────────
