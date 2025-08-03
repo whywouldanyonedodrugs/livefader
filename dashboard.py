@@ -85,8 +85,15 @@ class DashboardApp(App):
         hi = max(r[2] for r in data)
         lo = min(r[3] for r in data)
         span = (hi - lo) or 1e-9
-        rows_minus1 = rows - 1
-        y = lambda p: int((p - lo) / span * rows_minus1)
+        compress = 0.60                       # 0 – 1  (smaller ⇒ “squash” bars)
+        usable   = max(1, int(rows * compress))
+        pad_top  = (rows - usable) // 2       # equal top / bottom padding
+        pad_bot  = rows - usable - pad_top
+        rows_minus1 = usable - 1
+
+        # map price → y within the compressed band
+        def y(price: float) -> int:
+            return pad_top + int((price - lo) / (hi - lo or 1e-9) * rows_minus1)
 
         width  = 3 * len(data)                      # 3 characters per bar
         canvas = [[" "] * width for _ in range(rows)]
