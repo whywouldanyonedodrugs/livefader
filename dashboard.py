@@ -204,11 +204,11 @@ class DashboardApp(App):
 
         panel = self.query_one("#candle_chart")
         panel.border_title = f"{pair} – {len(ohlcv)}×15m (bars)"
-
+        rows_available  = panel.content_region.height  
         # draw an 8-row high bar chart
         chart = DashboardApp._ascii_ohlc_bars_minimal_colored(
             ohlcv,
-            rows=8,
+            rows=rows_available,,
             max_bars=20,
         )
 
