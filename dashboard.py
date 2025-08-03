@@ -173,7 +173,7 @@ class DashboardApp(App):
         pair = self._resolve_perp_symbol(self.exchange, raw_sym)
 
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="1h", limit=96)
+            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="30m", limit=8)
         except Exception as e:
             self.query_one("#equity_chart").update(f"Failed to fetch OHLCV: {e}")
             return
@@ -182,7 +182,7 @@ class DashboardApp(App):
 
         chart = DashboardApp._ascii_candles(ohlcv)     # ← change this line
         panel = self.query_one("#candle_chart")
-        panel.border_title = f"{pair} – {len(ohlcv)} × 1h"
+        panel.border_title = f"{pair} – {len(ohlcv)} × 30m"
         panel.update(Text(chart, style="yellow"))
 
     # ────────────────────────── compose ──────────────────────────
