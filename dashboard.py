@@ -110,21 +110,28 @@ class DashboardApp(App):
         width  = 3 * len(data)                      # 3 characters per bar
         canvas = [[" "] * width for _ in range(rows)]
 
+        min_height = 3                      # ← never render a bar shorter than this
+
         for i, (_, o, h, l, c, _) in enumerate(data):
             col  = "bright_green" if c >= o else "bright_red"
-            x0   = 3 * i + 1                        # centre column for the stem
-            top, bot      = y(h), y(l)
-            y_open, y_close = y(o), y(c)
+            x0   = 3 * i + 1
 
-            # stem (vertical line)
+            # 1️⃣ map prices to rows, force at least min_height
+            top, bot = y(h), y(l)
+            if top - bot + 1 < min_height:
+                pad = (min_height - (top - bot + 1)) // 2
+                top += pad
+                bot -= pad
+            body_open  = y(o)
+            body_close = y(c)
+
+            # 2️⃣ draw the vertical stem first
             for r in range(bot, top + 1):
-                canvas[rows_minus1 - r][x0] = f"[{col}]│[/]"
+                canvas[r][x0] = f"[{col}]│[/]"
 
-            # open tick (left)
-            canvas[rows_minus1 - y_open][x0 - 1] = f"[{col}]─[/]"
-
-            # close tick (right)
-            canvas[rows_minus1 - y_close][x0 + 1] = f"[{col}]─[/]"
+            # 3️⃣ overwrite with ticks (so they lie on top)
+            canvas[body_open][x0 - 1] = f"[{col}]─[/]"
+            canvas[body_close][x0 + 1] = f"[{col}]─[/]"
 
         # join rows
         lines = ["".join(r) for r in canvas]
