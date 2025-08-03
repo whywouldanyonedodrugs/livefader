@@ -61,59 +61,62 @@ class DashboardApp(App):
         # Last resort: return the spot pair so we at least draw a chart
         return f"{base}/USDT"
 
-    @staticmethod
     def _ascii_ohlc_bars(
         ohlcv: list[list[float]],
         rows: int = 15,
-        max_bars: int = 30,
-        min_height: int = 5,           # 👈 at least this tall
+        max_bars: int = 20,         # 20 bars ⇒ 20×5 = 100 chars max
     ) -> str:
         """
         Classic OHLC bar (open tick left, close tick right).
-        One bar = 3 text columns, colour-coded:
-        • bright_green = close ≥ open
-        • bright_red   = close <  open
+
+        One bar = 5 text columns:
+            "─│ ─"   (open tick, stem, close tick)
+
+        • Up-bar  → bright_green
+        • Down-bar→ bright_red
         """
 
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # — 1) down-sample so we never exceed max_bars —
-        step  = max(1, len(ohlcv) // max_bars)
-        data  = ohlcv[-step * max_bars :: step]
+        # ── 1) down-sample to ≤ max_bars ─────────────────────────────
+        stride = max(1, len(ohlcv) // max_bars)
+        bars   = ohlcv[-stride * max_bars :: stride]
 
-        # allocate canvas (rows × 3·bars)
-        W = 3 * len(data)
-        grid = [[" "] * W for _ in range(rows)]
+        hi = max(r[2] for r in bars)
+        lo = min(r[3] for r in bars)
 
-        # helper: centre one bar inside the full height
-        def y_map(high: float, low: float, price: float) -> int:
-            span = max(high - low, 1e-9)
-            # force stem to be ≥ min_height
-            span = max(span, 1 / rows * min_height * span)
-            mid  = (high + low) / 2
-            half = span / 2
-            offset = (price - mid) / half
-            return int(rows // 2 - offset * (rows // 2 - 1))
+        # Pad the range to be at least 25 % of widget height
+        target_span = (rows - 1) * 0.25
+        span = max(hi - lo, hi * 1e-8)           # avoid 0 span
+        if span < target_span:
+            pad = (target_span - span) / 2
+            hi += pad
+            lo -= pad
+            span = hi - lo
 
-        for idx, (_, o, h, l, c, _) in enumerate(data):
+        # map price → row
+        def y(p: float) -> int:
+            return int((hi - p) / span * (rows - 1))   # 0 = top
+
+        width  = 5 * len(bars)
+        grid   = [[" "] * width for _ in range(rows)]
+
+        for i, (_, o, h, l, c, _) in enumerate(bars):
             up   = c >= o
-            clr  = "bright_green" if up else "bright_red"
-            xmid = 3 * idx + 1           # centre column of this bar
+            style = "bright_green" if up else "bright_red"
 
-            # map prices → rows
-            top = y_map(h, l, h)
-            bot = y_map(h, l, l)
-            y_open  = y_map(h, l, o)
-            y_close = y_map(h, l, c)
+            x_mid = 5 * i + 2                # columns: 0-1-2-3-4
+            y_top, y_bot   = y(h), y(l)
+            y_open, y_close = y(o), y(c)
 
-            # draw stem first
-            for r in range(min(top, bot), max(top, bot) + 1):
-                grid[r][xmid] = f"[{clr}]│[/]"
+            # stem
+            for r in range(y_top, y_bot + 1):
+                grid[r][x_mid] = f"[{style}]│[/]"
 
-            # overwrite with ticks so they sit on top of the stem
-            grid[y_open ][xmid - 1] = f"[{clr}]─[/]"
-            grid[y_close][xmid + 1] = f"[{clr}]─[/]"
+            # ticks   (open left, close right)
+            grid[y_open ][x_mid - 2] = f"[{style}]──[/]"
+            grid[y_close][x_mid + 2] = f"[{style}]──[/]"
 
         return "\n".join("".join(r) for r in grid)
 
@@ -201,8 +204,8 @@ class DashboardApp(App):
 
                                         # header / empty click
 
-        chart  = DashboardApp._ascii_ohlc_bars(ohlcv, rows=15, max_bars=30)
-        panel  = self.query_one("#candle_chart")
+        chart = DashboardApp._ascii_ohlc_bars(ohlcv, rows=15, max_bars=20)
+        panel = self.query_one("#candle_chart")
         panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (OHLC)"
         panel.update(Text.from_markup(chart))
 
