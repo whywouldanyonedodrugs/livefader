@@ -30,9 +30,9 @@ class DashboardApp(App):
     # --- CSS for the "oldschool" layout and amber theme ---
     CSS = """
     Screen {
-        /* FIX: Apply the color directly instead of using a variable */
+        /* Set the global text color to amber */
         color: #FFBF00;
-        border-color: #FFBF00;
+        /* FIX: Removed the invalid 'border-color' property. */
     }
     #main_container {
         layout: grid;
@@ -53,7 +53,6 @@ class DashboardApp(App):
         height: 5;
     }
     .kpi_box {
-        /* FIX: Apply the color directly */
         border: heavy #FFBF00;
         border-title-align: center;
     }
@@ -62,7 +61,6 @@ class DashboardApp(App):
         padding-top: 1;
     }
     DataTable {
-        /* FIX: Apply the color directly */
         border: heavy #FFBF00;
         border-title-align: center;
         height: 12;
