@@ -62,58 +62,70 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
     @staticmethod
-    def _ascii_bars(
+    def _ascii_ohlc_bars(
         ohlcv: list[list[float]],
         rows: int = 15,
-        max_cols: int = 50,
-        centre: bool = True,
+        max_bars: int = 30,        # number of OHLC bars, not text columns
+        centre_h: bool = True,
+        centre_v: bool = True,
     ) -> str:
         """
-        ASCII bar-style candle chart (1 char wide) with colour:
+        Return coloured OHLC bars (open tick left, close tick right).
 
-        • bright_yellow  → up-bar  (close ≥ open)
-        • bright_magenta → down-bar
-
-        The chart is down-sampled to ≤ `max_cols` bars and centred horizontally
-        if `centre` is True.
+        • Up-bar  (close ≥ open) → bright_green
+        • Down-bar                → bright_red
         """
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        step  = max(1, len(ohlcv) // max_cols)
-        bars  = ohlcv[-step * max_cols :: step]
+        # ▸ down-sample so we never draw more than max_bars bars
+        stride = max(1, len(ohlcv) // max_bars)
+        data   = ohlcv[-stride * max_bars :: stride]
 
-        hi = max(r[2] for r in bars)
-        lo = min(r[3] for r in bars)
-        span = hi - lo or 1e-9
-        scale = rows - 1
-        y = lambda p: int((p - lo) / span * scale)
+        hi = max(r[2] for r in data)
+        lo = min(r[3] for r in data)
+        span = (hi - lo) or 1e-9
+        rows_minus1 = rows - 1
+        y = lambda p: int((p - lo) / span * rows_minus1)
 
-        grid = [[" "]*len(bars) for _ in range(rows)]
+        width  = 3 * len(data)                      # 3 characters per bar
+        canvas = [[" "] * width for _ in range(rows)]
 
-        for x, (_, o, h, l, c, _) in enumerate(bars):
-            up  = c >= o
-            wick_style  = "bright_yellow"  if up else "bright_magenta"
-            body_style  = "yellow"         if up else "magenta"
+        for i, (_, o, h, l, c, _) in enumerate(data):
+            col  = "bright_green" if c >= o else "bright_red"
+            x0   = 3 * i + 1                        # centre column for the stem
+            top, bot      = y(h), y(l)
+            y_open, y_close = y(o), y(c)
 
-            top, bot         = y(h), y(l)
-            body_top, body_b = y(max(o, c)), y(min(o, c))
-
-            # wick (dim colour)
+            # stem (vertical line)
             for r in range(bot, top + 1):
-                grid[scale - r][x] = f"[{wick_style}]│[/]"
+                canvas[rows_minus1 - r][x0] = f"[{col}]│[/]"
 
-            # body (solid colour)
-            for r in range(body_b, body_top + 1):
-                grid[scale - r][x] = f"[{body_style}]█[/]"
+            # open tick (left)
+            canvas[rows_minus1 - y_open][x0 - 1] = f"[{col}]─[/]"
 
-        # assemble rows
-        lines = ["".join(row) for row in grid]
+            # close tick (right)
+            canvas[rows_minus1 - y_close][x0 + 1] = f"[{col}]─[/]"
 
-        # optional horizontal centring
-        if centre and len(bars) < max_cols:
-            pad = " " * ((max_cols - len(bars)) // 2)
+        # join rows
+        lines = ["".join(r) for r in canvas]
+
+        # horizontal centring
+        if centre_h and len(data) < max_bars:
+            pad_cols = (max_bars - len(data)) // 2 * 3
+            pad = " " * pad_cols
             lines = [pad + ln + pad for ln in lines]
+
+        # vertical centring
+        if centre_v:
+            non_blank = [i for i, ln in enumerate(lines) if ln.strip()]
+            if non_blank:
+                top, bot = min(non_blank), max(non_blank)
+                used = bot - top + 1
+                pad_top  = (rows - used) // 2
+                pad_bot  = rows - used - pad_top
+                blank    = " " * len(lines[0])
+                lines = [blank]*pad_top + lines[top:bot+1] + [blank]*pad_bot
 
         return "\n".join(lines)
 
@@ -201,10 +213,10 @@ class DashboardApp(App):
 
                                         # header / empty click
 
-        chart = DashboardApp._ascii_bars(ohlcv, rows=15, max_cols=50)
-        panel = self.query_one("#candle_chart")
+        chart  = DashboardApp._ascii_ohlc_bars(ohlcv, rows=15, max_bars=30)
+        panel  = self.query_one("#candle_chart")
+        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m  (OHLC)"
         panel.update(Text.from_markup(chart))
-        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m  (bar view)"
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
