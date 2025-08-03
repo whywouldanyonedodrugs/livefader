@@ -89,11 +89,23 @@ class DashboardApp(App):
         usable   = max(1, int(rows * compress))
         pad_top  = (rows - usable) // 2       # equal top / bottom padding
         pad_bot  = rows - usable - pad_top
-        rows_minus1 = usable - 1
+        
+        # --- vertical mapping: centre on mid-price --------------------------
+        mid   = (hi + lo) / 2
+        half  = max(hi - mid, mid - lo) or 1e-9        # symmetric span
+        center_row  = rows // 2                        # zero-based
+        scale_rows  = rows // 2 - 1                    # rows above / below mid
 
-        # map price → y within the compressed band
         def y(price: float) -> int:
-            return pad_top + int((price - lo) / (hi - lo or 1e-9) * rows_minus1)
+            """
+            Map price → row index such that
+            mid  → center_row
+            mid+half → top of band
+            mid-half → bottom of band
+            """
+            offset = (price - mid) / half
+            return int(center_row - offset * scale_rows)
+
 
         width  = 3 * len(data)                      # 3 characters per bar
         canvas = [[" "] * width for _ in range(rows)]
