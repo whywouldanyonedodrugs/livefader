@@ -8,6 +8,9 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, DataTable
 from textual.containers import Container
 from textual.timer import Timer
+from rich.text import Text
+from textual.message import Message
+from textual.events import Click
 
 REFRESH_INTERVAL_SECONDS = 10  # dashboard update cadence
 
@@ -35,6 +38,41 @@ class DashboardApp(App):
     BINDINGS = [("q", "quit", "Quit")]
 
     # ────────────────────────── helpers ──────────────────────────
+
+    @staticmethod
+    def _ascii_candles(ohlcv: list[list[float]], rows: int = 15) -> str:
+        """
+        Given a list of [ts, open, high, low, close, vol] rows (oldest→newest),
+        return a multiline string that looks like a mini candlestick chart.
+        """
+        if len(ohlcv) < 2:
+            return "Not enough data."
+        highs  = [r[2] for r in ohlcv]
+        lows   = [r[3] for r in ohlcv]
+        h, l   = max(highs), min(lows)
+        if h == l:
+            h += 1e-8  # avoid div/0
+
+        # normalise to 0-rows scale
+        def y(price):
+            return int((price - l) / (h - l) * (rows - 1))
+
+        grid = [["   "] * len(ohlcv) for _ in range(rows)]
+        for x, (_, o, hi, lo, c, _) in enumerate(ohlcv):
+            top, bot = y(hi), y(lo)
+            body_top, body_bot = y(max(o, c)), y(min(o, c))
+            col = "█" if c >= o else "░"
+
+            # wicks
+            for y_ in range(bot, top + 1):
+                grid[rows - 1 - y_][x] = "│ "
+
+            # body
+            for y_ in range(body_bot, body_top + 1):
+                grid[rows - 1 - y_][x] = f"{col} "
+
+        return "\n".join("".join(row) for row in grid)
+
     @staticmethod
     def _db_sym_to_pair(symbol: str) -> str:
         """
@@ -95,6 +133,30 @@ class DashboardApp(App):
         if not table.columns:
             table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
+    async def on_data_table_row_highlighted(self, message: DataTable.RowHighlighted) -> None:
+        """
+        When the user presses <Enter> or clicks a row, show a 1h ASCII candle chart
+        for that symbol beneath the KPI boxes.
+        """
+        table = message.sender
+        sym   = table.get_cell(message.row_key, 0)  # first column = symbol
+
+        # Convert DB symbol → exchange pair
+        pair  = self._db_sym_to_pair(sym)
+
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="1h", limit=50)
+        except Exception as e:
+            self.query_one("#equity_chart").update(f"Failed to fetch OHLCV: {e}")
+            return
+
+        chart_text = self._ascii_candles(ohlcv)
+        # You can pipe this into any widget you like.
+        # Here we reuse the equity_chart box:
+        box = self.query_one("#equity_chart")
+        box.border_title = f"{pair} – last 50×1 h"
+        box.update(Text(chart_text, style="yellow"))
+
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -143,6 +205,11 @@ class DashboardApp(App):
 
         self.set_interval(REFRESH_INTERVAL_SECONDS, self.update_data)
         await self.update_data()
+
+        open_tbl = self.query_one("#open_positions_table")
+        open_tbl.cursor_type  = "row"
+        open_tbl.show_cursor  = True
+        open_tbl.focus()   
 
     async def on_unmount(self) -> None:
         if self.exchange:
@@ -260,6 +327,7 @@ class DashboardApp(App):
                 r["exit_reason"],
                 f"{r['holding_minutes']:.1f}",
             ) # ← add headers once
+            
 
 if __name__ == "__main__":
     DashboardApp().run()
