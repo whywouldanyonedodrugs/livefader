@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Static, DataTable
+from textual.widgets import Header, Footer, Static, DataTable, Sparkline
 from textual.containers import Container
 from textual.timer import Timer
 
@@ -25,18 +25,16 @@ ASCII_LOGO = r"""
 """
 
 class DashboardApp(App):
-    """A retro, amber-themed TUI dashboard for the trading bot."""
+    """A retro, multi-panel TUI dashboard for the trading bot."""
 
-    # --- CSS for the "oldschool" layout and amber theme ---
+    # --- CSS for the advanced layout and amber theme ---
     CSS = """
     Screen {
-        /* Set the global text color to amber */
         color: #FFBF00;
-        /* FIX: Removed the invalid 'border-color' property. */
     }
     #main_container {
         layout: grid;
-        grid-size: 2 2;
+        grid-size: 2 4;
         grid-gutter: 1;
         padding: 0 1;
     }
@@ -52,18 +50,21 @@ class DashboardApp(App):
         grid-gutter: 1;
         height: 5;
     }
+    #equity_container {
+        column-span: 2;
+        height: 7;
+        border: heavy #FFBF00;
+        border-title-align: center;
+        padding: 1;
+    }
     .kpi_box {
         border: heavy #FFBF00;
         border-title-align: center;
     }
-    .kpi_value {
-        text-align: center;
-        padding-top: 1;
-    }
     DataTable {
         border: heavy #FFBF00;
         border-title-align: center;
-        height: 12;
+        height: 14;
     }
     """
 
@@ -87,6 +88,10 @@ class DashboardApp(App):
                 yield Static("", classes="kpi_box", id="kpi_profit_factor")
                 yield Static("", classes="kpi_box", id="kpi_open_positions")
             
+            # --- NEW WIDGET ---
+            with Container(id="equity_container"):
+                yield Sparkline([], summary_function=max)
+
             yield DataTable(id="open_positions_table")
             yield DataTable(id="recent_trades_table")
         yield Footer()
@@ -104,13 +109,14 @@ class DashboardApp(App):
         self.query_one("#kpi_win_rate").border_title = "Win Rate"
         self.query_one("#kpi_profit_factor").border_title = "Profit Factor"
         self.query_one("#kpi_open_positions").border_title = "Open Positions"
+        self.query_one("#equity_container").border_title = "Equity Curve (Last 100 Snapshots)"
 
         open_pos_table = self.query_one("#open_positions_table")
         open_pos_table.border_title = "Live Positions"
         open_pos_table.add_columns("Symbol", "Side", "Size", "Entry Price")
         
         recent_trades_table = self.query_one("#recent_trades_table")
-        recent_trades_table.border_title = "Last 5 Closed Trades"
+        recent_trades_table.border_title = "Last 10 Closed Trades"
         recent_trades_table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
         self.update_timer: Timer = self.set_interval(REFRESH_INTERVAL_SECONDS, self.update_data)
@@ -122,6 +128,7 @@ class DashboardApp(App):
             return
 
         try:
+            # --- EXPANDED QUERIES ---
             kpi_query = """
                 SELECT
                     (SELECT COUNT(*) FROM positions WHERE status = 'OPEN') as open_positions,
@@ -131,22 +138,34 @@ class DashboardApp(App):
                     (SELECT SUM(pnl) FROM positions WHERE status = 'CLOSED' AND pnl > 0) as gross_profit,
                     (SELECT SUM(pnl) FROM positions WHERE status = 'CLOSED' AND pnl < 0) as gross_loss
             """
-            kpis = await self.pool.fetchrow(kpi_query)
+            open_pos_query = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
+            recent_trades_query = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 10"
+            equity_query = "SELECT equity FROM equity_snapshots ORDER BY ts DESC LIMIT 100"
 
-            open_positions = await self.pool.fetch("SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC")
-            recent_trades = await self.pool.fetch("SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 5")
+            # Run all queries concurrently for efficiency
+            kpis, open_positions, recent_trades, equity_records = await asyncio.gather(
+                self.pool.fetchrow(kpi_query),
+                self.pool.fetch(open_pos_query),
+                self.pool.fetch(recent_trades_query),
+                self.pool.fetch(equity_query)
+            )
 
+            # --- Update KPI Widgets ---
             self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions']}")
-            
             total_pnl = kpis['total_pnl'] or 0
             self.query_one("#kpi_pnl").update(f"\n${total_pnl:,.2f}")
-            
             win_rate = (kpis['win_count'] / kpis['total_closed']) * 100 if kpis['total_closed'] > 0 else 0
             self.query_one("#kpi_win_rate").update(f"\n{win_rate:.2f}%")
-            
             profit_factor = kpis['gross_profit'] / abs(kpis['gross_loss']) if kpis['gross_loss'] and kpis['gross_loss'] != 0 else float('inf')
             self.query_one("#kpi_profit_factor").update(f"\n{profit_factor:.2f}")
 
+            # --- Update Equity Curve Sparkline ---
+            if equity_records:
+                # The sparkline needs the data in chronological order, so we reverse the list
+                equity_data = [float(r['equity']) for r in reversed(equity_records)]
+                self.query_one(Sparkline).data = equity_data
+
+            # --- Update Tables ---
             open_pos_table = self.query_one("#open_positions_table")
             open_pos_table.clear()
             for pos in open_positions:
