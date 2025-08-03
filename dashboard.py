@@ -65,71 +65,75 @@ class DashboardApp(App):
     def _ascii_ohlc_bars(
         ohlcv: list[list[float]],
         rows: int = 15,
-        max_bars: int = 20,           # 20 bars → 20 × 5 = 100 text-columns
+        max_bars: int = 20,           # draws at most 20 bars → 20×5 columns
     ) -> str:
         """
-        Classic OHLC bar chart for Textual.
+        Classic OHLC bars (open tick left, stem, close tick right).
 
         • One bar uses five columns:  “──│──”
-        (open-tick, stem, close-tick)
-        • Up-bar   → bright_green
-        • Down-bar → bright_red
-        • Always draws at least a 2-row stem, so even a completely flat candle
-        is visible.
+        • Up-bar   (close ≥ open) → bright_green
+        • Down-bar (close <  open) → bright_red
+        • Guarantee each stem is at least 2 rows tall, so bars never vanish.
         """
 
-        # ------------------------------------------------------------------#
+        # ————————————————————————————————————————————————
+        # 1) Early exit if not enough data
         if len(ohlcv) < 2:
             return "Not enough data."
-        # 1) down-sample so we never exceed `max_bars`
+
+        # 2) Down-sample to at most max_bars
         stride = max(1, len(ohlcv) // max_bars)
         bars   = ohlcv[-stride * max_bars :: stride]
 
-        hi = max(r[2] for r in bars)            # column indices: [ts, o, h, l, c, v]
+        # 3) Find overall high/low and pad the range to avoid zero-height stems
+        hi = max(r[2] for r in bars)  # r = [ts, open, high, low, close, vol]
         lo = min(r[3] for r in bars)
-
-        # 2) pad the vertical span so stems never hug the frame
-        span = max(hi - lo, hi * 1e-8)          # avoid 0 span
-        min_span_px = (rows - 1) * 0.25         # ≥ 25 % of panel height
+        span = max(hi - lo, hi * 1e-8)             # avoid zero span
+        min_span_px = (rows - 1) * 0.25            # at least 25% of height
         if span < min_span_px:
             pad = (min_span_px - span) / 2
             hi += pad
             lo -= pad
             span = hi - lo
 
-        # 3) price → row mapper  (0 = top)
-        y = lambda p: int((hi - p) / span * (rows - 1))
+        # 4) Price → row mapper (0 = top row, rows-1 = bottom)
+        def y(price: float) -> int:
+            return int((hi - price) / span * (rows - 1))
 
+        # 5) Prepare an empty canvas
         width = 5 * len(bars)
         grid  = [[" "] * width for _ in range(rows)]
 
-        for i, (_, o, h, l, c, _) in enumerate(bars):
-            style = "bright_green" if c >= o else "bright_red"
-            x_mid = 5 * i + 2                     # columns 0-1-2-3-4
+        # 6) Draw each bar
+        for idx, (_, o, h, l, c, _) in enumerate(bars):
+            colour = "bright_green" if c >= o else "bright_red"
+            x_mid  = 5 * idx + 2  # center column of this bar’s 5-column slot
 
-            # map every price in this candle
-            y_hi, y_lo   = y(h), y(l)
-            y_open       = y(o)
-            y_close      = y(c)
+            # map OHLC to rows
+            y_hi    = y(h)
+            y_lo    = y(l)
+            y_open  = y(o)
+            y_close = y(c)
 
-            # ── guarantee a visible stem (≥ 2 rows) ──
-            if y_hi == y_lo:                      # flat candle
+            # ── ensure a minimum stem height of 2 rows ──
+            if y_hi == y_lo:
                 y_hi = max(0,        y_hi - 1)
                 y_lo = min(rows - 1, y_lo + 1)
-                # re-centre ticks on the widened stem
-                y_open = y_close = (y_hi + y_lo) // 2
+                # re-center open/close tick on the new stem
+                y_open  = y_close = (y_hi + y_lo) // 2
 
-            # stem
+            # draw the vertical stem first
             for r in range(y_hi, y_lo + 1):
-                grid[r][x_mid] = f"[{style}]│[/]"
+                grid[r][x_mid] = f"[{colour}]│[/]"
 
-            # ticks  (drawn *after* stem so they sit on top)
-            grid[y_open ][x_mid - 2] = f"[{style}]──[/]"
-            grid[y_close][x_mid + 2] = f"[{style}]──[/]"
+            # draw the open tick (left)
+            grid[y_open][x_mid - 2] = f"[{colour}]──[/]"
 
-        # join the rows into one markup string
-        return "\n".join("".join(r) for r in grid)
+            # draw the close tick (right)
+            grid[y_close][x_mid + 2] = f"[{colour}]──[/]"
 
+        # 7) Flatten to a single markup string
+        return "\n".join("".join(row) for row in grid)
 
     
     @staticmethod
@@ -215,11 +219,13 @@ class DashboardApp(App):
 
                                         # header / empty click
 
-        chart  = DashboardApp._ascii_ohlc_bars(ohlcv, rows=15, max_bars=20)
-        panel  = self.query_one("#candle_chart")
-        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m  (OHLC)"
-        panel.update(Text.from_markup(chart))        # ← use from_markup
-        
+        # inside your on_data_table_row_highlighted or equivalent:
+        chart = DashboardApp._ascii_ohlc_bars(ohlcv, rows=15, max_bars=20)
+        panel = self.query_one("#candle_chart")
+        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (OHLC)"
+        panel.update(Text.from_markup(chart))  # ← make sure to use from_markup
+
+
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
