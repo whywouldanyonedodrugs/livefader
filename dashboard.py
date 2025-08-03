@@ -133,29 +133,24 @@ class DashboardApp(App):
         if not table.columns:
             table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
-    async def on_data_table_row_highlighted(self, message: DataTable.RowHighlighted) -> None:
-        """
-        When the user presses <Enter> or clicks a row, show a 1h ASCII candle chart
-        for that symbol beneath the KPI boxes.
-        """
-        table = message.sender
-        sym   = table.get_cell(message.row_key, 0)  # first column = symbol
+    async def on_data_table_row_highlighted(
+        self, message: DataTable.RowHighlighted
+    ) -> None:
+        """Show a 1-hour ASCII candle chart for the highlighted symbol."""
+        table = message.control                    # ←  sender → control
+        sym   = table.get_cell(message.row_key, 0)  # first column = Symbol
 
-        # Convert DB symbol → exchange pair
         pair  = self._db_sym_to_pair(sym)
-
         try:
             ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="1h", limit=50)
         except Exception as e:
             self.query_one("#equity_chart").update(f"Failed to fetch OHLCV: {e}")
             return
 
-        chart_text = self._ascii_candles(ohlcv)
-        # You can pipe this into any widget you like.
-        # Here we reuse the equity_chart box:
-        box = self.query_one("#equity_chart")
+        chart = self._ascii_candles(ohlcv)
+        box   = self.query_one("#equity_chart")
         box.border_title = f"{pair} – last 50×1 h"
-        box.update(Text(chart_text, style="yellow"))
+        box.update(Text(chart, style="yellow"))
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
