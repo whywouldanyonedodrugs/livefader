@@ -154,23 +154,23 @@ class DashboardApp(App):
         if not table.columns:
             table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
+    @on(DataTable.RowHighlighted)          # or RowSelected
     async def on_data_table_row_highlighted(
         self, message: DataTable.RowHighlighted
     ) -> None:
-        """Show a 1-hour ASCII candle chart for the highlighted symbol."""
-        table = message.control                             # the DataTable
-        row_i = message.cursor_row                          # highlighted row index
+        table = message.control
+        row_i = message.cursor_row
         try:
-            sym = table.get_cell_at((row_i, 0))             # first column = Symbol
+            raw_sym = table.get_cell_at((row_i, 0))   # first column = Symbol
         except Exception:
-            return                                          # header / empty click
+            return                                    # header / empty click
 
-        await self.exchange.load_markets()        # guarantees .markets is ready
+        # build a valid Bybit symbol (perp or spot) and fetch 15-minute candles
+        await self.exchange.load_markets()
         pair = self._resolve_perp_symbol(self.exchange, raw_sym)
 
-        pair  = self._db_sym_to_pair(sym)
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="15min", limit=16)
+            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="15m", limit=96)
         except Exception as e:
             self.query_one("#equity_chart").update(f"Failed to fetch OHLCV: {e}")
             return
