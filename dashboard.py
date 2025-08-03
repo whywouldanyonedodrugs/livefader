@@ -89,7 +89,8 @@ class DashboardApp(App):
         usable   = max(1, int(rows * compress))
         pad_top  = (rows - usable) // 2       # equal top / bottom padding
         pad_bot  = rows - usable - pad_top
-        
+        rows_minus1 = usable - 1
+
         # --- vertical mapping: centre on mid-price --------------------------
         mid   = (hi + lo) / 2
         half  = max(hi - mid, mid - lo) or 1e-9        # symmetric span
@@ -105,10 +106,6 @@ class DashboardApp(App):
             """
             offset = (price - mid) / half
             return int(center_row - offset * scale_rows)
-
-
-        width  = 3 * len(data)                      # 3 characters per bar
-        canvas = [[" "] * width for _ in range(rows)]
 
         for i, (_, o, h, l, c, _) in enumerate(data):
             col  = "bright_green" if c >= o else "bright_red"
