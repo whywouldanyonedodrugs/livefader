@@ -107,6 +107,9 @@ class DashboardApp(App):
             offset = (price - mid) / half
             return int(center_row - offset * scale_rows)
 
+        width  = 3 * len(data)                      # 3 characters per bar
+        canvas = [[" "] * width for _ in range(rows)]
+
         for i, (_, o, h, l, c, _) in enumerate(data):
             col  = "bright_green" if c >= o else "bright_red"
             x0   = 3 * i + 1                        # centre column for the stem
