@@ -85,7 +85,7 @@ class DashboardApp(App):
         hi = max(r[2] for r in data)
         lo = min(r[3] for r in data)
         span = (hi - lo) or 1e-9
-        compress = 0.60                       # 0 – 1  (smaller ⇒ “squash” bars)
+        compress = 0.1                       # 0 – 1  (smaller ⇒ “squash” bars)
         usable   = max(1, int(rows * compress))
         pad_top  = (rows - usable) // 2       # equal top / bottom padding
         pad_bot  = rows - usable - pad_top
