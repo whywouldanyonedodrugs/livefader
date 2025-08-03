@@ -148,7 +148,6 @@ class DashboardApp(App):
             return
 
         try:
-            # --- FIX: Replaced the complex subqueries with a single, efficient query ---
             kpi_query = """
                 SELECT
                     COUNT(*) FILTER (WHERE status = 'OPEN') AS open_positions,
@@ -173,28 +172,39 @@ class DashboardApp(App):
 
             # --- Update KPI Widgets ---
             self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions']}")
-            total_pnl = kpis['total_pnl'] or 0
+            
+            # FIX: Handle NoneType for PnL
+            total_pnl = kpis['total_pnl'] or 0.0
             self.query_one("#kpi_pnl").update(f"\n${total_pnl:,.2f}")
-            win_rate = (kpis['win_count'] / kpis['total_closed']) * 100 if kpis['total_closed'] and kpis['total_closed'] > 0 else 0
+            
+            win_rate = (kpis['win_count'] / kpis['total_closed']) * 100 if kpis['total_closed'] and kpis['total_closed'] > 0 else 0.0
             self.query_one("#kpi_win_rate").update(f"\n{win_rate:.2f}%")
-            profit_factor = kpis['gross_profit'] / abs(kpis['gross_loss']) if kpis['gross_loss'] and kpis['gross_loss'] != 0 else float('inf')
+            
+            profit_factor = kpis['gross_profit'] / abs(kpis['gross_loss']) if kpis['gross_profit'] and kpis['gross_loss'] and kpis['gross_loss'] != 0 else 0.0
             self.query_one("#kpi_profit_factor").update(f"\n{profit_factor:.2f}")
 
             # --- Update Text-Based Equity Curve ---
             equity_text = self.query_one("#equity_text")
-            if equity_records:
+            if equity_records and len(equity_records) > 1:
                 equity_data = [float(r['equity']) for r in reversed(equity_records)]
                 start_eq, current_eq = equity_data[0], equity_data[-1]
                 min_eq, max_eq = min(equity_data), max(equity_data)
                 change = current_eq - start_eq
                 change_pct = (change / start_eq) * 100 if start_eq > 0 else 0
                 trend = "▲" if change >= 0 else "▼"
+                
+                # Simple text-based sparkline
+                normalized_data = [(x - min_eq) / (max_eq - min_eq) if (max_eq - min_eq) > 0 else 0.5 for x in equity_data]
+                spark_chars = " ▂▃▄▅▆▇█"
+                sparkline = "".join(spark_chars[int(x * (len(spark_chars) - 1))] for x in normalized_data)
+
                 equity_text.update(
                     f" Start: ${start_eq:,.2f}   Current: ${current_eq:,.2f}   ({change:+.2f}, {change_pct:+.2f}% {trend})\n"
-                    f" Min:   ${min_eq:,.2f}   Max:     ${max_eq:,.2f}"
+                    f" Min:   ${min_eq:,.2f}   Max:     ${max_eq:,.2f}\n\n"
+                    f" {sparkline}"
                 )
             else:
-                equity_text.update("Not enough equity data yet.")
+                equity_text.update("\nNot enough equity data to draw curve.")
 
             # --- Update Text-Based Bar Charts ---
             self.query_one("#regime_chart").update(self._create_bar_chart(regime_wins, 'market_regime_at_entry', 'wins'))
@@ -220,11 +230,11 @@ class DashboardApp(App):
             # --- Update Recent Trades Table ---
             recent_trades_table = self.query_one("#recent_trades_table")
             recent_trades_table.clear()
-            for trade in recent_trades:
-                recent_trades_table.add_row(trade['symbol'], f"{trade['pnl']:.2f}", trade['exit_reason'], f"{trade['holding_minutes']:.1f}")
+            if recent_trades:
+                for trade in recent_trades:
+                    recent_trades_table.add_row(trade['symbol'], f"{trade['pnl']:.2f}", trade['exit_reason'], f"{trade['holding_minutes']:.1f}")
 
         except Exception as e:
-            # This will now only catch unexpected errors
             self.query_one("#kpi_pnl").update(f"ERROR:\n{e}")
 
 if __name__ == "__main__":
