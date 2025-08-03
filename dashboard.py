@@ -62,21 +62,24 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
     @staticmethod
-    def _ascii_candles(
+    def _ascii_bars(
         ohlcv: list[list[float]],
         rows: int = 15,
-        max_cols: int = 40,          # ← counts *candle* slots, not characters
-        centre_h: bool = True,
-        centre_v: bool = True,
+        max_cols: int = 50,
+        centre: bool = True,
     ) -> str:
         """
-        ASCII candlestick chart, 2 characters per bar (wick + body) so the candle
-        looks full.  max_cols is the number of candles, not text columns.
+        ASCII bar-style candle chart (1 char wide) with colour:
+
+        • bright_yellow  → up-bar  (close ≥ open)
+        • bright_magenta → down-bar
+
+        The chart is down-sampled to ≤ `max_cols` bars and centred horizontally
+        if `centre` is True.
         """
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # ── 1) down-sample to ≤ max_cols bars ───────────────────────────────
         step  = max(1, len(ohlcv) // max_cols)
         bars  = ohlcv[-step * max_cols :: step]
 
@@ -86,50 +89,34 @@ class DashboardApp(App):
         scale = rows - 1
         y = lambda p: int((p - lo) / span * scale)
 
-        # grid is rows × (2 * len(bars)) characters
-        width  = 2 * len(bars)
-        grid   = [[" "] * width for _ in range(rows)]
+        grid = [[" "]*len(bars) for _ in range(rows)]
 
-        for i, (_, o, h, l, c, _) in enumerate(bars):
-            x1, x2 = 2 * i, 2 * i + 1                   # two columns per candle
-            top, bot       = y(h), y(l)
-            body_top       = y(max(o, c))
-            body_bot       = y(min(o, c))
-            body_char      = "█" if c >= o else "░"
+        for x, (_, o, h, l, c, _) in enumerate(bars):
+            up  = c >= o
+            wick_style  = "bright_yellow"  if up else "bright_magenta"
+            body_style  = "yellow"         if up else "magenta"
 
-            # wicks
+            top, bot         = y(h), y(l)
+            body_top, body_b = y(max(o, c)), y(min(o, c))
+
+            # wick (dim colour)
             for r in range(bot, top + 1):
-                grid[scale - r][x1] = "│"
-                grid[scale - r][x2] = "│"
+                grid[scale - r][x] = f"[{wick_style}]│[/]"
 
-            # body (filled)
-            for r in range(body_bot, body_top + 1):
-                grid[scale - r][x1] = body_char
-                grid[scale - r][x2] = body_char
+            # body (solid colour)
+            for r in range(body_b, body_top + 1):
+                grid[scale - r][x] = f"[{body_style}]█[/]"
 
-        # convert rows → strings
+        # assemble rows
         lines = ["".join(row) for row in grid]
 
-        # ── horizontal centring ─────────────────────────────────────────────
-        if centre_h and len(bars) < max_cols:
-            pad_candles = (max_cols - len(bars)) // 2
-            pad = " " * (pad_candles * 2)          # two chars per candle
+        # optional horizontal centring
+        if centre and len(bars) < max_cols:
+            pad = " " * ((max_cols - len(bars)) // 2)
             lines = [pad + ln + pad for ln in lines]
 
-        # ── vertical centring ───────────────────────────────────────────────
-        if centre_v:
-            used_top = next((i for i, ln in enumerate(lines) if ln.strip()), 0)
-            used_bot = len(lines) - 1 - next(
-                (i for i, ln in enumerate(reversed(lines)) if ln.strip()), 0
-            )
-            used_h = used_bot - used_top + 1
-            if used_h < rows:
-                pad_top    = (rows - used_h) // 2
-                pad_bottom = rows - used_h - pad_top
-                blank = " " * len(lines[0])
-                lines = [blank]*pad_top + lines[used_top:used_bot+1] + [blank]*pad_bottom
-
         return "\n".join(lines)
+
     
     @staticmethod
     def _db_sym_to_pair(symbol: str) -> str:
@@ -214,10 +201,10 @@ class DashboardApp(App):
 
                                         # header / empty click
 
-        chart = DashboardApp._ascii_candles(ohlcv)     # ← change this line
+        chart = DashboardApp._ascii_bars(ohlcv, rows=15, max_cols=50)
         panel = self.query_one("#candle_chart")
-        panel.border_title = f"{pair} – {len(ohlcv)} × 30m"
-        panel.update(Text(chart, style="yellow"))
+        panel.update(Text.from_markup(chart))
+        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m  (bar view)"
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
