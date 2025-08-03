@@ -151,34 +151,34 @@ class DashboardApp(App):
         if not self.pool:
             return
 
-        # --- 1) DB fetch and KPI + chart updates ---
+        # --- 1) Fetch from DB, update KPIs & charts ---
         try:
             kpi_query = """
                 SELECT
-                    COUNT(*) FILTER (WHERE status = 'OPEN') AS open_positions,
-                    SUM(pnl)   FILTER (WHERE status = 'CLOSED') AS total_pnl,
+                    COUNT(*) FILTER (WHERE status = 'OPEN')          AS open_positions,
+                    SUM(pnl)   FILTER (WHERE status = 'CLOSED')      AS total_pnl,
                     COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl > 0) AS win_count,
-                    COUNT(*) FILTER (WHERE status = 'CLOSED') AS total_closed,
+                    COUNT(*) FILTER (WHERE status = 'CLOSED')        AS total_closed,
                     SUM(pnl) FILTER (WHERE status = 'CLOSED' AND pnl > 0) AS gross_profit,
                     SUM(pnl) FILTER (WHERE status = 'CLOSED' AND pnl < 0) AS gross_loss
                 FROM positions
             """
-            open_pos_query    = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
-            recent_trades_query = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 10"
-            equity_query      = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100"
-            regime_query      = "SELECT market_regime_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY market_regime_at_entry"
-            session_query     = "SELECT session_tag_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY session_tag_at_entry"
+            open_pos_q    = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
+            recent_trades_q = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 10"
+            equity_q      = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100"
+            regime_q      = "SELECT market_regime_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY market_regime_at_entry"
+            session_q     = "SELECT session_tag_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY session_tag_at_entry"
 
             kpis, open_positions, recent_trades, equity_records, regime_wins, session_wins = await asyncio.gather(
                 self.pool.fetchrow(kpi_query),
-                self.pool.fetch(open_pos_query),
-                self.pool.fetch(recent_trades_query),
-                self.pool.fetch(equity_query),
-                self.pool.fetch(regime_query),
-                self.pool.fetch(session_query),
+                self.pool.fetch(open_pos_q),
+                self.pool.fetch(recent_trades_q),
+                self.pool.fetch(equity_q),
+                self.pool.fetch(regime_q),
+                self.pool.fetch(session_q),
             )
 
-            # — Update the four KPI boxes —
+            # Update KPI widgets
             self.query_one("#kpi_open_positions").update(f"{kpis['open_positions'] or 0}")
             total_pnl = kpis["total_pnl"] or 0.0
             self.query_one("#kpi_pnl").update(f"${total_pnl:,.2f}")
@@ -191,18 +191,18 @@ class DashboardApp(App):
             profit_factor = gross_profit / abs(gross_loss) if gross_loss else float("inf")
             self.query_one("#kpi_profit_factor").update(f"{profit_factor:.2f}")
 
-            # — Equity curve —
-            eq_widget = self.query_one("#equity_chart")
+            # Equity curve
+            eq_w = self.query_one("#equity_chart")
             if len(equity_records or []) > 1:
                 equity_data = [float(r["equity"]) for r in equity_records]
                 start_eq, curr_eq = equity_data[0], equity_data[-1]
                 pct = (curr_eq / start_eq - 1) * 100 if start_eq else 0
                 info = f" Start: ${start_eq:,.2f}  Current: ${curr_eq:,.2f} ({pct:+.2f}%)"
-                eq_widget.update(f"{info}\n\n" + self._create_equity_barchart(equity_data))
+                eq_w.update(f"{info}\n\n" + self._create_equity_barchart(equity_data))
             else:
-                eq_widget.update("\nNot enough equity data yet.")
+                eq_w.update("\nNot enough equity data yet.")
 
-            # — Bar charts —
+            # Bar charts
             self.query_one("#regime_chart").update(
                 self._create_bar_chart(regime_wins, 'market_regime_at_entry', 'wins')
             )
@@ -211,25 +211,28 @@ class DashboardApp(App):
             )
 
         except Exception as db_err:
-            # If *this* blows up, we can’t do much — at least show the error
+            # If the DB fetch or KPI logic fails, show it and stop here
             self.query_one("#kpi_pnl").update(f"ERROR DB:\n{db_err}")
             return
 
 
-        # --- 2) Live Positions Table (safe Ticker fetch) ---
-        open_pos_table = self.query_one("#open_positions_table")
-        open_pos_table.clear(rows=True)  # only clear the *rows*, keep your six columns
+        # --- 2) Live Positions Table ---
+        open_table = self.query_one("#open_positions_table")
+        open_table.clear()    # drops both rows & columns
+        open_table.add_columns(
+            "Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)"
+        )
 
-        symbols_to_fetch = [f"{pos['symbol']}/USDT" for pos in open_positions]
+        # Try the ticker fetch separately so failures won't kill the whole refresh
         try:
-            tickers = await self.exchange.fetch_tickers(symbols_to_fetch)
-        except Exception as x_err:
-            # swallow it so your UI doesn’t break; you could also log this
+            symbols = [f"{pos['symbol']}/USDT" for pos in open_positions]
+            tickers = await self.exchange.fetch_tickers(symbols)
+        except Exception:
             tickers = {}
 
         for pos in open_positions:
-            key = f"{pos['symbol']}/USDT"
-            last_price = tickers.get(key, {}).get("last", 0.0)
+            sym = pos["symbol"]
+            last_price = tickers.get(f"{sym}/USDT", {}).get("last", 0.0)
             entry_price = float(pos["entry_price"])
             size = float(pos["size"])
             if pos["side"].lower() == "short":
@@ -237,8 +240,8 @@ class DashboardApp(App):
             else:
                 upnl = (last_price - entry_price) * size
 
-            open_pos_table.add_row(
-                pos["symbol"],
+            open_table.add_row(
+                sym,
                 pos["side"],
                 f"{size}",
                 f"{entry_price:.5f}",
@@ -248,15 +251,16 @@ class DashboardApp(App):
 
 
         # --- 3) Recent Trades Table ---
-        recent_trades_table = self.query_one("#recent_trades_table")
-        recent_trades_table.clear(rows=True)
+        recent_table = self.query_one("#recent_trades_table")
+        recent_table.clear()
+        recent_table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
-        for trade in recent_trades:
-            recent_trades_table.add_row(
-                trade["symbol"],
-                f"{trade['pnl']:.2f}",
-                trade["exit_reason"],
-                f"{trade['holding_minutes']:.1f}"
+        for tr in recent_trades:
+            recent_table.add_row(
+                tr["symbol"],
+                f"{tr['pnl']:.2f}",
+                tr["exit_reason"],
+                f"{tr['holding_minutes']:.1f}"
             )
 
 
