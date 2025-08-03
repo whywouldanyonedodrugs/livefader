@@ -62,49 +62,55 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
     ###############################################################################
-    # 1)  Compact coloured OHLC bars (now draws a continuous stem)
+    # (1)  Compact coloured OHLC “bars”  – now uses the full panel height
     ###############################################################################
     @staticmethod
     def _ascii_ohlc_bars_minimal_colored(
         ohlcv: list[list[float]],
-        rows: int = 12,          # will be overridden with the widget height
-        max_bars: int = 20,      # width  = max_bars × 2 columns
+        rows: int = 12,         # will be overridden with actual widget height
+        max_bars: int = 20,     # every bar uses 2 text columns
     ) -> str:
         """
-        One-column-per-bar OHLC view:
+        One-column-per-bar OHLC view.
 
-            │  stem  (high → low)
-            █  close (body, coloured)
-        The whole stem is rendered so highs / lows are visible – no more single
-        glyph at the ends.  Green = close ≥ open, red otherwise.
+            │  = high / low          (full-height stem)
+            █  = close               (body, coloured)
+        Green if close ≥ open, red otherwise.
+        The price range is expanded to always fill ~90 % of the widget so that
+        even tiny moves translate into multiple rows.
         """
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # ── 1) down-sample ──────────────────────────────────────────────────────
+        # ── 1) down-sample to ≤ max_bars ────────────────────────────────────────
         stride = max(1, len(ohlcv) // max_bars)
         bars   = ohlcv[-stride * max_bars :: stride]
 
-        # ── 2) price range & padding ───────────────────────────────────────────
+        # ── 2) overall high / low  –  stretch to ~90 % of available rows ───────
         hi = max(r[2] for r in bars)
         lo = min(r[3] for r in bars)
-        span = max(hi - lo, hi * 1e-8)
-        target = (rows - 1) * 0.25                # at least 25 % of panel height
-        if span < target:
-            pad = (target - span) / 2
+        if hi == lo:
+            hi += 1e-9                       # avoid div/0 on completely flat data
+
+        span  = hi - lo
+        target_span = (rows - 1) * 0.90      # fill ~90 % of the vertical space
+        if span < target_span:
+            pad = (target_span - span) / 2
             hi += pad
             lo -= pad
-            span = hi - lo
+            span = hi - lo                   # new, wider span
 
-        # mapper price → row (0 = top)
-        def y(p: float) -> int:
-            return int((hi - p) / span * (rows - 1))
+        # mapper: price → integer row (0 = top)
+        scale = rows - 1
+        def y(price: float) -> int:
+            # round() instead of int() so subtle moves aren’t truncated away
+            return round((hi - price) / span * scale)
 
-        # ── 3) canvas ──────────────────────────────────────────────────────────
+        # ── 3) empty canvas ────────────────────────────────────────────────────
         width = len(bars) * 2
         grid  = [[" "] * width for _ in range(rows)]
 
-        # ── 4) draw every bar ──────────────────────────────────────────────────
+        # ── 4) draw each bar ───────────────────────────────────────────────────
         for i, (_, o, h, l, c, _) in enumerate(bars):
             x_mid  = i * 2
             colour = "bright_green" if c >= o else "bright_red"
@@ -112,21 +118,20 @@ class DashboardApp(App):
             y_hi, y_lo = y(h), y(l)
             y_close    = y(c)
 
-            # guarantee at least 2-row stem so flat bars are visible
+            # guarantee stem is at least 2 rows tall
             if y_hi == y_lo:
                 y_hi = max(0,        y_hi - 1)
                 y_lo = min(rows - 1, y_lo + 1)
                 y_close = (y_hi + y_lo) // 2
 
-            # vertical stem
+            # vertical stem (high → low)
             for r in range(y_hi, y_lo + 1):
                 grid[r][x_mid] = f"[{colour}]│[/]"
 
-            # close tick / body
+            # close “body”
             grid[y_close][x_mid] = f"[{colour}]█[/]"
 
         return "\n".join("".join(row) for row in grid)
-
 
     
     @staticmethod
@@ -190,44 +195,46 @@ class DashboardApp(App):
             table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
     ###############################################################################
-    # 2)  Row-highlight handler (uses real panel height)
+    # (2)  Row-highlight handler  –  now asks the widget for its true height
     ###############################################################################
     @on(DataTable.RowHighlighted)
     async def on_data_table_row_highlighted(
         self, message: DataTable.RowHighlighted
     ) -> None:
+        """Redraw the mini OHLC panel whenever the user moves the cursor."""
         table = message.control
         row   = message.cursor_row
 
-        # ── symbol from first column ───────────────────────────────────────────
+        # symbol in first column
         try:
             raw_sym = table.get_cell_at((row, 0))
         except Exception:
-            return              # header / empty click
+            return                               # header / blank click
 
-        # ── fetch data ─────────────────────────────────────────────────────────
         await self.exchange.load_markets()
         pair = self._resolve_perp_symbol(self.exchange, raw_sym)
+
+        # 24 × 15-minute candles = 6 h snapshot
         try:
             ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="15m", limit=24)
         except Exception as err:
             self.query_one("#candle_chart").update(f"OHLCV error: {err}")
             return
 
-        # ── draw into the candle panel ─────────────────────────────────────────
         panel = self.query_one("#candle_chart")
 
-        # actual inner height (minus borders) so bars use full vertical space
+        # Real inner height (minus borders) so we can use the full vertical range
         rows_available = max(4, panel.content_region.height)
 
-        chart_markup = self._ascii_ohlc_bars_minimal_colored(
+        chart = self._ascii_ohlc_bars_minimal_colored(
             ohlcv,
             rows=rows_available,
             max_bars=20,
         )
 
         panel.border_title = f"{pair} – {len(ohlcv)}×15 m (bars)"
-        panel.update(Text.from_markup(chart_markup))
+        panel.update(Text.from_markup(chart))
+
         
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
