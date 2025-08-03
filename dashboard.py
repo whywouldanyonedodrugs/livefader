@@ -49,7 +49,7 @@ class DashboardApp(App):
 
     def _create_bar_chart(self, data: list[dict], category_key: str, value_key: str, max_width: int = 30) -> str:
         if not data: return "No data available."
-        max_val = max(item[value_key] for item in data) if data else 0
+        max_val = max(item[value_key] for item in data if item[value_key] is not None) if data else 0
         chart = []
         for item in data:
             category = str(item[category_key]) if item[category_key] else "N/A"
@@ -60,14 +60,11 @@ class DashboardApp(App):
         return "\n".join(chart)
 
     def _create_equity_barchart(self, equity_data: list[float], num_bars: int = 10, height: int = 8) -> str:
-        """Creates a vertical ASCII bar chart for the equity curve."""
         if len(equity_data) < 2: return "Not enough data."
-        
         min_eq, max_eq = min(equity_data), max(equity_data)
         if max_eq == min_eq: return "Equity is flat."
-
-        # Bin the data
-        bin_size = len(equity_data) // num_bars
+        
+        bin_size = len(equity_data) // num_bars if num_bars > 0 else 1
         bins = [equity_data[i:i + bin_size][-1] for i in range(0, len(equity_data), bin_size)][:num_bars]
         
         normalized = [((val - min_eq) / (max_eq - min_eq)) * (height - 1) for val in bins]
@@ -91,6 +88,7 @@ class DashboardApp(App):
                 yield Static("", classes="kpi_box", id="kpi_profit_factor")
                 yield Static("", classes="kpi_box", id="kpi_open_positions")
             
+            # FIX: The ID is 'equity_chart'
             yield Static("", classes="chart_box", id="equity_chart")
             yield Static("", classes="chart_box", id="regime_chart")
             yield Static("", classes="chart_box", id="session_chart")
@@ -107,7 +105,6 @@ class DashboardApp(App):
         
         self.pool = await asyncpg.create_pool(self.db_dsn, min_size=1, max_size=2)
         
-        # We need a ccxt instance to fetch live prices for unrealized PnL
         import ccxt.async_support as ccxt
         self.exchange = ccxt.bybit({'enableRateLimit': True})
 
@@ -115,7 +112,8 @@ class DashboardApp(App):
         self.query_one("#kpi_win_rate").border_title = "Win Rate"
         self.query_one("#kpi_profit_factor").border_title = "Profit Factor"
         self.query_one("#kpi_open_positions").border_title = "Open Positions"
-        self.query_one("#equity_text").border_title = "Equity Curve"
+        # FIX: Use the correct ID 'equity_chart'
+        self.query_one("#equity_chart").border_title = "Equity Curve"
         self.query_one("#regime_chart").border_title = "Wins by Market Regime"
         self.query_one("#session_chart").border_title = "Wins by Trading Session"
 
@@ -131,16 +129,13 @@ class DashboardApp(App):
         await self.update_data()
 
     async def on_unmount(self) -> None:
-        """Clean up resources when the app exits."""
-        if self.exchange:
-            await self.exchange.close()
+        if self.exchange: await self.exchange.close()
 
     async def update_data(self) -> None:
-        """Fetch fresh data from the database and update widgets."""
-        if not self.pool:
-            return
+        if not self.pool: return
 
         try:
+            # FIX: The full, correct query
             kpi_query = """
                 SELECT
                     COUNT(*) FILTER (WHERE status = 'OPEN') AS open_positions,
@@ -153,10 +148,11 @@ class DashboardApp(App):
             """
             open_pos_query = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
             recent_trades_query = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 10"
-            equity_query = "SELECT equity FROM equity_snapshots ORDER BY ts DESC LIMIT 100"
+            equity_query = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100" # ASC for chronological order
             regime_query = "SELECT market_regime_at_entry, COUNT(*) as wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY market_regime_at_entry"
             session_query = "SELECT session_tag_at_entry, COUNT(*) as wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY session_tag_at_entry"
 
+            # FIX: The full, correct gather call
             kpis, open_positions, recent_trades, equity_records, regime_wins, session_wins = await asyncio.gather(
                 self.pool.fetchrow(kpi_query), self.pool.fetch(open_pos_query),
                 self.pool.fetch(recent_trades_query), self.pool.fetch(equity_query),
@@ -165,24 +161,22 @@ class DashboardApp(App):
 
             # --- Update KPI Widgets ---
             self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions'] or 0}")
-            
             total_pnl = kpis['total_pnl'] or 0.0
             self.query_one("#kpi_pnl").update(f"\n${total_pnl:,.2f}")
-            
             win_count = kpis['win_count'] or 0
             total_closed = kpis['total_closed'] or 0
             win_rate = (win_count / total_closed) * 100 if total_closed > 0 else 0.0
             self.query_one("#kpi_win_rate").update(f"\n{win_rate:.2f}%")
-            
             gross_profit = kpis['gross_profit'] or 0.0
             gross_loss = kpis['gross_loss'] or 0.0
             profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 else float('inf')
             self.query_one("#kpi_profit_factor").update(f"\n{profit_factor:.2f}")
 
-            # --- FIX: Update Text-Based Equity Curve ---
+            # --- Update Text-Based Equity Curve ---
+            # FIX: Use the correct ID 'equity_chart'
             equity_chart = self.query_one("#equity_chart")
             if equity_records and len(equity_records) > 1:
-                equity_data = [float(r['equity']) for r in reversed(equity_records)]
+                equity_data = [float(r['equity']) for r in equity_records] # Already chronological
                 start_eq, current_eq = equity_data[0], equity_data[-1]
                 min_eq, max_eq = min(equity_data), max(equity_data)
                 change_pct = (current_eq / start_eq - 1) * 100 if start_eq > 0 else 0
