@@ -780,14 +780,29 @@ class LiveTrader:
                 position_size = float(positions[0].get('info', {}).get('size', 0))
             
             if position_size == 0:
-                LOG.info("Position size for %s is 0. Trade is closed. Finalizing...", symbol)
-                # The position is closed on the exchange, for any reason.
-                # Trigger our finalization logic to clean up and record the PnL.
-                await self._finalize_position(pid, pos)
-                return # Stop further processing for this closed position
+                LOG.info("Position size for %s is 0. Trade is closed. Inferring exit reason and finalizing...", symbol)
+                
+                inferred_reason = "UNKNOWN"
+                open_orders = await self._all_open_orders(symbol)
+                open_cids = {o.get("clientOrderId") for o in open_orders}
+                
+                # --- FIX: More robust inference logic ---
+                # First, check if any of the possible Take Profit orders are missing.
+                if (pos.get("tp_final_cid") and pos["tp_final_cid"] not in open_cids) or \
+                (pos.get("tp2_cid") and pos["tp2_cid"] not in open_cids) or \
+                (pos.get("tp1_cid") and pos["tp1_cid"] not in open_cids):
+                    inferred_reason = "TP"
+                # If not a TP, check if any of the possible Stop Loss orders are missing.
+                elif (pos.get("sl_trail_cid") and pos["sl_trail_cid"] not in open_cids) or \
+                    (pos.get("sl_cid") and pos["sl_cid"] not in open_cids):
+                    inferred_reason = "SL"
+                
+                LOG.info("Inferred exit reason for %s is: %s", symbol, inferred_reason)
+                
+                await self._finalize_position(pid, pos, inferred_exit_reason=inferred_reason)
+                return
         except Exception as e:
             LOG.error("Could not fetch position size for %s during update: %s", symbol, e)
-            # Don't proceed if we can't confirm the position state
             return
         # --- END OF SAFETY NET ---
 
@@ -911,44 +926,43 @@ class LiveTrader:
             pos["sl_trail_cid"] = sl_trail_cid
             LOG.info("Trail updated %s to %.4f", symbol, new_stop)
             
-    async def _finalize_position(self, pid: int, pos: Dict[str, Any]):
+    async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
         symbol = pos["symbol"]
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
 
         # --- 1. Determine the Exit Reason and Price ---
-        # FIX: Add tp2_cid to the list of possible closing orders
-        possible_closing_cids = [
-            pos.get("sl_cid"), pos.get("tp1_cid"), 
-            pos.get("tp_final_cid"), pos.get("sl_trail_cid"),
-            pos.get("tp2_cid")
-        ]
-        
-        # FIX: Accept all valid "closed" statuses from the exchange
-        valid_closed_statuses = {"closed", "filled"}
+        if inferred_exit_reason and inferred_exit_reason != "UNKNOWN":
+            LOG.info("Using inferred exit reason: %s", inferred_exit_reason)
+            closing_order_type = inferred_exit_reason
+        else:
+            LOG.warning("Could not infer exit reason for %s, attempting to fetch closing order.", symbol)
+            possible_closing_cids = [
+                pos.get("sl_cid"), pos.get("tp1_cid"), pos.get("tp_final_cid"), 
+                pos.get("sl_trail_cid"), pos.get("tp2_cid")
+            ]
+            
+            # FIX: Accept all valid "closed" statuses from the exchange, case-insensitively.
+            valid_closed_statuses = {"closed", "filled", "cancelled"}
 
-        for cid in filter(None, possible_closing_cids):
-            try:
-                order = await self._fetch_by_cid(cid, symbol)
-                # Use case-insensitive check
-                if order and order.get('status') and order['status'].lower() in valid_closed_statuses:
-                    exit_price = float(order.get('average') or order.get('price'))
-                    exit_qty = float(order['filled'])
-                    if "TP" in cid: closing_order_type = "TP"
-                    elif "SL" in cid: closing_order_type = "SL"
-                    LOG.info(f"Position {pid} closed by order {cid} at avg price {exit_price}")
-                    break 
-            except ccxt.OrderNotFound:
-                continue
-            except Exception as e:
-                LOG.warning(f"Could not fetch closing order {cid} for PnL calc: {e}")
+            for cid in filter(None, possible_closing_cids):
+                try:
+                    order = await self._fetch_by_cid(cid, symbol)
+                    if order and order.get('status') and order['status'].lower() in valid_closed_statuses:
+                        exit_price = float(order.get('average') or order.get('price'))
+                        exit_qty = float(order['filled'])
+                        if "TP" in cid: closing_order_type = "TP"
+                        elif "SL" in cid: closing_order_type = "SL"
+                        break 
+                except Exception:
+                    continue
 
-        # Fallback to ticker price if we couldn't find the exact closing order
         if not exit_price:
-            LOG.warning(f"Could not determine exact fill price for {pid}. Using last market price for PnL.")
+            LOG.warning("Could not determine exact fill price for %d. Using last market price.", pid)
             ticker = await self.exchange.fetch_ticker(symbol)
             exit_price = float(ticker["last"])
-            exit_qty = float(pos["size"]) # Fallback to full size
-            closing_order_type = "FALLBACK" # Mark this as a fallback exit
+            exit_qty = float(pos["size"])
+            if closing_order_type == "UNKNOWN":
+                closing_order_type = "FALLBACK"
 
         # --- 2. Perform Post-Trade Calculations ---
         closed_at = datetime.now(timezone.utc)
