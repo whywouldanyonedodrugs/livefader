@@ -117,7 +117,7 @@ class DashboardApp(App):
             grid[y_lo][x] = f"[{color}]│[/]"
 
             # draw close (the “body”)
-            grid[y_close][x] = f"[{color}]┼[/]"
+            grid[y_close][x] = f"[{color}]█[/]"
 
         return "\n".join("".join(row) for row in grid)
 
