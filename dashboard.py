@@ -137,15 +137,21 @@ class DashboardApp(App):
         self, message: DataTable.RowHighlighted
     ) -> None:
         """Show a 1-hour ASCII candle chart for the highlighted symbol."""
-        table = message.control                    # ←  sender → control
-        sym   = table.get_cell(message.row_key, 0)  # first column = Symbol
+        table = message.control                             # the DataTable
+        row_i = message.cursor_row                          # highlighted row index
+        try:
+            sym = table.get_cell_at((row_i, 0))             # first column = Symbol
+        except Exception:
+            return                                          # header / empty click
 
         pair  = self._db_sym_to_pair(sym)
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="1h", limit=50)
+            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="15min", limit=16)
         except Exception as e:
             self.query_one("#equity_chart").update(f"Failed to fetch OHLCV: {e}")
             return
+
+                                        # header / empty click
 
         chart = self._ascii_candles(ohlcv)
         box   = self.query_one("#equity_chart")
