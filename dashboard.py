@@ -61,67 +61,73 @@ class DashboardApp(App):
         # Last resort: return the spot pair so we at least draw a chart
         return f"{base}/USDT"
 
-
     @staticmethod
     def _ascii_candles(
         ohlcv: list[list[float]],
         rows: int = 15,
-        max_cols: int = 40,
-        centre_h: bool = True,       # horizontal centring
-        centre_v: bool = True,       # vertical   centring
+        max_cols: int = 40,          # ← counts *candle* slots, not characters
+        centre_h: bool = True,
+        centre_v: bool = True,
     ) -> str:
         """
-        Return an ASCII candlestick chart that fits in `rows` × `max_cols`.
-
-        • Each candle is exactly one text column wide (down-sampled if necessary)
-        • If `centre_h` / `centre_v` are True, the chart is padded so the active
-        area sits in the middle of the box.
+        ASCII candlestick chart, 2 characters per bar (wick + body) so the candle
+        looks full.  max_cols is the number of candles, not text columns.
         """
         if len(ohlcv) < 2:
             return "Not enough data."
 
         # ── 1) down-sample to ≤ max_cols bars ───────────────────────────────
-        step = max(1, len(ohlcv) // max_cols)
-        bars = ohlcv[-step * max_cols :: step]
+        step  = max(1, len(ohlcv) // max_cols)
+        bars  = ohlcv[-step * max_cols :: step]
 
         hi = max(r[2] for r in bars)
         lo = min(r[3] for r in bars)
         span = hi - lo or 1e-9
-        y = lambda p: int((p - lo) / span * (rows - 1))
+        scale = rows - 1
+        y = lambda p: int((p - lo) / span * scale)
 
-        grid = [[" "]*len(bars) for _ in range(rows)]
+        # grid is rows × (2 * len(bars)) characters
+        width  = 2 * len(bars)
+        grid   = [[" "] * width for _ in range(rows)]
 
-        for x, (_, o, h, l, c, _) in enumerate(bars):
+        for i, (_, o, h, l, c, _) in enumerate(bars):
+            x1, x2 = 2 * i, 2 * i + 1                   # two columns per candle
             top, bot       = y(h), y(l)
-            body_top, body_bot = y(max(o, c)), y(min(o, c))
-            glyph = "█" if c >= o else "░"
+            body_top       = y(max(o, c))
+            body_bot       = y(min(o, c))
+            body_char      = "█" if c >= o else "░"
 
-            for r in range(bot, top + 1):          # wick
-                grid[rows-1-r][x] = "│"
-            for r in range(body_bot, body_top + 1): # body
-                grid[rows-1-r][x] = glyph
+            # wicks
+            for r in range(bot, top + 1):
+                grid[scale - r][x1] = "│"
+                grid[scale - r][x2] = "│"
 
-        # ── 2) horizontal centring (pad left/right) ────────────────────────
-        lines = ["".join(r) for r in grid]
+            # body (filled)
+            for r in range(body_bot, body_top + 1):
+                grid[scale - r][x1] = body_char
+                grid[scale - r][x2] = body_char
+
+        # convert rows → strings
+        lines = ["".join(row) for row in grid]
+
+        # ── horizontal centring ─────────────────────────────────────────────
         if centre_h and len(bars) < max_cols:
-            pad = (max_cols - len(bars)) // 2
-            pad_str = " " * pad
-            lines = [pad_str + ln + pad_str for ln in lines]
+            pad_candles = (max_cols - len(bars)) // 2
+            pad = " " * (pad_candles * 2)          # two chars per candle
+            lines = [pad + ln + pad for ln in lines]
 
-        # ── 3) vertical centring (pad top/bottom) ──────────────────────────
+        # ── vertical centring ───────────────────────────────────────────────
         if centre_v:
-            # find first & last rows that contain any non-space
             used_top = next((i for i, ln in enumerate(lines) if ln.strip()), 0)
-            used_bot = len(lines)-1 - next(
+            used_bot = len(lines) - 1 - next(
                 (i for i, ln in enumerate(reversed(lines)) if ln.strip()), 0
             )
             used_h = used_bot - used_top + 1
             if used_h < rows:
                 pad_top    = (rows - used_h) // 2
                 pad_bottom = rows - used_h - pad_top
-                core = lines[used_top:used_bot+1]
-                lines = [" " * len(lines[0])] * pad_top + core + \
-                        [" " * len(lines[0])] * pad_bottom
+                blank = " " * len(lines[0])
+                lines = [blank]*pad_top + lines[used_top:used_bot+1] + [blank]*pad_bottom
 
         return "\n".join(lines)
     
