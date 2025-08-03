@@ -198,7 +198,7 @@ class DashboardApp(App):
         pair = self._resolve_perp_symbol(self.exchange, raw_sym)
 
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="30m", limit=8)
+            ohlcv = await self.exchange.fetch_ohlcv(pair, timeframe="15m", limit=24)
         except Exception as e:
             self.query_one("#equity_chart").update(f"Failed to fetch OHLCV: {e}")
             return
