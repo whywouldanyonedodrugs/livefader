@@ -147,7 +147,9 @@ class DashboardApp(App):
         if self.exchange: await self.exchange.close()
 
     async def update_data(self) -> None:
-        if not self.pool: return
+        """Fetch fresh data from the database and update widgets."""
+        if not self.pool:
+            return
 
         try:
             kpi_query = """
@@ -172,27 +174,23 @@ class DashboardApp(App):
                 self.pool.fetch(regime_query), self.pool.fetch(session_query)
             )
 
-            # --- FIX: Remove the manual '\n' from the update strings ---
+            # --- Update KPI Widgets ---
             self.query_one("#kpi_open_positions").update(f"{kpis['open_positions'] or 0}")
-            
             total_pnl = kpis['total_pnl'] or 0.0
             self.query_one("#kpi_pnl").update(f"${total_pnl:,.2f}")
-            
             win_count = kpis['win_count'] or 0
             total_closed = kpis['total_closed'] or 0
             win_rate = (win_count / total_closed) * 100 if total_closed > 0 else 0.0
             self.query_one("#kpi_win_rate").update(f"{win_rate:.2f}%")
-            
             gross_profit = kpis['gross_profit'] or 0.0
             gross_loss = kpis['gross_loss'] or 0.0
             profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 else float('inf')
             self.query_one("#kpi_profit_factor").update(f"{profit_factor:.2f}")
 
             # --- Update Text-Based Equity Curve ---
-            # FIX: Use the correct ID 'equity_chart'
             equity_chart = self.query_one("#equity_chart")
             if equity_records and len(equity_records) > 1:
-                equity_data = [float(r['equity']) for r in equity_records] # Already chronological
+                equity_data = [float(r['equity']) for r in equity_records]
                 start_eq, current_eq = equity_data[0], equity_data[-1]
                 min_eq, max_eq = min(equity_data), max(equity_data)
                 change_pct = (current_eq / start_eq - 1) * 100 if start_eq > 0 else 0
@@ -203,7 +201,7 @@ class DashboardApp(App):
             else:
                 equity_chart.update("\nNot enough equity data yet.")
 
-            # --- Update other panels ---
+            # --- Update Text-Based Bar Charts ---
             self.query_one("#regime_chart").update(self._create_bar_chart(regime_wins, 'market_regime_at_entry', 'wins'))
             self.query_one("#session_chart").update(self._create_bar_chart(session_wins, 'session_tag_at_entry', 'wins'))
 
@@ -211,16 +209,22 @@ class DashboardApp(App):
             open_pos_table = self.query_one("#open_positions_table")
             open_pos_table.clear()
             if open_positions:
-                tickers = await self.exchange.fetch_tickers([pos['symbol'] for pos in open_positions])
+                # Create the list of symbols in the format ccxt expects (e.g., 'MUSDT/USDT')
+                symbols_to_fetch = [f"{pos['symbol']}/USDT" for pos in open_positions]
+                tickers = await self.exchange.fetch_tickers(symbols_to_fetch)
+                
                 for pos in open_positions:
-                    symbol = pos['symbol']
-                    current_price = tickers.get(symbol, {}).get('last', 0.0)
+                    symbol_db = pos['symbol']
+                    # FIX: Use the correctly formatted key for the lookup
+                    ticker_key = f"{symbol_db}/USDT"
+                    
+                    current_price = tickers.get(ticker_key, {}).get('last', 0.0)
                     entry_price = float(pos['entry_price'])
                     size = float(pos['size'])
                     upnl = (entry_price - current_price) * size if pos['side'] == 'short' else (current_price - entry_price) * size
                     
                     open_pos_table.add_row(
-                        symbol, pos['side'], f"{size}", f"{entry_price:.5f}",
+                        symbol_db, pos['side'], f"{size}", f"{entry_price:.5f}",
                         f"{current_price:.5f}", f"{upnl:+.2f}"
                     )
 
