@@ -82,8 +82,8 @@ class DashboardApp(App):
     # ── tiny helpers to avoid duplicate headers ─────────────────────────
     @staticmethod
     def _ensure_live_headers(table: DataTable) -> None:
-        """Add the 6 live-position columns once, if they’re missing."""
-        if table.column_count == 0:                 # ← no headers yet
+        """Add the six live-position columns once, if they’re missing."""
+        if not table.columns:                     # <— works on every Textual
             table.add_columns(
                 "Symbol", "Side", "Size",
                 "Entry Price", "Current Price", "UPnL ($)"
@@ -91,8 +91,8 @@ class DashboardApp(App):
 
     @staticmethod
     def _ensure_trade_headers(table: DataTable) -> None:
-        """Add the 4 recent-trade columns once, if they’re missing."""
-        if table.column_count == 0:
+        """Add the four recent-trade columns once, if they’re missing."""
+        if not table.columns:
             table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
 
     # ────────────────────────── compose ──────────────────────────
