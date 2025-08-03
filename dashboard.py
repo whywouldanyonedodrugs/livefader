@@ -30,11 +30,9 @@ class DashboardApp(App):
     # --- CSS for the "oldschool" layout and amber theme ---
     CSS = """
     Screen {
-        /* Define our amber color variable */
-        $amber: #FFBF00;
-        /* Set all text and borders to amber */
-        color: $amber;
-        border-color: $amber;
+        /* FIX: Apply the color directly instead of using a variable */
+        color: #FFBF00;
+        border-color: #FFBF00;
     }
     #main_container {
         layout: grid;
@@ -55,8 +53,8 @@ class DashboardApp(App):
         height: 5;
     }
     .kpi_box {
-        /* Use a heavy, solid border */
-        border: heavy $amber;
+        /* FIX: Apply the color directly */
+        border: heavy #FFBF00;
         border-title-align: center;
     }
     .kpi_value {
@@ -64,8 +62,8 @@ class DashboardApp(App):
         padding-top: 1;
     }
     DataTable {
-        /* Use a heavy, solid border with a title */
-        border: heavy $amber;
+        /* FIX: Apply the color directly */
+        border: heavy #FFBF00;
         border-title-align: center;
         height: 12;
     }
@@ -104,7 +102,6 @@ class DashboardApp(App):
         
         self.pool = await asyncpg.create_pool(self.db_dsn, min_size=1, max_size=2)
         
-        # Set titles for our widgets
         self.query_one("#kpi_pnl").border_title = "Total PnL"
         self.query_one("#kpi_win_rate").border_title = "Win Rate"
         self.query_one("#kpi_profit_factor").border_title = "Profit Factor"
@@ -141,7 +138,6 @@ class DashboardApp(App):
             open_positions = await self.pool.fetch("SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC")
             recent_trades = await self.pool.fetch("SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 5")
 
-            # --- Update KPI Widgets (without color markup) ---
             self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions']}")
             
             total_pnl = kpis['total_pnl'] or 0
@@ -153,7 +149,6 @@ class DashboardApp(App):
             profit_factor = kpis['gross_profit'] / abs(kpis['gross_loss']) if kpis['gross_loss'] and kpis['gross_loss'] != 0 else float('inf')
             self.query_one("#kpi_profit_factor").update(f"\n{profit_factor:.2f}")
 
-            # --- Update Tables ---
             open_pos_table = self.query_one("#open_positions_table")
             open_pos_table.clear()
             for pos in open_positions:
