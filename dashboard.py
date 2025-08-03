@@ -1,3 +1,4 @@
+```python
 # /opt/livefader/src/dashboard.py
 
 import asyncio
@@ -12,7 +13,7 @@ from textual.containers import Container
 from textual.timer import Timer
 
 # --- Configuration ---
-REFRESH_INTERVAL_SECONDS = 10 # How often to refresh the data
+REFRESH_INTERVAL_SECONDS = 10  # How often to refresh the data
 
 # This is our ASCII art logo. The 'r' before the string is important.
 ASCII_LOGO = r"""
@@ -32,7 +33,6 @@ class DashboardApp(App):
     #main_container { layout: grid; grid-size: 3; grid-gutter: 1; padding: 0 1; }
     #logo { column-span: 3; height: 9; content-align: center middle; }
     #kpi_container {
-        /* FIX: Correct column span to use the full width */
         column-span: 3;
         layout: grid;
         grid-size: 4;
@@ -44,7 +44,6 @@ class DashboardApp(App):
         border-title-align: center;
         padding: 1;
     }
-    /* FIX: Add explicit content alignment for KPI boxes */
     .kpi_box {
         content-align: center middle;
     }
@@ -63,8 +62,9 @@ class DashboardApp(App):
         self.db_dsn = os.getenv("DATABASE_URL")
 
     def _create_bar_chart(self, data: list[dict], category_key: str, value_key: str, max_width: int = 30) -> str:
-        if not data: return "No data available."
-        max_val = max(item[value_key] for item in data if item[value_key] is not None) if data else 0
+        if not data:
+            return "No data available."
+        max_val = max(item[value_key] for item in data if item[value_key] is not None)
         chart = []
         for item in data:
             category = str(item[category_key]) if item[category_key] else "N/A"
@@ -75,26 +75,23 @@ class DashboardApp(App):
         return "\n".join(chart)
 
     def _create_equity_barchart(self, equity_data: list[float], num_bars: int = 10, height: int = 8) -> str:
-        if len(equity_data) < 2: return "Not enough data."
+        if len(equity_data) < 2:
+            return "Not enough data."
         min_eq, max_eq = min(equity_data), max(equity_data)
-        if max_eq == min_eq: return "Equity is flat."
-        
-        bin_size = len(equity_data) // num_bars if num_bars > 0 else 1
+        if max_eq == min_eq:
+            return "Equity is flat."
+        bin_size = len(equity_data) // num_bars or 1
         bins = [equity_data[i:i + bin_size][-1] for i in range(0, len(equity_data), bin_size)][:num_bars]
-        
         normalized = [((val - min_eq) / (max_eq - min_eq)) * (height - 1) for val in bins]
-        
         chart = [""] * height
         for h in range(height - 1, -1, -1):
             row = ""
             for val in normalized:
                 row += "███ " if val >= h else "    "
             chart[height - 1 - h] = row
-        
         return "\n".join(chart)
 
     def compose(self) -> ComposeResult:
-        # ... (This function is correct and does not need changes) ...
         yield Header(show_clock=True)
         with Container(id="main_container"):
             yield Static(ASCII_LOGO, id="logo")
@@ -103,7 +100,7 @@ class DashboardApp(App):
                 yield Static("", classes="kpi_box", id="kpi_win_rate")
                 yield Static("", classes="kpi_box", id="kpi_profit_factor")
                 yield Static("", classes="kpi_box", id="kpi_open_positions")
-            
+
             yield Static("", classes="chart_box", id="equity_chart")
             yield Static("", classes="chart_box", id="regime_chart")
             yield Static("", classes="chart_box", id="session_chart")
@@ -113,17 +110,17 @@ class DashboardApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
-        # ... (This function is correct and does not need changes) ...
         if not self.db_dsn:
             self.query_one("#kpi_pnl").border_title = "Error"
             self.query_one("#kpi_pnl").update("DB_DSN not found")
             return
-        
-        self.pool = await asyncpg.create_pool(self.db_dsn, min_size=1, max_size=2)
-        
-        import ccxt.async_support as ccxt
-        self.exchange = ccxt.bybit({'enableRateLimit': True})
 
+        self.pool = await asyncpg.create_pool(self.db_dsn, min_size=1, max_size=2)
+
+        import ccxt.async_support as ccxt
+        self.exchange = ccxt.bybit({"enableRateLimit": True})
+
+        # Set up KPI & chart titles
         self.query_one("#kpi_pnl").border_title = "Total PnL"
         self.query_one("#kpi_win_rate").border_title = "Win Rate"
         self.query_one("#kpi_profit_factor").border_title = "Profit Factor"
@@ -132,19 +129,17 @@ class DashboardApp(App):
         self.query_one("#regime_chart").border_title = "Wins by Market Regime"
         self.query_one("#session_chart").border_title = "Wins by Trading Session"
 
-        open_pos_table = self.query_one("#open_positions_table")
-        open_pos_table.border_title = "Live Positions"
-        open_pos_table.add_columns("Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)")
-        
-        recent_trades_table = self.query_one("#recent_trades_table")
-        recent_trades_table.border_title = "Last 10 Closed Trades"
-        recent_trades_table.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
+        # Only set borders here — the columns will be added each refresh
+        self.query_one("#open_positions_table").border_title = "Live Positions"
+        self.query_one("#recent_trades_table").border_title = "Last 10 Closed Trades"
 
+        # Start the periodic update
         self.update_timer: Timer = self.set_interval(REFRESH_INTERVAL_SECONDS, self.update_data)
         await self.update_data()
 
     async def on_unmount(self) -> None:
-        if self.exchange: await self.exchange.close()
+        if self.exchange:
+            await self.exchange.close()
 
     async def update_data(self) -> None:
         """Fetch fresh data from the database and update widgets."""
@@ -163,11 +158,11 @@ class DashboardApp(App):
                     SUM(pnl) FILTER (WHERE status = 'CLOSED' AND pnl < 0) AS gross_loss
                 FROM positions
             """
-            open_pos_q    = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
+            open_pos_q      = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
             recent_trades_q = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 10"
-            equity_q      = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100"
-            regime_q      = "SELECT market_regime_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY market_regime_at_entry"
-            session_q     = "SELECT session_tag_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY session_tag_at_entry"
+            equity_q        = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100"
+            regime_q        = "SELECT market_regime_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY market_regime_at_entry"
+            session_q       = "SELECT session_tag_at_entry, COUNT(*) AS wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY session_tag_at_entry"
 
             kpis, open_positions, recent_trades, equity_records, regime_wins, session_wins = await asyncio.gather(
                 self.pool.fetchrow(kpi_query),
@@ -204,10 +199,10 @@ class DashboardApp(App):
 
             # Bar charts
             self.query_one("#regime_chart").update(
-                self._create_bar_chart(regime_wins, 'market_regime_at_entry', 'wins')
+                self._create_bar_chart(regime_wins, "market_regime_at_entry", "wins")
             )
             self.query_one("#session_chart").update(
-                self._create_bar_chart(session_wins, 'session_tag_at_entry', 'wins')
+                self._create_bar_chart(session_wins, "session_tag_at_entry", "wins")
             )
 
         except Exception as db_err:
@@ -215,24 +210,23 @@ class DashboardApp(App):
             self.query_one("#kpi_pnl").update(f"ERROR DB:\n{db_err}")
             return
 
-
         # --- 2) Live Positions Table ---
         open_table = self.query_one("#open_positions_table")
-        open_table.clear()    # drops both rows & columns
+        open_table.clear()  # drops both rows & columns
         open_table.add_columns(
             "Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)"
         )
 
-        # Try the ticker fetch separately so failures won't kill the whole refresh
+        # Fetch tickers using the raw symbol (e.g. "BTC/USDT")
         try:
-            symbols = [f"{pos['symbol']}/USDT" for pos in open_positions]
+            symbols = [pos["symbol"] for pos in open_positions]
             tickers = await self.exchange.fetch_tickers(symbols)
         except Exception:
             tickers = {}
 
         for pos in open_positions:
             sym = pos["symbol"]
-            last_price = tickers.get(f"{sym}/USDT", {}).get("last", 0.0)
+            last_price = tickers.get(sym, {}).get("last", 0.0)
             entry_price = float(pos["entry_price"])
             size = float(pos["size"])
             if pos["side"].lower() == "short":
@@ -246,9 +240,8 @@ class DashboardApp(App):
                 f"{size}",
                 f"{entry_price:.5f}",
                 f"{last_price:.5f}",
-                f"{upnl:+.2f}"
+                f"{upnl:+.2f}",
             )
-
 
         # --- 3) Recent Trades Table ---
         recent_table = self.query_one("#recent_trades_table")
@@ -260,9 +253,8 @@ class DashboardApp(App):
                 tr["symbol"],
                 f"{tr['pnl']:.2f}",
                 tr["exit_reason"],
-                f"{tr['holding_minutes']:.1f}"
+                f"{tr['holding_minutes']:.1f}",
             )
-
 
 
 if __name__ == "__main__":
