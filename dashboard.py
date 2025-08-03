@@ -62,63 +62,78 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
     @staticmethod
-    def _ascii_ohlc_bars(
+    def _ascii_ohlc_bars_one_char(
         ohlcv: list[list[float]],
-        rows: int = 12,           # ← match chart_box height in CSS
-        max_bars: int = 20,       # at most 20 bars → 20×5 columns
+        rows: int = 12,
+        max_bars: int = 20,       # at most 20 bars → width=20 chars
     ) -> str:
         """
-        Classic OHLC bars (──│──) in bright_green/bright_red.
-        Guarantees each stem is at least 2 rows tall so bars never vanish.
+        One-char-wide OHLC bar chart:
+        ┬ top of wick
+        │ middle of wick
+        ┴ bottom of wick
+        ├ open tick
+        ┤ close tick
+        ┼ flat candle (open==close)
         """
+
+        # 1) Not enough data?
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # 1) Down-sample
+        # 2) Down-sample to ≤ max_bars
         stride = max(1, len(ohlcv) // max_bars)
         bars   = ohlcv[-stride * max_bars :: stride]
 
-        # 2) Compute and pad overall range so stems aren't zero-height
-        hi   = max(r[2] for r in bars)
-        lo   = min(r[3] for r in bars)
+        # 3) Determine & pad the global high/low
+        hi = max(r[2] for r in bars)
+        lo = min(r[3] for r in bars)
         span = max(hi - lo, hi * 1e-8)
-        min_px = (rows - 1) * 0.25
-        if span < min_px:
-            pad = (min_px - span) / 2
+        min_span = (rows - 1) * 0.25
+        if span < min_span:
+            pad = (min_span - span) / 2
             hi += pad; lo -= pad; span = hi - lo
 
-        # 3) Price→row (0=top, rows-1=bottom)
+        # 4) price → row mapper (0=top, rows-1=bottom)
         def y(p: float) -> int:
             return int((hi - p) / span * (rows - 1))
 
-        width = 5 * len(bars)
+        width = len(bars)
         grid  = [[" "] * width for _ in range(rows)]
 
+        # 5) Draw each bar into a single column
         for i, (_, o, h, l, c, _) in enumerate(bars):
-            clr   = "bright_green" if c >= o else "bright_red"
-            x_mid = 5 * i + 2
+            col = "bright_green" if c >= o else "bright_red"
 
             y_hi    = y(h)
             y_lo    = y(l)
             y_open  = y(o)
             y_close = y(c)
 
-            # ensure min‐2-row stem
+            # ensure at least 2-row stem
             if y_hi == y_lo:
                 y_hi = max(0,        y_hi - 1)
                 y_lo = min(rows - 1, y_lo + 1)
                 y_open = y_close = (y_hi + y_lo) // 2
 
-            # draw stem
+            # 5a: draw the vertical wick
             for r in range(y_hi, y_lo + 1):
-                grid[r][x_mid] = f"[{clr}]│[/]"
+                char = (
+                    "┬" if r == y_hi and r != y_lo else
+                    "┴" if r == y_lo and r != y_hi else
+                    "┼" if y_hi == y_lo else
+                    "│"
+                )
+                grid[r][i] = f"[{col}]{char}[/]"
 
-            # open tick (left)
-            grid[y_open][x_mid - 2] = f"[{clr}]──[/]"
+            # 5b: draw open/close ticks on top
+            if y_open == y_close:
+                # flat candle: already marked as ┼
+                continue
+            grid[y_open][i]  = f"[{col}]├[/]"
+            grid[y_close][i] = f"[{col}]┤[/]"
 
-            # close tick (right)
-            grid[y_close][x_mid + 2] = f"[{clr}]──[/]"
-
+        # 6) flatten to a markup string
         return "\n".join("".join(row) for row in grid)
 
     
@@ -205,17 +220,17 @@ class DashboardApp(App):
 
                                         # header / empty click
 
-        # inside your on_data_table_row_highlighted or equivalent:
         panel = self.query_one("#candle_chart")
+        rows  = panel.size.height
 
-        # compute rows dynamically from panel’s height,
-        # minus 2 for top & bottom border (if needed)
-        rows = panel.size.height
+        chart = DashboardApp._ascii_ohlc_bars_one_char(
+            ohlcv,
+            rows=rows,
+            max_bars=20,
+        )
 
-        chart = DashboardApp._ascii_ohlc_bars(ohlcv, rows=rows, max_bars=20)
         panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (OHLC)"
         panel.update(Text.from_markup(chart))
-
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
