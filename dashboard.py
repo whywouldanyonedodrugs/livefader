@@ -36,30 +36,48 @@ class DashboardApp(App):
 
     # ────────────────────────── helpers ──────────────────────────
     @staticmethod
-    def _db_symbol_to_ccxt(sym: str) -> str:
-        """Convert DB symbol like 'MAGICUSDT' or 'BTCUSDT' to 'MAGIC/USDT'."""
-        if "/" in sym:
-            return sym
-        if sym.endswith("USDT"):
-            return f"{sym[:-4]}/USDT"
-        if sym.endswith("USDC"):
-            return f"{sym[:-4]}/USDC"
-        return sym  # fall-back
+    def _db_sym_to_pair(symbol: str) -> str:
+        """
+        Convert symbols stored like 'BTCUSDT', 'MAGICUSDT', 'MUSDT'
+        into CCXT style 'BTC/USDT', 'MAGIC/USDT', 'M/USDT'.
+        """
+        symbol = symbol.upper()
+        if "/" in symbol:                # already a pair
+            return symbol
+        for quote in ("USDT", "USDC", "BTC", "ETH"):
+            if symbol.endswith(quote):
+                base = symbol[: -len(quote)]
+                return f"{base}/{quote}"
+        return symbol                    # fallback (unlikely)
 
     @staticmethod
-    def _bar_chart(rows, k, v, width=30):
+    def _bar_chart(rows, key, val_key, width=30):
         if not rows:
             return "No data."
-        mx = max(r[v] for r in rows if r[v] is not None)
-        out = []
+        m = max(r[val_key] for r in rows if r[val_key] is not None)
+        lines = []
         for r in rows:
-            label = str(r[k] or "N/A")
-            val   = r[v] or 0
-            bar   = "█" * int((val / mx) * width) if mx else ""
-            out.append(f"{label:<15} | {bar} ({val})")
-        return "\n".join(out)
+            label = str(r[key] or "N/A")
+            value = r[val_key] or 0
+            bar_len = int((value / m) * width) if m else 0
+            lines.append(f"{label:<15} | {'█'*bar_len} ({value})")
+        return "\n".join(lines)
 
-    # (equity bar-chart unchanged; omitted for brevity)
+    @staticmethod
+    def _equity_barchart(curve, bars=10, height=8):
+        if len(curve) < 2:
+            return "Not enough data."
+        mn, mx = min(curve), max(curve)
+        if mx == mn:
+            return "Equity is flat."
+        step   = max(1, len(curve) // bars)
+        samples = [curve[i] for i in range(step-1, len(curve), step)][:bars]
+        scaled  = [((v-mn)/(mx-mn))*(height-1) for v in samples]
+        rows = []
+        for h in reversed(range(height)):
+            row = "".join("███ " if v >= h else "    " for v in scaled)
+            rows.append(row)
+        return "\n".join(rows)
 
     # ────────────────────────── compose ──────────────────────────
     def compose(self) -> ComposeResult:
@@ -88,7 +106,7 @@ class DashboardApp(App):
 
     async def on_mount(self) -> None:
         if not self.db_dsn:
-            self.query_one("#kpi_pnl").update("DB_DSN not found")
+            self.query_one("#kpi_pnl").update("DB_DSN not set")
             return
 
         self.pool = await asyncpg.create_pool(self.db_dsn, min_size=1, max_size=2)
@@ -96,16 +114,16 @@ class DashboardApp(App):
         import ccxt.async_support as ccxt
         self.exchange = ccxt.bybit({"enableRateLimit": True})
 
-        # only set titles here – NO add_columns
-        self.query_one("#kpi_pnl").border_title          = "Total PnL"
-        self.query_one("#kpi_win_rate").border_title      = "Win Rate"
-        self.query_one("#kpi_profit_factor").border_title = "Profit Factor"
-        self.query_one("#kpi_open_positions").border_title= "Open Positions"
-        self.query_one("#equity_chart").border_title      = "Equity Curve"
-        self.query_one("#regime_chart").border_title      = "Wins by Market Regime"
-        self.query_one("#session_chart").border_title     = "Wins by Trading Session"
-        self.query_one("#open_positions_table").border_title = "Live Positions"
-        self.query_one("#recent_trades_table").border_title  = "Last 10 Closed Trades"
+        # set the border titles (no add_columns here!)
+        self.query_one("#kpi_pnl").border_title            = "Total PnL"
+        self.query_one("#kpi_win_rate").border_title        = "Win Rate"
+        self.query_one("#kpi_profit_factor").border_title   = "Profit Factor"
+        self.query_one("#kpi_open_positions").border_title  = "Open Positions"
+        self.query_one("#equity_chart").border_title        = "Equity Curve"
+        self.query_one("#regime_chart").border_title        = "Wins by Market Regime"
+        self.query_one("#session_chart").border_title       = "Wins by Trading Session"
+        self.query_one("#open_positions_table").border_title= "Live Positions"
+        self.query_one("#recent_trades_table").border_title = "Last 10 Closed Trades"
 
         self.set_interval(REFRESH_INTERVAL_SECONDS, self.update_data)
         await self.update_data()
@@ -118,72 +136,75 @@ class DashboardApp(App):
     async def update_data(self) -> None:
         if not self.pool:
             return
-        try:
-            kpi_q   = """SELECT
-                COUNT(*) FILTER (WHERE status='OPEN')                       AS open_positions,
-                SUM(pnl)   FILTER (WHERE status='CLOSED')                   AS total_pnl,
-                COUNT(*) FILTER (WHERE status='CLOSED' AND pnl>0)           AS win_count,
-                COUNT(*) FILTER (WHERE status='CLOSED')                     AS total_closed,
-                SUM(pnl) FILTER (WHERE status='CLOSED' AND pnl>0)           AS gross_profit,
-                SUM(pnl) FILTER (WHERE status='CLOSED' AND pnl<0)           AS gross_loss
-            FROM positions"""
-            open_q  = "SELECT symbol, side, size, entry_price FROM positions WHERE status='OPEN' ORDER BY opened_at DESC"
-            recent_q= "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 10"
-            equity_q= "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100"
-            regime_q= "SELECT market_regime_at_entry AS regime, COUNT(*) AS wins FROM positions WHERE status='CLOSED' AND pnl>0 GROUP BY regime"
-            sess_q  = "SELECT session_tag_at_entry   AS sess,   COUNT(*) AS wins FROM positions WHERE status='CLOSED' AND pnl>0 GROUP BY sess"
 
-            kpis, open_pos, recent, eq_rows, reg_rows, sess_rows = await asyncio.gather(
+        # ── fetch everything from DB ──
+        try:
+            kpi_q = """
+                SELECT
+                    COUNT(*) FILTER (WHERE status='OPEN')                    AS open_positions,
+                    SUM(pnl)   FILTER (WHERE status='CLOSED')                AS total_pnl,
+                    COUNT(*) FILTER (WHERE status='CLOSED' AND pnl>0)        AS wins,
+                    COUNT(*) FILTER (WHERE status='CLOSED')                  AS closed,
+                    SUM(pnl) FILTER (WHERE status='CLOSED' AND pnl>0)        AS g_profit,
+                    SUM(pnl) FILTER (WHERE status='CLOSED' AND pnl<0)        AS g_loss
+                FROM positions
+            """
+            open_q   = "SELECT symbol, side, size, entry_price FROM positions WHERE status='OPEN' ORDER BY opened_at DESC"
+            recent_q = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 10"
+            equity_q = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100"
+            regime_q = "SELECT market_regime_at_entry AS regime, COUNT(*) AS wins FROM positions WHERE status='CLOSED' AND pnl>0 GROUP BY regime"
+            sess_q   = "SELECT session_tag_at_entry   AS sess,   COUNT(*) AS wins FROM positions WHERE status='CLOSED' AND pnl>0 GROUP BY sess"
+
+            kpis, open_pos, recent, equity_rows, reg_rows, sess_rows = await asyncio.gather(
                 self.pool.fetchrow(kpi_q), self.pool.fetch(open_q),
                 self.pool.fetch(recent_q), self.pool.fetch(equity_q),
-                self.pool.fetch(regime_q), self.pool.fetch(sess_q),
+                self.pool.fetch(regime_q), self.pool.fetch(sess_q)
             )
         except Exception as err:
             self.query_one("#kpi_pnl").update(f"ERROR DB:\n{err}")
             return
 
         # ── KPI boxes ──
-        self.query_one("#kpi_open_positions").update(f"{kpis['open_positions'] or 0}")
+        self.query_one("#kpi_open_positions").update(str(kpis["open_positions"] or 0))
         self.query_one("#kpi_pnl").update(f"${(kpis['total_pnl'] or 0):,.2f}")
-        wins, closed = kpis["win_count"] or 0, kpis["total_closed"] or 0
+        wins, closed = kpis["wins"] or 0, kpis["closed"] or 0
         self.query_one("#kpi_win_rate").update(f"{(wins/closed*100 if closed else 0):.2f}%")
-        gp, gl = kpis["gross_profit"] or 0, kpis["gross_loss"] or 0
+        gp, gl = kpis["g_profit"] or 0, kpis["g_loss"] or 0
         pf = gp / abs(gl) if gl else float("inf")
         self.query_one("#kpi_profit_factor").update(f"{pf:.2f}")
 
-        # ── Equity curve (text barchart) ──
+        # ── Equity curve widget ──
         eq_widget = self.query_one("#equity_chart")
-        if len(eq_rows) > 1:
-            curve = [float(r["equity"]) for r in eq_rows]
+        if len(equity_rows) > 1:
+            curve = [float(r["equity"]) for r in equity_rows]
             start, curr = curve[0], curve[-1]
             pct = (curr / start - 1) * 100 if start else 0
             info = f" Start: ${start:,.2f}  Current: ${curr:,.2f} ({pct:+.2f}%)"
-            eq_widget.update(f"{info}\n\n" + self._create_equity_barchart(curve))
+            eq_widget.update(info + "\n\n" + self._equity_barchart(curve))
         else:
             eq_widget.update("\nNot enough equity data yet.")
 
-        # ── Regime / Session charts ──
-        self.query_one("#regime_chart").update(self._bar_chart(reg_rows, "regime", "wins"))
-        self.query_one("#session_chart").update(self._bar_chart(sess_rows,  "sess",   "wins"))
+        # ── regime / session bar charts ──
+        self.query_one("#regime_chart").update(self._bar_chart(reg_rows,  "regime", "wins"))
+        self.query_one("#session_chart").update(self._bar_chart(sess_rows, "sess",  "wins"))
 
         # ── Live positions table ──
         open_tbl = self.query_one("#open_positions_table")
-        open_tbl.clear(columns=True)  # wipe headers and rows
+        open_tbl.clear()  # clears both headers & rows
         open_tbl.add_columns("Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)")
 
-        # build CCXT keys
-        ccxt_syms = [self._db_symbol_to_ccxt(p["symbol"]) for p in open_pos]
+        pair_keys = [self._db_sym_to_pair(p["symbol"]) for p in open_pos]
         try:
-            tickers = await self.exchange.fetch_tickers(ccxt_syms) if ccxt_syms else {}
+            tickers = await self.exchange.fetch_tickers(pair_keys) if pair_keys else {}
         except Exception:
             tickers = {}
 
         for p in open_pos:
-            key  = self._db_symbol_to_ccxt(p["symbol"])
-            last = tickers.get(key, {}).get("last", 0.0)
-            entry = float(p["entry_price"]); size = float(p["size"])
+            pair = self._db_sym_to_pair(p["symbol"])
+            last = tickers.get(pair, {}).get("last", 0.0)
+            entry = float(p["entry_price"])
+            size  = float(p["size"])
             upnl  = (entry - last) * size if p["side"].lower() == "short" else (last - entry) * size
-
             open_tbl.add_row(
                 p["symbol"], p["side"], f"{size}",
                 f"{entry:.5f}", f"{last:.5f}", f"{upnl:+.2f}"
@@ -191,7 +212,7 @@ class DashboardApp(App):
 
         # ── Recent trades table ──
         recent_tbl = self.query_one("#recent_trades_table")
-        recent_tbl.clear(columns=True)
+        recent_tbl.clear()
         recent_tbl.add_columns("Symbol", "PnL", "Exit Reason", "Hold (m)")
         for r in recent:
             recent_tbl.add_row(
