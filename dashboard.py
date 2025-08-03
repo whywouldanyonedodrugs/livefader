@@ -62,41 +62,69 @@ class DashboardApp(App):
         return f"{base}/USDT"
 
 
-    def _ascii_candles(ohlcv: list[list[float]],
-                    rows: int = 15, max_cols: int = 40) -> str:
+    @staticmethod
+    def _ascii_candles(
+        ohlcv: list[list[float]],
+        rows: int = 15,
+        max_cols: int = 40,
+        centre_h: bool = True,       # horizontal centring
+        centre_v: bool = True,       # vertical   centring
+    ) -> str:
         """
-        Return an ASCII candlestick chart that never exceeds `max_cols` columns.
-        Each candle uses exactly one text column, so the output always fits.
+        Return an ASCII candlestick chart that fits in `rows` × `max_cols`.
+
+        • Each candle is exactly one text column wide (down-sampled if necessary)
+        • If `centre_h` / `centre_v` are True, the chart is padded so the active
+        area sits in the middle of the box.
         """
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # ▸ down-sample to <= max_cols bars
+        # ── 1) down-sample to ≤ max_cols bars ───────────────────────────────
         step = max(1, len(ohlcv) // max_cols)
-        samples = ohlcv[-step * max_cols :: step]
+        bars = ohlcv[-step * max_cols :: step]
 
-        highs = [r[2] for r in samples]
-        lows  = [r[3] for r in samples]
-        hi, lo = max(highs), min(lows)
-        scale = rows - 1
-        y = lambda p: int((p - lo) / (hi - lo or 1e-9) * scale)
+        hi = max(r[2] for r in bars)
+        lo = min(r[3] for r in bars)
+        span = hi - lo or 1e-9
+        y = lambda p: int((p - lo) / span * (rows - 1))
 
-        grid = [[" "] * len(samples) for _ in range(rows)]
+        grid = [[" "]*len(bars) for _ in range(rows)]
 
-        for x, (_, o, h, l, c, _) in enumerate(samples):
-            top, bot = y(h), y(l)
-            body_t, body_b = y(max(o, c)), y(min(o, c))
-            body_char = "█" if c >= o else "░"
+        for x, (_, o, h, l, c, _) in enumerate(bars):
+            top, bot       = y(h), y(l)
+            body_top, body_bot = y(max(o, c)), y(min(o, c))
+            glyph = "█" if c >= o else "░"
 
-            # wick
-            for r in range(bot, top + 1):
-                grid[scale - r][x] = "│"
-            # body
-            for r in range(body_b, body_t + 1):
-                grid[scale - r][x] = body_char
+            for r in range(bot, top + 1):          # wick
+                grid[rows-1-r][x] = "│"
+            for r in range(body_bot, body_top + 1): # body
+                grid[rows-1-r][x] = glyph
 
-        return "\n".join("".join(row) for row in grid)
+        # ── 2) horizontal centring (pad left/right) ────────────────────────
+        lines = ["".join(r) for r in grid]
+        if centre_h and len(bars) < max_cols:
+            pad = (max_cols - len(bars)) // 2
+            pad_str = " " * pad
+            lines = [pad_str + ln + pad_str for ln in lines]
 
+        # ── 3) vertical centring (pad top/bottom) ──────────────────────────
+        if centre_v:
+            # find first & last rows that contain any non-space
+            used_top = next((i for i, ln in enumerate(lines) if ln.strip()), 0)
+            used_bot = len(lines)-1 - next(
+                (i for i, ln in enumerate(reversed(lines)) if ln.strip()), 0
+            )
+            used_h = used_bot - used_top + 1
+            if used_h < rows:
+                pad_top    = (rows - used_h) // 2
+                pad_bottom = rows - used_h - pad_top
+                core = lines[used_top:used_bot+1]
+                lines = [" " * len(lines[0])] * pad_top + core + \
+                        [" " * len(lines[0])] * pad_bottom
+
+        return "\n".join(lines)
+    
     @staticmethod
     def _db_sym_to_pair(symbol: str) -> str:
         """
