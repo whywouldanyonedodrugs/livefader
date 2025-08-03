@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, DataTable
-from textual.containers import VerticalScroll, Container
+from textual.containers import Container
 from textual.timer import Timer
 
 # --- Configuration ---
@@ -28,41 +28,13 @@ class DashboardApp(App):
     """A retro, multi-panel TUI dashboard for the trading bot."""
 
     CSS = """
-    Screen {
-        color: #FFBF00;
-    }
-    #main_container {
-        layout: grid;
-        grid-size: 3;
-        grid-gutter: 1;
-        padding: 0 1;
-    }
-    #logo {
-        column-span: 3;
-        height: 9;
-        content-align: center middle;
-    }
-    #kpi_container {
-        column-span: 3;
-        layout: grid;
-        grid-size: 4;
-        grid-gutter: 1;
-        height: 5;
-    }
-    .kpi_box, .chart_box {
-        border: heavy #FFBF00;
-        border-title-align: center;
-        padding: 0 1;
-    }
-    .chart_box {
-        height: 10;
-    }
-    DataTable {
-        column-span: 3;
-        border: heavy #FFBF00;
-        border-title-align: center;
-        height: 12;
-    }
+    Screen { color: #FFBF00; }
+    #main_container { layout: grid; grid-size: 3; grid-gutter: 1; padding: 0 1; }
+    #logo { column-span: 3; height: 9; content-align: center middle; }
+    #kpi_container { column-span: 3; layout: grid; grid-size: 4; grid-gutter: 1; height: 5; }
+    .kpi_box, .chart_box { border: heavy #FFBF00; border-title-align: center; padding: 1; }
+    .chart_box { height: 12; }
+    DataTable { column-span: 3; border: heavy #FFBF00; border-title-align: center; height: 12; }
     """
 
     TITLE = "LiveFader Trading Bot Dashboard"
@@ -71,21 +43,42 @@ class DashboardApp(App):
     def __init__(self):
         super().__init__()
         self.pool = None
-        self.exchange = None # We need a ccxt instance for live prices
+        self.exchange = None
         load_dotenv()
         self.db_dsn = os.getenv("DATABASE_URL")
 
     def _create_bar_chart(self, data: list[dict], category_key: str, value_key: str, max_width: int = 30) -> str:
-        """Creates a simple text-based bar chart string."""
-        if not data:
-            return "No data available."
-        
+        if not data: return "No data available."
         max_val = max(item[value_key] for item in data) if data else 0
         chart = []
         for item in data:
-            bar_len = int((item[value_key] / max_val) * max_width) if max_val > 0 else 0
+            category = str(item[category_key]) if item[category_key] else "N/A"
+            value = item[value_key] or 0
+            bar_len = int((value / max_val) * max_width) if max_val > 0 else 0
             bar = "█" * bar_len
-            chart.append(f"{item[category_key]:<15} | {bar} ({item[value_key]})")
+            chart.append(f"{category:<15} | {bar} ({value})")
+        return "\n".join(chart)
+
+    def _create_equity_barchart(self, equity_data: list[float], num_bars: int = 10, height: int = 8) -> str:
+        """Creates a vertical ASCII bar chart for the equity curve."""
+        if len(equity_data) < 2: return "Not enough data."
+        
+        min_eq, max_eq = min(equity_data), max(equity_data)
+        if max_eq == min_eq: return "Equity is flat."
+
+        # Bin the data
+        bin_size = len(equity_data) // num_bars
+        bins = [equity_data[i:i + bin_size][-1] for i in range(0, len(equity_data), bin_size)][:num_bars]
+        
+        normalized = [((val - min_eq) / (max_eq - min_eq)) * (height - 1) for val in bins]
+        
+        chart = [""] * height
+        for h in range(height - 1, -1, -1):
+            row = ""
+            for val in normalized:
+                row += "███ " if val >= h else "    "
+            chart[height - 1 - h] = row
+        
         return "\n".join(chart)
 
     def compose(self) -> ComposeResult:
@@ -98,7 +91,7 @@ class DashboardApp(App):
                 yield Static("", classes="kpi_box", id="kpi_profit_factor")
                 yield Static("", classes="kpi_box", id="kpi_open_positions")
             
-            yield Static("", classes="chart_box", id="equity_text")
+            yield Static("", classes="chart_box", id="equity_chart")
             yield Static("", classes="chart_box", id="regime_chart")
             yield Static("", classes="chart_box", id="session_chart")
 
@@ -171,42 +164,36 @@ class DashboardApp(App):
             )
 
             # --- Update KPI Widgets ---
-            self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions']}")
+            self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions'] or 0}")
             
-            # FIX: Handle NoneType for PnL
             total_pnl = kpis['total_pnl'] or 0.0
             self.query_one("#kpi_pnl").update(f"\n${total_pnl:,.2f}")
             
-            win_rate = (kpis['win_count'] / kpis['total_closed']) * 100 if kpis['total_closed'] and kpis['total_closed'] > 0 else 0.0
+            win_count = kpis['win_count'] or 0
+            total_closed = kpis['total_closed'] or 0
+            win_rate = (win_count / total_closed) * 100 if total_closed > 0 else 0.0
             self.query_one("#kpi_win_rate").update(f"\n{win_rate:.2f}%")
             
-            profit_factor = kpis['gross_profit'] / abs(kpis['gross_loss']) if kpis['gross_profit'] and kpis['gross_loss'] and kpis['gross_loss'] != 0 else 0.0
+            gross_profit = kpis['gross_profit'] or 0.0
+            gross_loss = kpis['gross_loss'] or 0.0
+            profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 else float('inf')
             self.query_one("#kpi_profit_factor").update(f"\n{profit_factor:.2f}")
 
-            # --- Update Text-Based Equity Curve ---
-            equity_text = self.query_one("#equity_text")
+            # --- FIX: Update Text-Based Equity Curve ---
+            equity_chart = self.query_one("#equity_chart")
             if equity_records and len(equity_records) > 1:
                 equity_data = [float(r['equity']) for r in reversed(equity_records)]
                 start_eq, current_eq = equity_data[0], equity_data[-1]
                 min_eq, max_eq = min(equity_data), max(equity_data)
-                change = current_eq - start_eq
-                change_pct = (change / start_eq) * 100 if start_eq > 0 else 0
-                trend = "▲" if change >= 0 else "▼"
+                change_pct = (current_eq / start_eq - 1) * 100 if start_eq > 0 else 0
                 
-                # Simple text-based sparkline
-                normalized_data = [(x - min_eq) / (max_eq - min_eq) if (max_eq - min_eq) > 0 else 0.5 for x in equity_data]
-                spark_chars = " ▂▃▄▅▆▇█"
-                sparkline = "".join(spark_chars[int(x * (len(spark_chars) - 1))] for x in normalized_data)
-
-                equity_text.update(
-                    f" Start: ${start_eq:,.2f}   Current: ${current_eq:,.2f}   ({change:+.2f}, {change_pct:+.2f}% {trend})\n"
-                    f" Min:   ${min_eq:,.2f}   Max:     ${max_eq:,.2f}\n\n"
-                    f" {sparkline}"
-                )
+                info_line = f" Start: ${start_eq:,.2f}  Current: ${current_eq:,.2f} ({change_pct:+.2f}%)"
+                chart = self._create_equity_barchart(equity_data)
+                equity_chart.update(f"{info_line}\n\n{chart}")
             else:
-                equity_text.update("\nNot enough equity data to draw curve.")
+                equity_chart.update("\nNot enough equity data yet.")
 
-            # --- Update Text-Based Bar Charts ---
+            # --- Update other panels ---
             self.query_one("#regime_chart").update(self._create_bar_chart(regime_wins, 'market_regime_at_entry', 'wins'))
             self.query_one("#session_chart").update(self._create_bar_chart(session_wins, 'session_tag_at_entry', 'wins'))
 
