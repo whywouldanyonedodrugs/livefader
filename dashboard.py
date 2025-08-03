@@ -143,11 +143,22 @@ class DashboardApp(App):
             await self.exchange.close()
 
     async def update_data(self) -> None:
+        """Fetch fresh data from the database and update widgets."""
         if not self.pool:
             return
 
         try:
-            kpi_query = "..." # Same as before
+            # --- FIX: Replaced the complex subqueries with a single, efficient query ---
+            kpi_query = """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'OPEN') AS open_positions,
+                    SUM(pnl) FILTER (WHERE status = 'CLOSED') AS total_pnl,
+                    COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl > 0) AS win_count,
+                    COUNT(*) FILTER (WHERE status = 'CLOSED') AS total_closed,
+                    SUM(pnl) FILTER (WHERE status = 'CLOSED' AND pnl > 0) AS gross_profit,
+                    SUM(pnl) FILTER (WHERE status = 'CLOSED' AND pnl < 0) AS gross_loss
+                FROM positions
+            """
             open_pos_query = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
             recent_trades_query = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 10"
             equity_query = "SELECT equity FROM equity_snapshots ORDER BY ts DESC LIMIT 100"
@@ -164,11 +175,12 @@ class DashboardApp(App):
             self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions']}")
             total_pnl = kpis['total_pnl'] or 0
             self.query_one("#kpi_pnl").update(f"\n${total_pnl:,.2f}")
-            win_rate = (kpis['win_count'] / kpis['total_closed']) * 100 if kpis['total_closed'] > 0 else 0
+            win_rate = (kpis['win_count'] / kpis['total_closed']) * 100 if kpis['total_closed'] and kpis['total_closed'] > 0 else 0
             self.query_one("#kpi_win_rate").update(f"\n{win_rate:.2f}%")
             profit_factor = kpis['gross_profit'] / abs(kpis['gross_loss']) if kpis['gross_loss'] and kpis['gross_loss'] != 0 else float('inf')
             self.query_one("#kpi_profit_factor").update(f"\n{profit_factor:.2f}")
 
+            # --- Update Text-Based Equity Curve ---
             equity_text = self.query_one("#equity_text")
             if equity_records:
                 equity_data = [float(r['equity']) for r in reversed(equity_records)]
@@ -192,7 +204,6 @@ class DashboardApp(App):
             open_pos_table = self.query_one("#open_positions_table")
             open_pos_table.clear()
             if open_positions:
-                # Fetch all tickers concurrently
                 tickers = await self.exchange.fetch_tickers([pos['symbol'] for pos in open_positions])
                 for pos in open_positions:
                     symbol = pos['symbol']
@@ -202,7 +213,7 @@ class DashboardApp(App):
                     upnl = (entry_price - current_price) * size if pos['side'] == 'short' else (current_price - entry_price) * size
                     
                     open_pos_table.add_row(
-                        symbol, pos['side'], f"{size}", f"{entry_price:.5f}", # Formatted entry price
+                        symbol, pos['side'], f"{size}", f"{entry_price:.5f}",
                         f"{current_price:.5f}", f"{upnl:+.2f}"
                     )
 
@@ -213,6 +224,7 @@ class DashboardApp(App):
                 recent_trades_table.add_row(trade['symbol'], f"{trade['pnl']:.2f}", trade['exit_reason'], f"{trade['holding_minutes']:.1f}")
 
         except Exception as e:
+            # This will now only catch unexpected errors
             self.query_one("#kpi_pnl").update(f"ERROR:\n{e}")
 
 if __name__ == "__main__":
