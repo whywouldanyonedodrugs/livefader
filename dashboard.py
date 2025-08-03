@@ -31,8 +31,23 @@ class DashboardApp(App):
     Screen { color: #FFBF00; }
     #main_container { layout: grid; grid-size: 3; grid-gutter: 1; padding: 0 1; }
     #logo { column-span: 3; height: 9; content-align: center middle; }
-    #kpi_container { column-span: 3; layout: grid; grid-size: 4; grid-gutter: 1; height: 5; }
-    .kpi_box, .chart_box { border: heavy #FFBF00; border-title-align: center; padding: 1; }
+    #kpi_container {
+        /* FIX: Correct column span to use the full width */
+        column-span: 3;
+        layout: grid;
+        grid-size: 4;
+        grid-gutter: 1;
+        height: 5;
+    }
+    .kpi_box, .chart_box {
+        border: heavy #FFBF00;
+        border-title-align: center;
+        padding: 1;
+    }
+    /* FIX: Add explicit content alignment for KPI boxes */
+    .kpi_box {
+        content-align: center middle;
+    }
     .chart_box { height: 12; }
     DataTable { column-span: 3; border: heavy #FFBF00; border-title-align: center; height: 12; }
     """
@@ -79,6 +94,7 @@ class DashboardApp(App):
         return "\n".join(chart)
 
     def compose(self) -> ComposeResult:
+        # ... (This function is correct and does not need changes) ...
         yield Header(show_clock=True)
         with Container(id="main_container"):
             yield Static(ASCII_LOGO, id="logo")
@@ -88,7 +104,6 @@ class DashboardApp(App):
                 yield Static("", classes="kpi_box", id="kpi_profit_factor")
                 yield Static("", classes="kpi_box", id="kpi_open_positions")
             
-            # FIX: The ID is 'equity_chart'
             yield Static("", classes="chart_box", id="equity_chart")
             yield Static("", classes="chart_box", id="regime_chart")
             yield Static("", classes="chart_box", id="session_chart")
@@ -98,6 +113,7 @@ class DashboardApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
+        # ... (This function is correct and does not need changes) ...
         if not self.db_dsn:
             self.query_one("#kpi_pnl").border_title = "Error"
             self.query_one("#kpi_pnl").update("DB_DSN not found")
@@ -112,7 +128,6 @@ class DashboardApp(App):
         self.query_one("#kpi_win_rate").border_title = "Win Rate"
         self.query_one("#kpi_profit_factor").border_title = "Profit Factor"
         self.query_one("#kpi_open_positions").border_title = "Open Positions"
-        # FIX: Use the correct ID 'equity_chart'
         self.query_one("#equity_chart").border_title = "Equity Curve"
         self.query_one("#regime_chart").border_title = "Wins by Market Regime"
         self.query_one("#session_chart").border_title = "Wins by Trading Session"
@@ -135,7 +150,6 @@ class DashboardApp(App):
         if not self.pool: return
 
         try:
-            # FIX: The full, correct query
             kpi_query = """
                 SELECT
                     COUNT(*) FILTER (WHERE status = 'OPEN') AS open_positions,
@@ -148,29 +162,31 @@ class DashboardApp(App):
             """
             open_pos_query = "SELECT symbol, side, size, entry_price FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
             recent_trades_query = "SELECT symbol, pnl, exit_reason, holding_minutes FROM positions WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 10"
-            equity_query = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100" # ASC for chronological order
+            equity_query = "SELECT equity FROM equity_snapshots ORDER BY ts ASC LIMIT 100"
             regime_query = "SELECT market_regime_at_entry, COUNT(*) as wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY market_regime_at_entry"
             session_query = "SELECT session_tag_at_entry, COUNT(*) as wins FROM positions WHERE status = 'CLOSED' AND pnl > 0 GROUP BY session_tag_at_entry"
 
-            # FIX: The full, correct gather call
             kpis, open_positions, recent_trades, equity_records, regime_wins, session_wins = await asyncio.gather(
                 self.pool.fetchrow(kpi_query), self.pool.fetch(open_pos_query),
                 self.pool.fetch(recent_trades_query), self.pool.fetch(equity_query),
                 self.pool.fetch(regime_query), self.pool.fetch(session_query)
             )
 
-            # --- Update KPI Widgets ---
-            self.query_one("#kpi_open_positions").update(f"\n{kpis['open_positions'] or 0}")
+            # --- FIX: Remove the manual '\n' from the update strings ---
+            self.query_one("#kpi_open_positions").update(f"{kpis['open_positions'] or 0}")
+            
             total_pnl = kpis['total_pnl'] or 0.0
-            self.query_one("#kpi_pnl").update(f"\n${total_pnl:,.2f}")
+            self.query_one("#kpi_pnl").update(f"${total_pnl:,.2f}")
+            
             win_count = kpis['win_count'] or 0
             total_closed = kpis['total_closed'] or 0
             win_rate = (win_count / total_closed) * 100 if total_closed > 0 else 0.0
-            self.query_one("#kpi_win_rate").update(f"\n{win_rate:.2f}%")
+            self.query_one("#kpi_win_rate").update(f"{win_rate:.2f}%")
+            
             gross_profit = kpis['gross_profit'] or 0.0
             gross_loss = kpis['gross_loss'] or 0.0
             profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 else float('inf')
-            self.query_one("#kpi_profit_factor").update(f"\n{profit_factor:.2f}")
+            self.query_one("#kpi_profit_factor").update(f"{profit_factor:.2f}")
 
             # --- Update Text-Based Equity Curve ---
             # FIX: Use the correct ID 'equity_chart'
