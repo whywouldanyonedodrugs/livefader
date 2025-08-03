@@ -192,9 +192,7 @@ class DashboardApp(App):
             if equity_records and len(equity_records) > 1:
                 equity_data = [float(r['equity']) for r in equity_records]
                 start_eq, current_eq = equity_data[0], equity_data[-1]
-                min_eq, max_eq = min(equity_data), max(equity_data)
                 change_pct = (current_eq / start_eq - 1) * 100 if start_eq > 0 else 0
-                
                 info_line = f" Start: ${start_eq:,.2f}  Current: ${current_eq:,.2f} ({change_pct:+.2f}%)"
                 chart = self._create_equity_barchart(equity_data)
                 equity_chart.update(f"{info_line}\n\n{chart}")
@@ -208,35 +206,52 @@ class DashboardApp(App):
             # --- Update Live Positions Table ---
             open_pos_table = self.query_one("#open_positions_table")
             open_pos_table.clear()
+            open_pos_table.add_columns(
+                "Symbol", "Side", "Size", "Entry Price", "Current Price", "UPnL ($)"
+            )
+
             if open_positions:
-                # Create the list of symbols in the format ccxt expects (e.g., 'MUSDT/USDT')
                 symbols_to_fetch = [f"{pos['symbol']}/USDT" for pos in open_positions]
                 tickers = await self.exchange.fetch_tickers(symbols_to_fetch)
-                
                 for pos in open_positions:
                     symbol_db = pos['symbol']
-                    # FIX: Use the correctly formatted key for the lookup
                     ticker_key = f"{symbol_db}/USDT"
-                    
                     current_price = tickers.get(ticker_key, {}).get('last', 0.0)
                     entry_price = float(pos['entry_price'])
                     size = float(pos['size'])
-                    upnl = (entry_price - current_price) * size if pos['side'] == 'short' else (current_price - entry_price) * size
-                    
+                    upnl = (
+                        (entry_price - current_price) * size
+                        if pos['side'] == 'short'
+                        else (current_price - entry_price) * size
+                    )
                     open_pos_table.add_row(
-                        symbol_db, pos['side'], f"{size}", f"{entry_price:.5f}",
-                        f"{current_price:.5f}", f"{upnl:+.2f}"
+                        symbol_db,
+                        pos['side'],
+                        f"{size}",
+                        f"{entry_price:.5f}",
+                        f"{current_price:.5f}",
+                        f"{upnl:+.2f}"
                     )
 
             # --- Update Recent Trades Table ---
             recent_trades_table = self.query_one("#recent_trades_table")
             recent_trades_table.clear()
+            recent_trades_table.add_columns(
+                "Symbol", "PnL", "Exit Reason", "Hold (m)"
+            )
+
             if recent_trades:
                 for trade in recent_trades:
-                    recent_trades_table.add_row(trade['symbol'], f"{trade['pnl']:.2f}", trade['exit_reason'], f"{trade['holding_minutes']:.1f}")
+                    recent_trades_table.add_row(
+                        trade['symbol'],
+                        f"{trade['pnl']:.2f}",
+                        trade['exit_reason'],
+                        f"{trade['holding_minutes']:.1f}"
+                    )
 
         except Exception as e:
             self.query_one("#kpi_pnl").update(f"ERROR:\n{e}")
+
 
 if __name__ == "__main__":
     app = DashboardApp()
