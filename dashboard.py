@@ -208,7 +208,7 @@ class DashboardApp(App):
         # draw an 8-row high bar chart
         chart = DashboardApp._ascii_ohlc_bars_minimal_colored(
             ohlcv,
-            rows=rows_available,,
+            rows=rows_available,
             max_bars=20,
         )
 
