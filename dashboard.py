@@ -65,95 +65,57 @@ class DashboardApp(App):
     def _ascii_ohlc_bars(
         ohlcv: list[list[float]],
         rows: int = 15,
-        max_bars: int = 30,        # number of OHLC bars, not text columns
-        centre_h: bool = True,
-        centre_v: bool = True,
+        max_bars: int = 30,
+        min_height: int = 5,           # 👈 at least this tall
     ) -> str:
         """
-        Return coloured OHLC bars (open tick left, close tick right).
-
-        • Up-bar  (close ≥ open) → bright_green
-        • Down-bar                → bright_red
+        Classic OHLC bar (open tick left, close tick right).
+        One bar = 3 text columns, colour-coded:
+        • bright_green = close ≥ open
+        • bright_red   = close <  open
         """
+
         if len(ohlcv) < 2:
             return "Not enough data."
 
-        # ▸ down-sample so we never draw more than max_bars bars
-        stride = max(1, len(ohlcv) // max_bars)
-        data   = ohlcv[-stride * max_bars :: stride]
+        # — 1) down-sample so we never exceed max_bars —
+        step  = max(1, len(ohlcv) // max_bars)
+        data  = ohlcv[-step * max_bars :: step]
 
-        hi = max(r[2] for r in data)
-        lo = min(r[3] for r in data)
-        span = (hi - lo) or 1e-9
-        compress = 0.4                      # 0 – 1  (smaller ⇒ “squash” bars)
-        usable   = max(1, int(rows * compress))
-        pad_top  = (rows - usable) // 2       # equal top / bottom padding
-        pad_bot  = rows - usable - pad_top
-        rows_minus1 = usable - 1
+        # allocate canvas (rows × 3·bars)
+        W = 3 * len(data)
+        grid = [[" "] * W for _ in range(rows)]
 
-        # --- vertical mapping: centre on mid-price --------------------------
-        mid   = (hi + lo) / 2
-        half  = max(hi - mid, mid - lo) or 1e-9        # symmetric span
-        center_row  = rows // 2                        # zero-based
-        scale_rows  = rows // 2 - 1                    # rows above / below mid
-
-        def y(price: float) -> int:
-            """
-            Map price → row index such that
-            mid  → center_row
-            mid+half → top of band
-            mid-half → bottom of band
-            """
+        # helper: centre one bar inside the full height
+        def y_map(high: float, low: float, price: float) -> int:
+            span = max(high - low, 1e-9)
+            # force stem to be ≥ min_height
+            span = max(span, 1 / rows * min_height * span)
+            mid  = (high + low) / 2
+            half = span / 2
             offset = (price - mid) / half
-            return int(center_row - offset * scale_rows)
+            return int(rows // 2 - offset * (rows // 2 - 1))
 
-        width  = 3 * len(data)                      # 3 characters per bar
-        canvas = [[" "] * width for _ in range(rows)]
+        for idx, (_, o, h, l, c, _) in enumerate(data):
+            up   = c >= o
+            clr  = "bright_green" if up else "bright_red"
+            xmid = 3 * idx + 1           # centre column of this bar
 
-        min_height = 3                      # ← never render a bar shorter than this
+            # map prices → rows
+            top = y_map(h, l, h)
+            bot = y_map(h, l, l)
+            y_open  = y_map(h, l, o)
+            y_close = y_map(h, l, c)
 
-        for i, (_, o, h, l, c, _) in enumerate(data):
-            col  = "bright_green" if c >= o else "bright_red"
-            x0   = 3 * i + 1
+            # draw stem first
+            for r in range(min(top, bot), max(top, bot) + 1):
+                grid[r][xmid] = f"[{clr}]│[/]"
 
-            # 1️⃣ map prices to rows, force at least min_height
-            top, bot = y(h), y(l)
-            if top - bot + 1 < min_height:
-                pad = (min_height - (top - bot + 1)) // 2
-                top += pad
-                bot -= pad
-            body_open  = y(o)
-            body_close = y(c)
+            # overwrite with ticks so they sit on top of the stem
+            grid[y_open ][xmid - 1] = f"[{clr}]─[/]"
+            grid[y_close][xmid + 1] = f"[{clr}]─[/]"
 
-            # 2️⃣ draw the vertical stem first
-            for r in range(bot, top + 1):
-                canvas[r][x0] = f"[{col}]│[/]"
-
-            # 3️⃣ overwrite with ticks (so they lie on top)
-            canvas[body_open][x0 - 1] = f"[{col}]─[/]"
-            canvas[body_close][x0 + 1] = f"[{col}]─[/]"
-
-        # join rows
-        lines = ["".join(r) for r in canvas]
-
-        # horizontal centring
-        if centre_h and len(data) < max_bars:
-            pad_cols = (max_bars - len(data)) // 2 * 3
-            pad = " " * pad_cols
-            lines = [pad + ln + pad for ln in lines]
-
-        # vertical centring
-        if centre_v:
-            non_blank = [i for i, ln in enumerate(lines) if ln.strip()]
-            if non_blank:
-                top, bot = min(non_blank), max(non_blank)
-                used = bot - top + 1
-                pad_top  = (rows - used) // 2
-                pad_bot  = rows - used - pad_top
-                blank    = " " * len(lines[0])
-                lines = [blank]*pad_top + lines[top:bot+1] + [blank]*pad_bot
-
-        return "\n".join(lines)
+        return "\n".join("".join(r) for r in grid)
 
     
     @staticmethod
@@ -241,7 +203,7 @@ class DashboardApp(App):
 
         chart  = DashboardApp._ascii_ohlc_bars(ohlcv, rows=15, max_bars=30)
         panel  = self.query_one("#candle_chart")
-        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m  (OHLC)"
+        panel.border_title = f"{pair} – {len(ohlcv)} × 15 m (OHLC)"
         panel.update(Text.from_markup(chart))
 
     # ────────────────────────── compose ──────────────────────────
