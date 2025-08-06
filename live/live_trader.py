@@ -471,7 +471,25 @@ class LiveTrader:
                     if zero_volume_pct > 0.25:
                         LOG.warning("DATA_ERROR for %s on %s: Detected stale data (%.0f%% zero volume). Skipping symbol.", symbol, tf, zero_volume_pct * 100)
                         return None
-                
+
+                # --- FIX: VWAP calculation is now unconditional ---
+                tf_minutes = 5 # Assuming 5m base timeframe
+                vwap_bars = int((self.cfg.get("GAP_VWAP_HOURS", 24) * 60) / tf_minutes)
+                vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
+                vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
+                df5['vwap'] = vwap_num / vwap_den
+                df5['vwap_dev'] = abs(df5['close'] - df5['vwap']) / df5['vwap']
+
+                # The filter's decision logic
+                if self.cfg.get("GAP_FILTER_ENABLED", True):
+                    df5['vwap_ok'] = df5['vwap_dev'] <= self.cfg.get("GAP_MAX_DEV_PCT", 0.01)
+                    df5['vwap_consolidated'] = df5['vwap_ok'].rolling(self.cfg.get("GAP_MIN_BARS", 12)).min().fillna(0).astype(bool)
+                else:
+                    # If the filter is off, it never vetoes the trade
+                    df5['vwap_consolidated'] = True
+                # --- END OF FIX ---
+
+
                 df.drop(df.index[-1], inplace=True)
                 if df.empty: return None
                 dfs[tf] = df
@@ -968,38 +986,59 @@ class LiveTrader:
         closed_at = datetime.now(timezone.utc)
         opened_at = pos["opened_at"]
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
-        
         entry_price_float = float(pos["entry_price"])
         pnl_pct = ((entry_price_float / exit_price) - 1) * 100 if exit_price > 0 else 0.0
-
-        # Initialize metrics to 0 in case the data fetch fails
-        mae_usd, mfe_usd, mae_over_atr, mfe_over_atr, realized_vol_during_trade = 0, 0, 0, 0, 0
+        
+        mae_usd, mfe_usd, mae_over_atr, mfe_over_atr = 0, 0, 0, 0
+        realized_vol_during_trade, btc_beta_during_trade = 0.0, 0.0
         
         try:
-            # Fetch 1-minute OHLCV data for the trade's duration to calculate MAE/MFE/Vol
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000))
-            if ohlcv:
-                trade_df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                trade_df['timestamp'] = pd.to_datetime(trade_df['timestamp'], unit='ms', utc=True)
-                # Filter for the exact duration of the trade
-                trade_df = trade_df[trade_df['timestamp'] <= closed_at]
+            since_ts = int(opened_at.timestamp() * 1000)
+            # Fetch data for both the traded asset and the benchmark (BTC)
+            asset_ohlcv, btc_ohlcv = await asyncio.gather(
+                self.exchange.fetch_ohlcv(symbol, '1m', since=since_ts),
+                self.exchange.fetch_ohlcv('BTCUSDT', '1m', since=since_ts)
+            )
 
-                if not trade_df.empty:
-                    high_during_trade = trade_df['high'].max()
-                    low_during_trade = trade_df['low'].min()
-                    
-                    # For a short position
+            if asset_ohlcv and btc_ohlcv:
+                asset_df = pd.DataFrame(asset_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                asset_df['ts'] = pd.to_datetime(asset_df['ts'], unit='ms', utc=True)
+                asset_df = asset_df[(asset_df['ts'] >= opened_at) & (asset_df['ts'] <= closed_at)].set_index('ts')
+
+                btc_df = pd.DataFrame(btc_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                btc_df['ts'] = pd.to_datetime(btc_df['ts'], unit='ms', utc=True)
+                btc_df = btc_df[(btc_df['ts'] >= opened_at) & (btc_df['ts'] <= closed_at)].set_index('ts')
+
+                if not asset_df.empty:
+                    high_during_trade = asset_df['h'].max()
+                    low_during_trade = asset_df['l'].min()
                     mae_usd = (high_during_trade - entry_price_float) * float(pos["size"])
                     mfe_usd = (entry_price_float - low_during_trade) * float(pos["size"])
-                    
                     atr_at_entry = float(pos["atr"])
                     mae_over_atr = (high_during_trade - entry_price_float) / atr_at_entry if atr_at_entry > 0 else 0
                     mfe_over_atr = (entry_price_float - low_during_trade) / atr_at_entry if atr_at_entry > 0 else 0
                     
-                    # Annualized volatility of 1-minute returns during the trade
-                    realized_vol_during_trade = trade_df['close'].pct_change().std() * np.sqrt(365 * 24 * 60)
+                    asset_returns = asset_df['c'].pct_change().dropna()
+                    if not asset_returns.empty:
+                        realized_vol_during_trade = asset_returns.std() * np.sqrt(365 * 24 * 60)
+
+                # --- FIX: BTC Beta Calculation Logic ---
+                if not asset_df.empty and not btc_df.empty:
+                    asset_returns = asset_df['c'].pct_change().rename('asset')
+                    btc_returns = btc_df['c'].pct_change().rename('btc')
+                    combined_df = pd.concat([asset_returns, btc_returns], axis=1).dropna()
+                    
+                    # Require at least 5 minutes of overlapping data for a meaningful calculation
+                    if len(combined_df) > 5:
+                        covariance = combined_df['asset'].cov(combined_df['btc'])
+                        variance = combined_df['btc'].var()
+                        if variance > 0:
+                            btc_beta_during_trade = covariance / variance
+                            LOG.info("Calculated BTC Beta for %s: %.4f", symbol, btc_beta_during_trade)
+
         except Exception as e:
-            LOG.warning("Could not calculate MAE/MFE/Vol for %s: %s", symbol, e)
+            # Add more detailed logging to see why it might fail
+            LOG.warning("Could not calculate advanced post-trade metrics for %s: %s", symbol, e)
 
         # --- 3. Finalize and Clean Up ---
         # Unconditionally cancel ALL orders for this symbol to ensure a clean slate.
