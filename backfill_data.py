@@ -4,7 +4,8 @@ import asyncio
 import asyncpg
 import logging
 import os
-from datetime import datetime, timezone
+# FIX: Added timedelta to the import list
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
