@@ -16,7 +16,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 LOG = logging.getLogger(__name__)
 
 # --- Replicated Indicator Logic from the Bot ---
-# This makes the script self-contained and guarantees consistent calculations.
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 def atr(df, period=14):
     tr = pd.DataFrame({'h-l': df['h'] - df['l'], 'h-pc': abs(df['h'] - df['c'].shift()), 'l-pc': abs(df['l'] - df['c'].shift())}).max(axis=1)
@@ -56,12 +55,15 @@ async def main():
         exchange = ccxt.bybit({'enableRateLimit': True})
         await exchange.load_markets()
         
-        # Find all trades where key data is missing
+        # --- FIX: A much more comprehensive query to find all broken trades ---
         query = """
             SELECT * FROM positions 
             WHERE status = 'CLOSED' AND (
-                adx_at_entry IS NULL OR 
-                exit_reason IS NULL OR 
+                adx_at_entry IS NULL OR
+                vwap_dev_pct_at_entry = 0 OR
+                btc_beta_during_trade IS NULL OR
+                btc_beta_during_trade = 0 OR
+                exit_reason IS NULL OR
                 exit_reason IN ('UNKNOWN', 'FALLBACK', 'UNKNOWN_CLOSE')
             ) ORDER BY id
         """
@@ -84,13 +86,11 @@ async def main():
                 pnl = float(trade['pnl'])
                 atr_at_entry_db = float(trade['atr'])
 
-                # --- 1. Fix Exit Reason & Contextual Metrics ---
                 inferred_exit_reason = 'TP' if pnl > 0 else 'SL'
                 hour_of_day = opened_at.hour
                 day_of_week = opened_at.weekday()
                 session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
-                # --- 2. Fetch All Necessary Historical Data ---
                 since_ts_1d = int((opened_at - timedelta(days=40)).timestamp() * 1000)
                 since_ts_4h = int((opened_at - timedelta(days=100)).timestamp() * 1000)
                 since_ts_1h = int((opened_at - timedelta(days=25)).timestamp() * 1000)
@@ -108,7 +108,6 @@ async def main():
                 df1h = pd.DataFrame(ohlcv_1h, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
                 df5m = pd.DataFrame(ohlcv_5m, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
 
-                # --- 3. Calculate All Pre-Trade Metrics ---
                 adx_at_entry = adx(df1h, 14).iloc[-1]
                 ema_fast_at_entry = ema(df4h['c'], 12).iloc[-1]
                 ema_slow_at_entry = ema(df4h['c'], 26).iloc[-1]
@@ -119,7 +118,6 @@ async def main():
                 vwap = (vwap_num / vwap_den).iloc[-1]
                 vwap_dev_pct_at_entry = abs(entry_price - vwap) / vwap if vwap > 0 else 0.0
 
-                # --- 4. Calculate Post-Trade Metrics ---
                 ohlcv_1m_asset, ohlcv_1m_btc = await asyncio.gather(
                     exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000)),
                     exchange.fetch_ohlcv('BTCUSDT', '1m', since=int(opened_at.timestamp() * 1000))
@@ -140,12 +138,11 @@ async def main():
                         asset_returns = df1m_asset['c'].pct_change().rename('asset')
                         btc_returns = df1m_btc['c'].pct_change().rename('btc')
                         combined_df = pd.concat([asset_returns, btc_returns], axis=1).dropna()
-                        if len(combined_df) > 5: # Require at least 5 minutes of data
+                        if len(combined_df) > 5:
                             covariance = combined_df['asset'].cov(combined_df['btc'])
                             variance = combined_df['btc'].var()
                             btc_beta_during_trade = covariance / variance if variance > 0 else 0.0
 
-                # --- 5. Update the Database Record ---
                 update_query = """
                     UPDATE positions SET
                         exit_reason = $1, adx_at_entry = $2, vwap_dev_pct_at_entry = $3,
