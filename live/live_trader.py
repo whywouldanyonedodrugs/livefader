@@ -1146,26 +1146,32 @@ class LiveTrader:
             await self.tg.send(msg)
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
-        symbol = pos["symbol"]
-        try:
-            await self.exchange.cancel_all_orders(symbol)
-            # FIX: Cast size to float
-            await self.exchange.create_market_order(symbol, "buy", float(pos["size"]), params={'reduceOnly': True})
-        except Exception as e:
-            LOG.warning("Force-close order issue on %s: %s", symbol, e)
+            symbol = pos["symbol"]
+            try:
+                # This part is correct
+                await self.exchange.cancel_all_orders(symbol)
+                await self.exchange.create_market_order(symbol, "buy", float(pos["size"]), params={'reduceOnly': True})
+            except Exception as e:
+                LOG.warning("Force-close order issue on %s: %s", symbol, e)
 
-        # FIX: Cast all values to float before math
-        last_price = float((await self.exchange.fetch_ticker(symbol))["last"])
-        entry_price = float(pos["entry_price"])
-        size = float(pos["size"])
-        pnl = (entry_price - last_price) * size
-        
-        await self.db.update_position(pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl)
-        await self.db.add_fill(pid, tag, last_price, size, datetime.now(timezone.utc))
-        await self.risk.on_trade_close(pnl, self.tg)
-        self.last_exit[symbol] = datetime.now(timezone.utc)
-        del self.open_positions[pid]
-        await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
+            # This part is correct
+            last_price = float((await self.exchange.fetch_ticker(symbol))["last"])
+            entry_price = float(pos["entry_price"])
+            size = float(pos["size"])
+            pnl = (entry_price - last_price) * size
+            
+            # This part is correct
+            await self.db.update_position(pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl)
+            await self.db.add_fill(pid, tag, last_price, size, datetime.now(timezone.utc))
+            await self.risk.on_trade_close(pnl, self.tg)
+            self.last_exit[symbol] = datetime.now(timezone.utc)
+            
+            # --- FIX: Use .pop() for safe deletion ---
+            # This will remove the pid from the dictionary if it exists,
+            # and do nothing if it doesn't (preventing the KeyError on startup).
+            self.open_positions.pop(pid, None)
+            
+            await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
     async def _main_signal_loop(self):
         LOG.info("Starting main signal scan loop.")
