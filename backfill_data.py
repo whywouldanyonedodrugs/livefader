@@ -19,7 +19,7 @@ LOG = logging.getLogger(__name__)
 # --- Replicated Indicator Logic from the Bot ---
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 def atr(df, period=14):
-    tr = pd.DataFrame({'h-l': df['high'] - df['low'], 'h-pc': abs(df['high'] - df['close'].shift()), 'l-pc': abs(df['low'] - df['close'].shift())}).max(axis=1)
+    tr = pd.DataFrame({'h-l': df['h'] - df['l'], 'h-pc': abs(df['h'] - df['c'].shift()), 'l-pc': abs(df['l'] - df['c'].shift())}).max(axis=1)
     return ema(tr, period)
 def rsi(series, period=14):
     delta = series.diff()
@@ -31,11 +31,11 @@ def rsi(series, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 def adx(df, period=14):
-    plus_dm = df['high'].diff()
-    minus_dm = df['low'].diff()
+    plus_dm = df['h'].diff()
+    minus_dm = df['l'].diff()
     plus_dm[plus_dm < 0] = 0
     minus_dm[minus_dm > 0] = 0
-    tr = pd.DataFrame({'h-l': df['high'] - df['low'], 'h-pc': abs(df['high'] - df['close'].shift()), 'l-pc': abs(df['low'] - df['close'].shift())}).max(axis=1)
+    tr = pd.DataFrame({'h-l': df['h'] - df['l'], 'h-pc': abs(df['h'] - df['c'].shift()), 'l-pc': abs(df['l'] - df['c'].shift())}).max(axis=1)
     atr_val = ema(tr, period)
     plus_di = 100 * (ema(plus_dm, period) / atr_val)
     minus_di = 100 * (ema(abs(minus_dm), period) / atr_val)
@@ -108,8 +108,8 @@ async def main():
                 df5m = pd.DataFrame(ohlcv_5m, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
 
                 adx_at_entry = adx(df1h, 14).iloc[-1]
-                ema_fast_at_entry = ema(df4h['close'], 12).iloc[-1]
-                ema_slow_at_entry = ema(df4h['close'], 26).iloc[-1]
+                ema_fast_at_entry = ema(df4h['c'], 12).iloc[-1]
+                ema_slow_at_entry = ema(df4h['c'], 26).iloc[-1]
                 
                 vwap_num = (df5m['c'] * df5m['v']).rolling(48).sum()
                 vwap_den = df5m['v'].rolling(48).sum()
@@ -130,7 +130,6 @@ async def main():
                         mae_over_atr = mae / atr_at_entry_db if atr_at_entry_db > 0 else 0
                         mfe_over_atr = mfe / atr_at_entry_db if atr_at_entry_db > 0 else 0
 
-                # --- NEW: Full BTC Beta Calculation Logic ---
                 if ohlcv_1m_asset and ohlcv_1m_btc:
                     df1m_btc = pd.DataFrame(ohlcv_1m_btc, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[opened_at:closed_at]
                     if not df1m_asset.empty and not df1m_btc.empty:
@@ -141,7 +140,6 @@ async def main():
                             covariance = combined_df['asset'].cov(combined_df['btc'])
                             variance = combined_df['btc'].var()
                             btc_beta_during_trade = covariance / variance if variance > 0 else 0.0
-                # --- END OF NEW LOGIC ---
 
                 update_query = """
                     UPDATE positions SET
