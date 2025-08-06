@@ -472,36 +472,22 @@ class LiveTrader:
                         LOG.warning("DATA_ERROR for %s on %s: Detected stale data (%.0f%% zero volume). Skipping symbol.", symbol, tf, zero_volume_pct * 100)
                         return None
 
-                # --- FIX: VWAP calculation is now unconditional ---
-                tf_minutes = 5 # Assuming 5m base timeframe
-                vwap_bars = int((self.cfg.get("GAP_VWAP_HOURS", 24) * 60) / tf_minutes)
-                vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
-                vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
-                df5['vwap'] = vwap_num / vwap_den
-                df5['vwap_dev'] = abs(df5['close'] - df5['vwap']) / df5['vwap']
-
-                # The filter's decision logic
-                if self.cfg.get("GAP_FILTER_ENABLED", True):
-                    df5['vwap_ok'] = df5['vwap_dev'] <= self.cfg.get("GAP_MAX_DEV_PCT", 0.01)
-                    df5['vwap_consolidated'] = df5['vwap_ok'].rolling(self.cfg.get("GAP_MIN_BARS", 12)).min().fillna(0).astype(bool)
-                else:
-                    # If the filter is off, it never vetoes the trade
-                    df5['vwap_consolidated'] = True
-                # --- END OF FIX ---
-
 
                 df.drop(df.index[-1], inplace=True)
                 if df.empty: return None
                 dfs[tf] = df
 
+            # 1. Define df5 from the dictionary of all dataframes
             df5 = dfs[base_tf]
+
+            # 2. Now that df5 exists, perform all calculations on it
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
             df5['rsi'] = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
             df5['atr'] = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
             df5['adx'] = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
-            tf_minutes = 5
+            tf_minutes = 5 # Assuming 5m base timeframe
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
             df5['price_boom_ago'] = df5['close'].shift(boom_bars)
@@ -510,6 +496,7 @@ class LiveTrader:
             df1d = dfs['1d']
             ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
 
+            # 3. This is the correct location for the VWAP calculation
             if self.cfg.get("GAP_FILTER_ENABLED", True):
                 vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
                 vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
@@ -519,6 +506,7 @@ class LiveTrader:
                 df5['vwap_ok'] = df5['vwap_dev'] <= cfg.GAP_MAX_DEV_PCT
                 df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
             else:
+                # If filter is disabled, create placeholder columns to prevent errors
                 df5['vwap_consolidated'] = True
                 df5['vwap_dev'] = 0.0
                 df5['vwap_ok'] = True
@@ -583,7 +571,7 @@ class LiveTrader:
                 f"====================================================\n"
             )
 
-            if price_boom and price_slowdown and ema_down: # Your existing signal condition
+            if price_boom and price_slowdown and ema_down:
                 LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, last['close'])
                 return Signal(
                     symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
@@ -598,7 +586,9 @@ class LiveTrader:
                     listing_age_days=listing_age_days,
                     session_tag=session_tag,
                     day_of_week=day_of_week,
-                    hour_of_day=hour_of_day
+                    hour_of_day=hour_of_day,
+                    # This was missing from the original Signal object creation
+                    vwap_consolidated=bool(last.get('vwap_consolidated', False))
                 )
             return None
 
