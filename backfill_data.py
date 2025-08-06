@@ -1,10 +1,9 @@
-# /opt/livefader/src/backfill_data.py
+# /opt/livefader/src/backfill_data_full.py
 
 import asyncio
 import asyncpg
 import logging
 import os
-# FIX: Added timedelta to the import list
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import pandas as pd
@@ -13,18 +12,11 @@ import statsmodels.api as sm
 import ccxt.async_support as ccxt
 from tqdm import tqdm
 
-import warnings
-from statsmodels.tools.sm_exceptions import ValueWarning
-warnings.simplefilter('ignore', ValueWarning)
-
 # --- Basic Configuration ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 LOG = logging.getLogger(__name__)
 
+# --- Replicated Indicator Logic from the Bot ---
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 def atr(df, period=14):
     tr = pd.DataFrame({'h-l': df['high'] - df['low'], 'h-pc': abs(df['high'] - df['close'].shift()), 'l-pc': abs(df['low'] - df['close'].shift())}).max(axis=1)
@@ -49,54 +41,11 @@ def adx(df, period=14):
     minus_di = 100 * (ema(abs(minus_dm), period) / atr_val)
     dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
     return ema(dx, period)
-def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period, min_periods=period).mean().rolling(window=period, min_periods=period).mean()
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    tr1 = pd.DataFrame(df['high'] - df['low'])
-    tr2 = pd.DataFrame(abs(df['high'] - df['close'].shift(1)))
-    tr3 = pd.DataFrame(abs(df['low'] - df['close'].shift(1)))
-    tr = pd.concat([tr1, tr2, tr3], axis=1, join='inner').max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 async def calculate_historical_regime(exchange, opened_at: datetime) -> str:
-    """Calculates the market regime for a specific historical date."""
-    try:
-        since_ts = int((opened_at - timedelta(days=500)).timestamp() * 1000)
-        ohlcv = await exchange.fetch_ohlcv('BTCUSDT', '1d', since=since_ts, limit=500)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-        df = df[df['timestamp'] < opened_at] # Use data available *before* the trade
-        df.set_index('timestamp', inplace=True)
-
-        daily_returns = df['close'].pct_change().dropna()
-        
-        # Volatility Regime
-        model = sm.tsa.MarkovRegression(daily_returns, k_regimes=2, switching_variance=True)
-        results = model.fit(disp=False)
-        low_vol_regime_idx = np.argmin(results.params[-2:])
-        vol_regime = "LOW_VOL" if results.smoothed_marginal_probabilities[low_vol_regime_idx].iloc[-1] > 0.5 else "HIGH_VOL"
-
-        # Trend Regime
-        df['tma'] = triangular_moving_average(df['close'], 100)
-        atr_series = atr(df, period=20)
-        df['keltner_upper'] = df['tma'] + (atr_series * 2.0)
-        df['keltner_lower'] = df['tma'] - (atr_series * 2.0)
-        df.dropna(inplace=True)
-        
-        last_day = df.iloc[-1]
-        if last_day['close'] > last_day['keltner_upper']:
-            trend_regime = "BULL"
-        elif last_day['close'] < last_day['keltner_lower']:
-            trend_regime = "BEAR"
-        else:
-            trend_regime = "UNKNOWN" # Can't easily determine trend in the middle
-
-        return f"{trend_regime}_{vol_regime}"
-    except Exception as e:
-        LOG.warning(f"Could not calculate historical regime for {opened_at.date()}: {e}")
-        return "UNKNOWN"
+    # This is a complex calculation, for now we will keep it simple
+    # In a future version, we can replicate the full logic from the live bot
+    return "BACKFILLED"
 
 async def main():
     load_dotenv()
@@ -112,7 +61,14 @@ async def main():
         exchange = ccxt.bybit({'enableRateLimit': True})
         await exchange.load_markets()
         
-        query = "SELECT * FROM positions WHERE rsi_at_entry IS NULL AND status = 'CLOSED' ORDER BY id"
+        query = """
+            SELECT * FROM positions 
+            WHERE status = 'CLOSED' AND (
+                adx_at_entry IS NULL OR 
+                exit_reason IS NULL OR 
+                exit_reason IN ('UNKNOWN', 'FALLBACK', 'UNKNOWN_CLOSE')
+            ) ORDER BY id
+        """
         trades_to_fix = await conn.fetch(query)
 
         if not trades_to_fix:
@@ -129,68 +85,83 @@ async def main():
                 closed_at = trade['closed_at']
                 entry_price = float(trade['entry_price'])
                 size = float(trade['size'])
+                pnl = float(trade['pnl'])
+                atr_at_entry_db = float(trade['atr'])
 
-                # --- 1. Fetch All Necessary Historical Data ---
-                since_ts_1d = int((opened_at - timedelta(days=40)).timestamp() * 1000)
-                since_ts_1h = int((opened_at - timedelta(days=25)).timestamp() * 1000) # ~600 hours
-                
-                ohlcv_1d = await exchange.fetch_ohlcv(symbol, '1d', since=since_ts_1d, limit=40)
-                ohlcv_1h = await exchange.fetch_ohlcv(symbol, '1h', since=since_ts_1h, limit=600)
-                
-                df1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df1d['timestamp'] = pd.to_datetime(df1d['timestamp'], unit='ms', utc=True)
-                df1d = df1d[df1d['timestamp'] < opened_at]
+                inferred_exit_reason = 'TP' if pnl > 0 else 'SL'
+                hour_of_day = opened_at.hour
+                day_of_week = opened_at.weekday()
+                session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
-                df1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df1h['timestamp'] = pd.to_datetime(df1h['timestamp'], unit='ms', utc=True)
-                df1h = df1h[df1h['timestamp'] < opened_at]
+                since_ts_4h = int((opened_at - timedelta(days=100)).timestamp() * 1000)
+                since_ts_1h = int((opened_at - timedelta(days=25)).timestamp() * 1000)
+                since_ts_5m = int((opened_at - timedelta(days=5)).timestamp() * 1000)
 
-                # --- 2. Calculate All Pre-Trade Metrics ---
-                rsi_at_entry = rsi(df1h['close'], 14).iloc[-1]
+                ohlcv_4h, ohlcv_1h, ohlcv_5m = await asyncio.gather(
+                    exchange.fetch_ohlcv(symbol, '4h', since=since_ts_4h, limit=600),
+                    exchange.fetch_ohlcv(symbol, '1h', since=since_ts_1h, limit=600),
+                    exchange.fetch_ohlcv(symbol, '5m', since=since_ts_5m, limit=1440)
+                )
+
+                df4h = pd.DataFrame(ohlcv_4h, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
+                df1h = pd.DataFrame(ohlcv_1h, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
+                df5m = pd.DataFrame(ohlcv_5m, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
+
                 adx_at_entry = adx(df1h, 14).iloc[-1]
-                atr_pct_at_entry = (atr(df1h, 14).iloc[-1] / entry_price) * 100 if entry_price > 0 else 0
-                ret_30d_at_entry = (df1d['close'].iloc[-1] / df1d['close'].iloc[-30]) - 1 if len(df1d) >= 30 else 0.0
+                ema_fast_at_entry = ema(df4h['close'], 12).iloc[-1]
+                ema_slow_at_entry = ema(df4h['close'], 26).iloc[-1]
                 
-                # Simplified boom/slowdown
-                price_24h_ago = df1h[df1h['timestamp'] <= (opened_at - timedelta(hours=24))]['close'].iloc[-1]
-                price_4h_ago = df1h[df1h['timestamp'] <= (opened_at - timedelta(hours=4))]['close'].iloc[-1]
-                price_boom_pct = (entry_price / price_24h_ago) - 1
-                price_slowdown_pct = (entry_price / price_4h_ago) - 1
+                vwap_num = (df5m['c'] * df5m['v']).rolling(48).sum()
+                vwap_den = df5m['v'].rolling(48).sum()
+                vwap = (vwap_num / vwap_den).iloc[-1]
+                vwap_dev_pct_at_entry = abs(entry_price - vwap) / vwap if vwap > 0 else 0.0
 
-                market_regime = await calculate_historical_regime(exchange, opened_at)
-
-                # --- 3. Calculate Post-Trade Metrics ---
-                holding_minutes = (closed_at - opened_at).total_seconds() / 60
+                ohlcv_1m_asset, ohlcv_1m_btc = await asyncio.gather(
+                    exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000)),
+                    exchange.fetch_ohlcv('BTCUSDT', '1m', since=int(opened_at.timestamp() * 1000))
+                )
                 
-                ohlcv_1m = await exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000))
-                df1m = pd.DataFrame(ohlcv_1m, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-                df1m['ts'] = pd.to_datetime(df1m['ts'], unit='ms', utc=True)
-                df1m = df1m[(df1m['ts'] >= opened_at) & (df1m['ts'] <= closed_at)]
-                
-                mae_usd, mfe_usd = 0.0, 0.0
-                if not df1m.empty:
-                    mae_usd = (df1m['h'].max() - entry_price) * size
-                    mfe_usd = (entry_price - df1m['l'].min()) * size
+                mae_over_atr, mfe_over_atr, btc_beta_during_trade = 0.0, 0.0, 0.0
+                if ohlcv_1m_asset:
+                    df1m_asset = pd.DataFrame(ohlcv_1m_asset, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[opened_at:closed_at]
+                    if not df1m_asset.empty:
+                        mae = (df1m_asset['h'].max() - entry_price)
+                        mfe = (entry_price - df1m_asset['l'].min())
+                        mae_over_atr = mae / atr_at_entry_db if atr_at_entry_db > 0 else 0
+                        mfe_over_atr = mfe / atr_at_entry_db if atr_at_entry_db > 0 else 0
 
-                # --- 4. Update the Database Record ---
+                # --- NEW: Full BTC Beta Calculation Logic ---
+                if ohlcv_1m_asset and ohlcv_1m_btc:
+                    df1m_btc = pd.DataFrame(ohlcv_1m_btc, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[opened_at:closed_at]
+                    if not df1m_asset.empty and not df1m_btc.empty:
+                        asset_returns = df1m_asset['c'].pct_change().rename('asset')
+                        btc_returns = df1m_btc['c'].pct_change().rename('btc')
+                        combined_df = pd.concat([asset_returns, btc_returns], axis=1).dropna()
+                        if len(combined_df) > 2:
+                            covariance = combined_df['asset'].cov(combined_df['btc'])
+                            variance = combined_df['btc'].var()
+                            btc_beta_during_trade = covariance / variance if variance > 0 else 0.0
+                # --- END OF NEW LOGIC ---
+
                 update_query = """
                     UPDATE positions SET
-                        market_regime_at_entry = $1, rsi_at_entry = $2, adx_at_entry = $3,
-                        atr_pct_at_entry = $4, ret_30d_at_entry = $5, price_boom_pct_at_entry = $6,
-                        price_slowdown_pct_at_entry = $7, holding_minutes = $8, mae_usd = $9, mfe_usd = $10
-                    WHERE id = $11
+                        exit_reason = $1, adx_at_entry = $2, vwap_dev_pct_at_entry = $3,
+                        ema_fast_at_entry = $4, ema_slow_at_entry = $5, mae_over_atr = $6,
+                        mfe_over_atr = $7, session_tag_at_entry = $8, day_of_week_at_entry = $9,
+                        hour_of_day_at_entry = $10, btc_beta_during_trade = $11
+                    WHERE id = $12
                 """
                 await conn.execute(
-                    update_query, market_regime, rsi_at_entry, adx_at_entry,
-                    atr_pct_at_entry, ret_30d_at_entry, price_boom_pct,
-                    price_slowdown_pct, holding_minutes, mae_usd, mfe_usd, trade_id
+                    update_query, inferred_exit_reason, adx_at_entry, vwap_dev_pct_at_entry,
+                    ema_fast_at_entry, ema_slow_at_entry, mae_over_atr, mfe_over_atr,
+                    session_tag, day_of_week, hour_of_day, btc_beta_during_trade, trade_id
                 )
 
             except Exception as e:
                 LOG.error(f"Failed to backfill trade ID {trade['id']} ({trade['symbol']}): {e}")
                 continue
 
-        LOG.info("Backfilling process complete.")
+        LOG.info("Comprehensive backfilling process complete.")
 
     except Exception as e:
         LOG.error(f"A critical error occurred during the backfill process: {e}")
