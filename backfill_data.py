@@ -4,6 +4,7 @@ import asyncio
 import asyncpg
 import logging
 import os
+# FIX: Added timedelta to the import list
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import pandas as pd
@@ -12,12 +13,18 @@ import statsmodels.api as sm
 import ccxt.async_support as ccxt
 from tqdm import tqdm
 
+import warnings
+from statsmodels.tools.sm_exceptions import ValueWarning
+warnings.simplefilter('ignore', ValueWarning)
+
 # --- Basic Configuration ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 LOG = logging.getLogger(__name__)
 
-# --- Replicated Indicator Logic from the Bot ---
-# This makes the script self-contained and guarantees consistent calculations.
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 def atr(df, period=14):
     tr = pd.DataFrame({'h-l': df['high'] - df['low'], 'h-pc': abs(df['high'] - df['close'].shift()), 'l-pc': abs(df['low'] - df['close'].shift())}).max(axis=1)
@@ -45,9 +52,51 @@ def adx(df, period=14):
 def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period, min_periods=period).mean().rolling(window=period, min_periods=period).mean()
 
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr1 = pd.DataFrame(df['high'] - df['low'])
+    tr2 = pd.DataFrame(abs(df['high'] - df['close'].shift(1)))
+    tr3 = pd.DataFrame(abs(df['low'] - df['close'].shift(1)))
+    tr = pd.concat([tr1, tr2, tr3], axis=1, join='inner').max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
 async def calculate_historical_regime(exchange, opened_at: datetime) -> str:
-    # ... (This function is correct and remains the same) ...
-    return "UNKNOWN" # Placeholder
+    """Calculates the market regime for a specific historical date."""
+    try:
+        since_ts = int((opened_at - timedelta(days=500)).timestamp() * 1000)
+        ohlcv = await exchange.fetch_ohlcv('BTCUSDT', '1d', since=since_ts, limit=500)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df = df[df['timestamp'] < opened_at] # Use data available *before* the trade
+        df.set_index('timestamp', inplace=True)
+
+        daily_returns = df['close'].pct_change().dropna()
+        
+        # Volatility Regime
+        model = sm.tsa.MarkovRegression(daily_returns, k_regimes=2, switching_variance=True)
+        results = model.fit(disp=False)
+        low_vol_regime_idx = np.argmin(results.params[-2:])
+        vol_regime = "LOW_VOL" if results.smoothed_marginal_probabilities[low_vol_regime_idx].iloc[-1] > 0.5 else "HIGH_VOL"
+
+        # Trend Regime
+        df['tma'] = triangular_moving_average(df['close'], 100)
+        atr_series = atr(df, period=20)
+        df['keltner_upper'] = df['tma'] + (atr_series * 2.0)
+        df['keltner_lower'] = df['tma'] - (atr_series * 2.0)
+        df.dropna(inplace=True)
+        
+        last_day = df.iloc[-1]
+        if last_day['close'] > last_day['keltner_upper']:
+            trend_regime = "BULL"
+        elif last_day['close'] < last_day['keltner_lower']:
+            trend_regime = "BEAR"
+        else:
+            trend_regime = "UNKNOWN" # Can't easily determine trend in the middle
+
+        return f"{trend_regime}_{vol_regime}"
+    except Exception as e:
+        LOG.warning(f"Could not calculate historical regime for {opened_at.date()}: {e}")
+        return "UNKNOWN"
 
 async def main():
     load_dotenv()
