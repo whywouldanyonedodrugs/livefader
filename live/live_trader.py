@@ -1305,125 +1305,142 @@ class LiveTrader:
             }, indent=2))
 
     async def _resume(self):
-        """
-        On startup, intelligently load state from DB and reconcile with the exchange.
-        This version identifies valid positions FIRST, then cleans up only true orphans,
-        and includes all necessary reconciliation checks.
-        """
-        LOG.info("--> Resuming state with intelligent reconciliation...")
+            """
+            On startup, intelligently load state from DB and reconcile with the exchange.
+            This version identifies valid positions FIRST, then cleans up only true orphans,
+            and includes all necessary reconciliation checks.
+            """
+            LOG.info("--> Resuming state with intelligent reconciliation...")
 
-        # --- STEP 1: Fetch current state from both Exchange and Database ---
-        LOG.info("Step 1: Fetching open positions from EXCHANGE and DATABASE...")
-        try:
-            exchange_positions = await self.exchange.fetch_positions()
-            open_exchange_positions = {
-                p['info']['symbol']: p for p in exchange_positions if float(p['info'].get('size', 0)) > 0
-            }
-            LOG.info("...Success! Found %d positions on the exchange.", len(open_exchange_positions))
-        except Exception as e:
-            LOG.error("CRITICAL: Could not fetch exchange positions on startup: %s. Exiting.", e)
-            sys.exit(1)
+            # --- STEP 1: Fetch current state from both Exchange and Database ---
+            LOG.info("Step 1: Fetching open positions from EXCHANGE and DATABASE...")
+            try:
+                exchange_positions = await self.exchange.fetch_positions()
+                open_exchange_positions = {
+                    p['info']['symbol']: p for p in exchange_positions if float(p['info'].get('size', 0)) > 0
+                }
+                LOG.info("...Success! Found %d positions on the exchange.", len(open_exchange_positions))
+            except Exception as e:
+                LOG.error("CRITICAL: Could not fetch exchange positions on startup: %s. Exiting.", e)
+                sys.exit(1)
 
-        db_positions_rows = await self.db.fetch_open_positions()
-        db_positions = {r["symbol"]: dict(r) for r in db_positions_rows}
-        LOG.info("...Success! Found %d 'OPEN' positions in the database.", len(db_positions))
+            db_positions_rows = await self.db.fetch_open_positions()
+            db_positions = {r["symbol"]: dict(r) for r in db_positions_rows}
+            LOG.info("...Success! Found %d 'OPEN' positions in the database.", len(db_positions))
 
-        # --- STEP 2: Reconcile positions and identify all VALID client order IDs ---
-        LOG.info("Step 2: Reconciling positions and identifying valid protective orders...")
-        valid_cids = set()
-        
-        # Check for orphan positions on the exchange
-        for symbol, pos_data in open_exchange_positions.items():
-            if symbol not in db_positions:
-                msg = f"🚨 ORPHAN DETECTED: Position for {symbol} exists on exchange but not in DB. Closing immediately."
-                LOG.warning(msg)
-                await self.tg.send(msg)
-                try:
-                    side = 'buy' if pos_data['side'] == 'short' else 'sell'
-                    size = float(pos_data['info']['size'])
-                    await self.exchange.create_market_order(symbol, side, size, params={'reduceOnly': True})
-                except Exception as e:
-                    LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
+            # --- STEP 2: Reconcile positions and identify all VALID client order IDs ---
+            LOG.info("Step 2: Reconciling positions and identifying valid protective orders...")
+            valid_cids = set()
+            now_utc = datetime.now(timezone.utc)
 
-        # Check for DB/exchange mismatches and build the "safe list" of CIDs
-        for symbol, pos_row in list(db_positions.items()):
-            if symbol not in open_exchange_positions:
+            # Check for orphan positions on the exchange
+            for symbol, pos_data in open_exchange_positions.items():
+                if symbol not in db_positions:
+                    msg = f"🚨 ORPHAN DETECTED: Position for {symbol} exists on exchange but not in DB. Closing immediately."
+                    LOG.warning(msg)
+                    await self.tg.send(msg)
+                    try:
+                        side = 'buy' if pos_data['side'] == 'short' else 'sell'
+                        size = float(pos_data['info']['size'])
+                        await self.exchange.create_market_order(symbol, side, size, params={'reduceOnly': True})
+                    except Exception as e:
+                        LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
+
+            # Check for DB/exchange mismatches and build the "safe list" of CIDs
+            for symbol, pos_row in list(db_positions.items()):
                 pid = pos_row["id"]
-                LOG.warning(f"DB/EXCHANGE MISMATCH: Position {pid} for {symbol} is 'OPEN' in DB but not on exchange. Marking as closed.")
-                await self.db.update_position(pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=0)
-                del db_positions[symbol] # Remove from our list of valid positions
-                continue
-
-            # RESTORED: Check for size mismatches
-            ex_pos = open_exchange_positions[symbol]
-            db_size = float(pos_row['size'])
-            ex_size = float(ex_pos['info']['size'])
-            if abs(db_size - ex_size) > 1e-9:
-                pid = pos_row["id"]
-                msg = (f"🚨 SIZE MISMATCH on resume for {symbol} (pid {pid}): DB size is {db_size}, Exchange size is {ex_size}. Flagging for manual review.")
-                LOG.critical(msg)
-                await self.tg.send(msg)
-                await self.db.update_position(pid, status="SIZE_MISMATCH")
-                del db_positions[symbol] # This position is unsafe, don't treat its orders as valid
-                continue
-
-            # If we reach here, the position is valid. Add its CIDs to the safe list.
-            LOG.debug("Identified valid CIDs for position %s to preserve.", symbol)
-            if pos_row.get("sl_cid"): valid_cids.add(pos_row["sl_cid"])
-            if pos_row.get("tp1_cid"): valid_cids.add(pos_row["tp1_cid"])
-            if pos_row.get("tp_final_cid"): valid_cids.add(pos_row["tp_final_cid"])
-            if pos_row.get("sl_trail_cid"): valid_cids.add(pos_row["sl_trail_cid"])
-
-        LOG.info("...Identified %d CIDs belonging to valid positions.", len(valid_cids))
-
-        # --- STEP 3: Perform the INTELLIGENT Clean Slate Protocol ---
-        LOG.info("Step 3: Fetching all open orders to clean up ORPHANS ONLY...")
-        try:
-            # This helper function is more efficient than fetching for each symbol
-            all_open_orders = await self._all_open_orders_for_all_symbols()
-            
-            cancel_tasks = []
-            for order in all_open_orders:
-                cid = order.get("clientOrderId")
-                if cid and cid.startswith("bot_") and cid not in valid_cids:
-                    LOG.warning("Found orphaned order %s for symbol %s. Scheduling for cancellation.", cid, order['symbol'])
-                    cancel_tasks.append(self.exchange.cancel_order(order['id'], order['symbol'], params={'category': 'linear'}))
-            
-            if cancel_tasks:
-                LOG.info("Cancelling %d orphaned orders...", len(cancel_tasks))
-                await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                LOG.info("...Orphaned order cleanup complete.")
-            else:
-                LOG.info("...No orphaned orders found to cancel.")
                 
-        except Exception as e:
-            LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
-            traceback.print_exc()
+                if symbol not in open_exchange_positions:
+                    LOG.warning(f"DB/EXCHANGE MISMATCH: Position {pid} for {symbol} is 'OPEN' in DB but not on exchange. Marking as closed.")
+                    await self.db.update_position(pid, status="CLOSED", closed_at=now_utc, pnl=0, exit_reason="RECONCILE_CLOSE")
+                    del db_positions[symbol]
+                    continue
 
-        # --- STEP 4: Load final state into memory ---
-        LOG.info("Step 4: Loading final reconciled positions into memory...")
-        # We re-fetch from the DB to get the most up-to-date state after reconciliation
-        final_open_rows = await self.db.fetch_open_positions()
-        for r in final_open_rows:
-            self.open_positions[r["id"]] = dict(r)
-            LOG.info("...Successfully resumed and verified open position for %s (ID: %d)", r["symbol"], r["id"])
+                # --- NEW: Check for stale positions on restart ---
+                opened_at = pos_row.get("opened_at")
+                max_holding_duration = None
+                if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
+                    max_holding_duration = timedelta(hours=self.cfg.get("TIME_EXIT_HOURS", 4))
+                elif self.cfg.get("TIME_EXIT_ENABLED", False):
+                    max_holding_duration = timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
 
-        LOG.info("Step 5: Fetching peak equity from DB...")
-        peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
-        self.peak_equity = float(peak) if peak is not None else 0.0
-        LOG.info("...Initial peak equity loaded: $%.2f", self.peak_equity)
+                if opened_at and max_holding_duration and (now_utc - opened_at) > max_holding_duration:
+                    msg = f"⏰ STALE POSITION DETECTED on restart: {symbol} (pid {pid}) is older than the time limit. Forcing close."
+                    LOG.warning(msg)
+                    await self.tg.send(msg)
+                    # Use create_task to close in the background without blocking startup
+                    asyncio.create_task(self._force_close_position(pid, pos_row, tag="STALE_ON_RESTART"))
+                    # Remove from the list of positions to be loaded into memory
+                    del db_positions[symbol]
+                    continue # Skip to the next position
 
-        LOG.info("Step 6: Loading recent exit timestamps for cooldowns...")
-        cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS))
-        rows = await self.db.pool.fetch(
-            "SELECT symbol, closed_at FROM positions "
-            "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
-            timedelta(hours=cd_h),
-        )
-        for r in rows:
-            self.last_exit[r["symbol"]] = r["closed_at"]
-        
-        LOG.info("<-- Resume complete.")
+                # --- END OF NEW LOGIC ---
+
+                ex_pos = open_exchange_positions[symbol]
+                db_size = float(pos_row['size'])
+                ex_size = float(ex_pos['info']['size'])
+                if abs(db_size - ex_size) > 1e-9:
+                    msg = (f"🚨 SIZE MISMATCH on resume for {symbol} (pid {pid}): DB size is {db_size}, Exchange size is {ex_size}. Flagging for manual review.")
+                    LOG.critical(msg)
+                    await self.tg.send(msg)
+                    await self.db.update_position(pid, status="SIZE_MISMATCH")
+                    del db_positions[symbol]
+                    continue
+
+                LOG.debug("Identified valid CIDs for position %s to preserve.", symbol)
+                if pos_row.get("sl_cid"): valid_cids.add(pos_row["sl_cid"])
+                if pos_row.get("tp1_cid"): valid_cids.add(pos_row["tp1_cid"])
+                if pos_row.get("tp_final_cid"): valid_cids.add(pos_row["tp_final_cid"])
+                if pos_row.get("sl_trail_cid"): valid_cids.add(pos_row["sl_trail_cid"])
+
+            LOG.info("...Identified %d CIDs belonging to valid positions.", len(valid_cids))
+
+            # --- STEP 3: Perform the INTELLIGENT Clean Slate Protocol ---
+            LOG.info("Step 3: Fetching all open orders to clean up ORPHANS ONLY...")
+            try:
+                all_open_orders = await self._all_open_orders_for_all_symbols()
+                
+                cancel_tasks = []
+                for order in all_open_orders:
+                    cid = order.get("clientOrderId")
+                    if cid and cid.startswith("bot_") and cid not in valid_cids:
+                        LOG.warning("Found orphaned order %s for symbol %s. Scheduling for cancellation.", cid, order['symbol'])
+                        cancel_tasks.append(self.exchange.cancel_order(order['id'], order['symbol'], params={'category': 'linear'}))
+                
+                if cancel_tasks:
+                    LOG.info("Cancelling %d orphaned orders...", len(cancel_tasks))
+                    await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                    LOG.info("...Orphaned order cleanup complete.")
+                else:
+                    LOG.info("...No orphaned orders found to cancel.")
+                    
+            except Exception as e:
+                LOG.error("CRITICAL: Failed to perform clean slate protocol on startup: %s", e)
+                traceback.print_exc()
+
+            # --- STEP 4: Load final state into memory ---
+            LOG.info("Step 4: Loading final reconciled positions into memory...")
+            # The db_positions dict now only contains valid, non-stale positions
+            for symbol, pos_row in db_positions.items():
+                self.open_positions[pos_row["id"]] = pos_row
+                LOG.info("...Successfully resumed and verified open position for %s (ID: %d)", symbol, pos_row["id"])
+
+            LOG.info("Step 5: Fetching peak equity from DB...")
+            peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
+            self.peak_equity = float(peak) if peak is not None else 0.0
+            LOG.info("...Initial peak equity loaded: $%.2f", self.peak_equity)
+
+            LOG.info("Step 6: Loading recent exit timestamps for cooldowns...")
+            cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS))
+            rows = await self.db.pool.fetch(
+                "SELECT symbol, closed_at FROM positions "
+                "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
+                timedelta(hours=cd_h),
+            )
+            for r in rows:
+                self.last_exit[r["symbol"]] = r["closed_at"]
+            
+            LOG.info("<-- Resume complete.")
 
     async def run(self):
         await self.db.init()
