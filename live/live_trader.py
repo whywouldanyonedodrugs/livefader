@@ -634,8 +634,19 @@ class LiveTrader:
         bal = await self._fetch_platform_balance()
         free_usdt = bal["free"]["USDT"]
         risk_amt = await self._risk_amount(free_usdt)
-        stop_price_signal = sig.entry + self.cfg["SL_ATR_MULT"] * sig.atr
-        stop_dist = abs(sig.entry - stop_price_signal)
+
+        try:
+            # Fetch the most current price before calculating size
+            ticker = await self.exchange.fetch_ticker(sig.symbol)
+            current_price = float(ticker['last'])
+            LOG.info(f"Signal price for {sig.symbol} was {sig.entry:.4f}, but current price is {current_price:.4f}.")
+        except Exception as e:
+            LOG.error(f"Could not fetch live ticker for {sig.symbol} before entry. Aborting. Error: {e}")
+            return
+
+        stop_price_signal = current_price + self.cfg["SL_ATR_MULT"] * sig.atr
+        stop_dist = abs(current_price - stop_price_signal)
+        
         if stop_dist == 0:
             LOG.warning("VETO: Stop distance is zero for %s. Skipping.", sig.symbol)
             return
@@ -691,14 +702,21 @@ class LiveTrader:
 
         # --- Step 4: Persist to DB and place protective orders (CRITICAL BLOCK) ---
         try:
-            exit_deadline = (
-                datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
-                if self.cfg.get("TIME_EXIT_ENABLED", True) else None
-            )
+            # --- MODIFICATION: Prioritize hourly exit deadline calculation ---
+            exit_deadline = None
+            if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
+                exit_deadline = datetime.now(timezone.utc) + timedelta(hours=self.cfg.get("TIME_EXIT_HOURS", 4))
+                LOG.info(f"Setting hourly exit for {sig.symbol} at {exit_deadline.isoformat()}")
+            elif self.cfg.get("TIME_EXIT_ENABLED", False):
+                # Fallback to the daily exit if hourly is disabled
+                exit_deadline = datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
+                LOG.info(f"Setting daily exit for {sig.symbol} at {exit_deadline.isoformat()}")
+
             pid = await self.db.insert_position({
                 "symbol": sig.symbol, "side": "short", "size": actual_size,
                 "entry_price": actual_entry_price, "atr": sig.atr,
                 "status": "PENDING", "opened_at": datetime.now(timezone.utc),
+                "exit_deadline": exit_deadline, # Store the calculated deadline
                 # --- ALL NEW DATA ---
                 "risk_usd": risk_usd,
                 "slippage_usd": slippage_usd,
@@ -949,7 +967,7 @@ class LiveTrader:
         opened_at = pos["opened_at"]
         closed_at = datetime.now(timezone.utc)
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
-        
+
         # --- 1. Find the Closing Order and its True Price ---
         closing_order_cid = None
         if inferred_exit_reason:
@@ -958,7 +976,7 @@ class LiveTrader:
                 closing_order_cid = pos.get("tp_final_cid") or pos.get("tp2_cid") or pos.get("tp1_cid")
             elif inferred_exit_reason == "SL":
                 closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
-        
+
         if closing_order_cid:
             try:
                 order = await self._fetch_by_cid(closing_order_cid, symbol)
@@ -969,7 +987,6 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("Could not fetch exact closing order %s: %s", closing_order_cid, e)
 
-        # Fallback to ticker if the primary method fails
         if not exit_price:
             LOG.warning("Could not determine exact fill price for %d. Using last market price.", pid)
             ticker = await self.exchange.fetch_ticker(symbol)
@@ -977,73 +994,83 @@ class LiveTrader:
             exit_qty = float(pos["size"])
             closing_order_type = inferred_exit_reason or "FALLBACK"
 
-        # --- 2. Perform Post-Trade Calculations with Corrected MAE/MFE ---
+        # --- 2. Perform All Post-Trade Calculations ---
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
         entry_price_float = float(pos["entry_price"])
         pnl_pct = ((entry_price_float / exit_price) - 1) * 100 if exit_price > 0 else 0.0
-        
-        mae_usd, mfe_usd, mae_over_atr, mfe_over_atr = 0, 0, 0, 0
+
+        mae_usd, mfe_usd, mae_over_atr, mfe_over_atr = 0.0, 0.0, 0.0, 0.0
         realized_vol_during_trade, btc_beta_during_trade = 0.0, 0.0
 
         try:
-            # Fetch 1-minute OHLCV data for the trade's duration
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000))
+            # For a short position: MAE is price UP, MFE is price DOWN.
+            if closing_order_type == "SL":
+                mae_usd = (exit_price - entry_price_float) * float(pos["size"])
+            elif closing_order_type in ["TP", "TP1", "TP2", "TP_FINAL"]:
+                mfe_usd = (entry_price_float - exit_price) * float(pos["size"])
+
+            # Fetch 1-minute OHLCV data for the trade's duration for remaining calculations.
+            since_ts = int(opened_at.timestamp() * 1000)
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=since_ts)
+            
             if ohlcv:
                 trade_df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
                 trade_df['ts'] = pd.to_datetime(trade_df['ts'], unit='ms', utc=True)
                 trade_df = trade_df[trade_df['ts'] <= closed_at]
 
                 if not trade_df.empty:
-                    high_during_trade = trade_df['h'].max()
-                    low_during_trade = trade_df['l'].min()
-                    
-                    # --- FIX: Use the actual SL price for a more accurate MAE on losses ---
-                    if closing_order_type == "SL":
-                        # The true MAE is the price that triggered the stop loss.
-                        high_during_trade = max(high_during_trade, exit_price)
+                    if mae_usd == 0.0:
+                        mae_usd = (trade_df['h'].max() - entry_price_float) * float(pos["size"])
+                    if mfe_usd == 0.0:
+                        mfe_usd = (entry_price_float - trade_df['l'].min()) * float(pos["size"])
 
-                    # For a short position
-                    mae_usd = (high_during_trade - entry_price_float) * float(pos["size"])
-                    mfe_usd = (entry_price_float - low_during_trade) * float(pos["size"])
-                    
-                    atr_at_entry = float(pos["atr"])
-                    mae_over_atr = (high_during_trade - entry_price_float) / atr_at_entry if atr_at_entry > 0 else 0
-                    mfe_over_atr = (entry_price_float - low_during_trade) / atr_at_entry if atr_at_entry > 0 else 0
-                    
-                    asset_returns = asset_df['c'].pct_change().dropna()
+                    asset_returns = trade_df['c'].pct_change().dropna()
                     if not asset_returns.empty:
                         realized_vol_during_trade = asset_returns.std() * np.sqrt(365 * 24 * 60)
 
-                # --- FIX: BTC Beta Calculation Logic ---
-                if not asset_df.empty and not btc_df.empty:
-                    asset_returns = asset_df['c'].pct_change().rename('asset')
-                    btc_returns = btc_df['c'].pct_change().rename('btc')
-                    combined_df = pd.concat([asset_returns, btc_returns], axis=1).dropna()
-                    
-                    # Require at least 5 minutes of overlapping data for a meaningful calculation
-                    if len(combined_df) > 5:
-                        covariance = combined_df['asset'].cov(combined_df['btc'])
-                        variance = combined_df['btc'].var()
-                        if variance > 0:
-                            btc_beta_during_trade = covariance / variance
-                            LOG.info("Calculated BTC Beta for %s: %.4f", symbol, btc_beta_during_trade)
+                    # --- BTC BETA CALCULATION (RESTORED AND FIXED) ---
+                    benchmark_symbol = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
+                    if symbol != benchmark_symbol: # No need to calculate beta against itself
+                        btc_ohlcv = await self.exchange.fetch_ohlcv(benchmark_symbol, '1m', since=since_ts)
+                        if btc_ohlcv:
+                            btc_df = pd.DataFrame(btc_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                            btc_df['ts'] = pd.to_datetime(btc_df['ts'], unit='ms', utc=True)
+                            btc_df = btc_df[btc_df['ts'] <= closed_at]
+
+                            if not btc_df.empty:
+                                # Prepare the two return series
+                                asset_returns_named = asset_returns.rename('asset')
+                                btc_returns_named = btc_df['c'].pct_change().rename('btc')
+                                
+                                # Combine and align them by timestamp
+                                combined_df = pd.concat([asset_returns_named, btc_returns_named], axis=1).dropna()
+                                
+                                if len(combined_df) > 5: # Ensure enough data for a meaningful calculation
+                                    covariance = combined_df['asset'].cov(combined_df['btc'])
+                                    variance = combined_df['btc'].var()
+                                    if variance > 0:
+                                        btc_beta_during_trade = covariance / variance
+                                        LOG.info(f"Calculated BTC Beta for {symbol}: {btc_beta_during_trade:.4f}")
+
+            atr_at_entry = float(pos["atr"])
+            if atr_at_entry > 0:
+                mae_usd = max(0, mae_usd)
+                mfe_usd = max(0, mfe_usd)
+                mae_over_atr = (mae_usd / float(pos["size"])) / atr_at_entry
+                mfe_over_atr = (mfe_usd / float(pos["size"])) / atr_at_entry
 
         except Exception as e:
-            # Add more detailed logging to see why it might fail
             LOG.warning("Could not calculate advanced post-trade metrics for %s: %s", symbol, e)
 
         # --- 3. Finalize and Clean Up ---
-        # Unconditionally cancel ALL orders for this symbol to ensure a clean slate.
         try:
             LOG.info("Finalizing position %d for %s. Cancelling all related orders.", pid, symbol)
             await self.exchange.cancel_all_orders(symbol, params={'category': 'linear'})
         except Exception as e:
             LOG.warning(f"Final cleanup for position {pid} failed: {e}.")
-        
-        # Record the final fill that closed the position
+
         await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, closed_at)
 
-        # Fetch ALL fills for this position to calculate total PnL accurately
         all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
         total_pnl = 0
         for fill in all_fills:
@@ -1052,22 +1079,23 @@ class LiveTrader:
 
         # --- 4. Persist All Data to the Database ---
         await self.db.update_position(
-            pid, 
-            status="CLOSED", 
-            closed_at=closed_at, 
+            pid,
+            status="CLOSED",
+            closed_at=closed_at,
             pnl=total_pnl,
-            exit_reason=closing_order_type, 
+            exit_reason=closing_order_type,
             holding_minutes=holding_minutes,
-            pnl_pct=pnl_pct, 
-            mae_usd=mae_usd, 
+            pnl_pct=pnl_pct,
+            mae_usd=mae_usd,
             mfe_usd=mfe_usd,
-            mae_over_atr=mae_over_atr, 
+            mae_over_atr=mae_over_atr,
             mfe_over_atr=mfe_over_atr,
-            realized_vol_during_trade=realized_vol_during_trade
+            realized_vol_during_trade=realized_vol_during_trade,
+            btc_beta_during_trade=btc_beta_during_trade # Added back to the database update
         )
-        
+
         await self.risk.on_trade_close(total_pnl, self.tg)
-        
+
         del self.open_positions[pid]
         self.last_exit[symbol] = closed_at
         await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
@@ -1429,7 +1457,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 Bot online v5.0")
+        await self.tg.send("🤖 Bot online v6.0")
 
         try:
             async with asyncio.TaskGroup() as tg:

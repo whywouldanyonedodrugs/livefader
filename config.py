@@ -46,7 +46,7 @@ RISK_PCT           = 0.05         # 0.5 %
 SLIPPAGE_BUFFER_PCT = 0.0005
 
 # ── stop / targets ─────────────────────────────────────────────────────────
-SL_ATR_MULT             = 2.5
+SL_ATR_MULT             = 1.8
 FINAL_TP_ENABLED        = True
 FINAL_TP_ATR_MULT       = 1.0
 PARTIAL_TP_ENABLED      = False
@@ -56,8 +56,12 @@ TRAIL_ENABLED           = False
 TRAIL_START_ATR_MULT    = 1.0
 TRAIL_DISTANCE_ATR_MULT = 1.0
 TRAIL_MIN_MOVE_PCT      = 0.001
-TIME_EXIT_ENABLED       = True     # set False to disable
-TIME_EXIT_DAYS          = 10         # close runner after N days
+
+
+TIME_EXIT_HOURS_ENABLED = True     # Set to True to enable hourly exit
+TIME_EXIT_HOURS         = 4        # The number of hours a trade can run
+TIME_EXIT_ENABLED       = True     # This now acts as a fallback if hourly is disabled
+TIME_EXIT_DAYS          = 10       # Fallback: close runner after N days
 
 # --- Coin Age Filter (Applied in filters.py) ---
 MIN_COIN_AGE_DAYS = 14  # Min days since listing
