@@ -946,74 +946,66 @@ class LiveTrader:
             
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
         symbol = pos["symbol"]
+        opened_at = pos["opened_at"]
+        closed_at = datetime.now(timezone.utc)
         exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
-
-        # --- 1. Determine the Exit Reason and Price ---
-        if inferred_exit_reason and inferred_exit_reason != "UNKNOWN":
-            LOG.info("Using inferred exit reason: %s", inferred_exit_reason)
+        
+        # --- 1. Find the Closing Order and its True Price ---
+        closing_order_cid = None
+        if inferred_exit_reason:
             closing_order_type = inferred_exit_reason
-        else:
-            LOG.warning("Could not infer exit reason for %s, attempting to fetch closing order.", symbol)
-            possible_closing_cids = [
-                pos.get("sl_cid"), pos.get("tp1_cid"), pos.get("tp_final_cid"), 
-                pos.get("sl_trail_cid"), pos.get("tp2_cid")
-            ]
-            
-            # FIX: Accept all valid "closed" statuses from the exchange, case-insensitively.
-            valid_closed_statuses = {"closed", "filled", "cancelled"}
+            if inferred_exit_reason == "TP":
+                closing_order_cid = pos.get("tp_final_cid") or pos.get("tp2_cid") or pos.get("tp1_cid")
+            elif inferred_exit_reason == "SL":
+                closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
+        
+        if closing_order_cid:
+            try:
+                order = await self._fetch_by_cid(closing_order_cid, symbol)
+                if order and (order.get('average') or order.get('price')):
+                    exit_price = float(order.get('average') or order.get('price'))
+                    exit_qty = float(order.get('filled', 0))
+                    LOG.info(f"Found closing order {closing_order_cid}. Exit Price: {exit_price}")
+            except Exception as e:
+                LOG.warning("Could not fetch exact closing order %s: %s", closing_order_cid, e)
 
-            for cid in filter(None, possible_closing_cids):
-                try:
-                    order = await self._fetch_by_cid(cid, symbol)
-                    if order and order.get('status') and order['status'].lower() in valid_closed_statuses:
-                        exit_price = float(order.get('average') or order.get('price'))
-                        exit_qty = float(order['filled'])
-                        if "TP" in cid: closing_order_type = "TP"
-                        elif "SL" in cid: closing_order_type = "SL"
-                        break 
-                except Exception:
-                    continue
-
+        # Fallback to ticker if the primary method fails
         if not exit_price:
             LOG.warning("Could not determine exact fill price for %d. Using last market price.", pid)
             ticker = await self.exchange.fetch_ticker(symbol)
             exit_price = float(ticker["last"])
             exit_qty = float(pos["size"])
-            if closing_order_type == "UNKNOWN":
-                closing_order_type = "FALLBACK"
+            closing_order_type = inferred_exit_reason or "FALLBACK"
 
-        # --- 2. Perform Post-Trade Calculations ---
-        closed_at = datetime.now(timezone.utc)
-        opened_at = pos["opened_at"]
+        # --- 2. Perform Post-Trade Calculations with Corrected MAE/MFE ---
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
         entry_price_float = float(pos["entry_price"])
         pnl_pct = ((entry_price_float / exit_price) - 1) * 100 if exit_price > 0 else 0.0
         
         mae_usd, mfe_usd, mae_over_atr, mfe_over_atr = 0, 0, 0, 0
         realized_vol_during_trade, btc_beta_during_trade = 0.0, 0.0
-        
+
         try:
-            since_ts = int(opened_at.timestamp() * 1000)
-            # Fetch data for both the traded asset and the benchmark (BTC)
-            asset_ohlcv, btc_ohlcv = await asyncio.gather(
-                self.exchange.fetch_ohlcv(symbol, '1m', since=since_ts),
-                self.exchange.fetch_ohlcv('BTCUSDT', '1m', since=since_ts)
-            )
+            # Fetch 1-minute OHLCV data for the trade's duration
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000))
+            if ohlcv:
+                trade_df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                trade_df['ts'] = pd.to_datetime(trade_df['ts'], unit='ms', utc=True)
+                trade_df = trade_df[trade_df['ts'] <= closed_at]
 
-            if asset_ohlcv and btc_ohlcv:
-                asset_df = pd.DataFrame(asset_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-                asset_df['ts'] = pd.to_datetime(asset_df['ts'], unit='ms', utc=True)
-                asset_df = asset_df[(asset_df['ts'] >= opened_at) & (asset_df['ts'] <= closed_at)].set_index('ts')
+                if not trade_df.empty:
+                    high_during_trade = trade_df['h'].max()
+                    low_during_trade = trade_df['l'].min()
+                    
+                    # --- FIX: Use the actual SL price for a more accurate MAE on losses ---
+                    if closing_order_type == "SL":
+                        # The true MAE is the price that triggered the stop loss.
+                        high_during_trade = max(high_during_trade, exit_price)
 
-                btc_df = pd.DataFrame(btc_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-                btc_df['ts'] = pd.to_datetime(btc_df['ts'], unit='ms', utc=True)
-                btc_df = btc_df[(btc_df['ts'] >= opened_at) & (btc_df['ts'] <= closed_at)].set_index('ts')
-
-                if not asset_df.empty:
-                    high_during_trade = asset_df['h'].max()
-                    low_during_trade = asset_df['l'].min()
+                    # For a short position
                     mae_usd = (high_during_trade - entry_price_float) * float(pos["size"])
                     mfe_usd = (entry_price_float - low_during_trade) * float(pos["size"])
+                    
                     atr_at_entry = float(pos["atr"])
                     mae_over_atr = (high_during_trade - entry_price_float) / atr_at_entry if atr_at_entry > 0 else 0
                     mfe_over_atr = (entry_price_float - low_during_trade) / atr_at_entry if atr_at_entry > 0 else 0

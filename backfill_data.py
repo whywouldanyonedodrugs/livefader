@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
+import statsmodels.api as sm
 import ccxt.async_support as ccxt
 from tqdm import tqdm
 
@@ -40,6 +41,41 @@ def adx(df, period=14):
     minus_di = 100 * (ema(abs(minus_dm), period) / atr_val)
     dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
     return ema(dx, period)
+def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(window=period, min_periods=period).mean().rolling(window=period, min_periods=period).mean()
+
+async def calculate_historical_regime(exchange, opened_at: datetime) -> str:
+    """Calculates the market regime for a specific historical date."""
+    try:
+        since_ts = int((opened_at - timedelta(days=500)).timestamp() * 1000)
+        ohlcv = await exchange.fetch_ohlcv('BTCUSDT', '1d', since=since_ts, limit=500)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df = df[df['timestamp'] < opened_at]
+        df.set_index('timestamp', inplace=True)
+
+        daily_returns = df['close'].pct_change().dropna()
+        
+        model = sm.tsa.MarkovRegression(daily_returns, k_regimes=2, switching_variance=True)
+        results = model.fit(disp=False)
+        low_vol_regime_idx = np.argmin(results.params[-2:])
+        vol_regime = "LOW_VOL" if results.smoothed_marginal_probabilities[low_vol_regime_idx].iloc[-1] > 0.5 else "HIGH_VOL"
+
+        df['tma'] = triangular_moving_average(df['close'], 100)
+        atr_series = atr(df.rename(columns={'open':'o','high':'h','low':'l','close':'c'}), period=20)
+        df['keltner_upper'] = df['tma'] + (atr_series * 2.0)
+        df['keltner_lower'] = df['tma'] - (atr_series * 2.0)
+        df.dropna(inplace=True)
+        
+        last_day = df.iloc[-1]
+        if last_day['close'] > last_day['keltner_upper']: trend_regime = "BULL"
+        elif last_day['close'] < last_day['keltner_lower']: trend_regime = "BEAR"
+        else: trend_regime = "CHOP"
+
+        return f"{trend_regime}_{vol_regime}"
+    except Exception as e:
+        LOG.warning(f"Could not calculate historical regime for {opened_at.date()}: {e}")
+        return "UNKNOWN"
 
 async def main():
     load_dotenv()
@@ -55,16 +91,13 @@ async def main():
         exchange = ccxt.bybit({'enableRateLimit': True})
         await exchange.load_markets()
         
-        # --- FIX: A much more comprehensive query to find all broken trades ---
         query = """
             SELECT * FROM positions 
             WHERE status = 'CLOSED' AND (
                 adx_at_entry IS NULL OR
-                vwap_dev_pct_at_entry = 0 OR
+                vwap_dev_pct_at_entry IS NULL OR vwap_dev_pct_at_entry = 0 OR
                 btc_beta_during_trade IS NULL OR
-                btc_beta_during_trade = 0 OR
-                exit_reason IS NULL OR
-                exit_reason IN ('UNKNOWN', 'FALLBACK', 'UNKNOWN_CLOSE')
+                exit_reason IS NULL OR exit_reason IN ('UNKNOWN', 'FALLBACK', 'UNKNOWN_CLOSE')
             ) ORDER BY id
         """
         trades_to_fix = await conn.fetch(query)
@@ -86,11 +119,13 @@ async def main():
                 pnl = float(trade['pnl'])
                 atr_at_entry_db = float(trade['atr'])
 
+                # --- 1. Fix Exit Reason & Contextual Metrics ---
                 inferred_exit_reason = 'TP' if pnl > 0 else 'SL'
                 hour_of_day = opened_at.hour
                 day_of_week = opened_at.weekday()
                 session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
+                # --- 2. Fetch All Necessary Historical Data ---
                 since_ts_1d = int((opened_at - timedelta(days=40)).timestamp() * 1000)
                 since_ts_4h = int((opened_at - timedelta(days=100)).timestamp() * 1000)
                 since_ts_1h = int((opened_at - timedelta(days=25)).timestamp() * 1000)
@@ -108,6 +143,8 @@ async def main():
                 df1h = pd.DataFrame(ohlcv_1h, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
                 df5m = pd.DataFrame(ohlcv_5m, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
 
+                # --- 3. Calculate All Pre-Trade Metrics ---
+                rsi_at_entry = rsi(df1h['c'], 14).iloc[-1]
                 adx_at_entry = adx(df1h, 14).iloc[-1]
                 ema_fast_at_entry = ema(df4h['c'], 12).iloc[-1]
                 ema_slow_at_entry = ema(df4h['c'], 26).iloc[-1]
@@ -117,6 +154,8 @@ async def main():
                 vwap_den = df5m['v'].rolling(48).sum()
                 vwap = (vwap_num / vwap_den).iloc[-1]
                 vwap_dev_pct_at_entry = abs(entry_price - vwap) / vwap if vwap > 0 else 0.0
+                
+                market_regime = await calculate_historical_regime(exchange, opened_at)
 
                 ohlcv_1m_asset, ohlcv_1m_btc = await asyncio.gather(
                     exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000)),
@@ -148,13 +187,15 @@ async def main():
                         exit_reason = $1, adx_at_entry = $2, vwap_dev_pct_at_entry = $3,
                         ema_fast_at_entry = $4, ema_slow_at_entry = $5, mae_over_atr = $6,
                         mfe_over_atr = $7, session_tag_at_entry = $8, day_of_week_at_entry = $9,
-                        hour_of_day_at_entry = $10, btc_beta_during_trade = $11, ret_30d_at_entry = $12
-                    WHERE id = $13
+                        hour_of_day_at_entry = $10, btc_beta_during_trade = $11, ret_30d_at_entry = $12,
+                        rsi_at_entry = $13, market_regime_at_entry = $14
+                    WHERE id = $15
                 """
                 await conn.execute(
                     update_query, inferred_exit_reason, adx_at_entry, vwap_dev_pct_at_entry,
                     ema_fast_at_entry, ema_slow_at_entry, mae_over_atr, mfe_over_atr,
-                    session_tag, day_of_week, hour_of_day, btc_beta_during_trade, ret_30d_at_entry, trade_id
+                    session_tag, day_of_week, hour_of_day, btc_beta_during_trade, ret_30d_at_entry,
+                    rsi_at_entry, market_regime, trade_id
                 )
 
             except Exception as e:
