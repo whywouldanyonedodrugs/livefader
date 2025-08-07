@@ -161,39 +161,34 @@ def create_stable_cid(pid: int, tag: str) -> str:
 
 @dataclasses.dataclass
 class Signal:
-    # Core Signal Info
+    # --- All required fields (no default value) ---
     symbol: str
     entry: float
     atr: float
-    
-    # Core Indicators
     rsi: float
     adx: float
     atr_pct: float
     market_regime: str
-    
-    # Strategy Filter Values
     price_boom_pct: float
     price_slowdown_pct: float
     vwap_dev_pct: float
-    ret_30d: float
+    ret_3d: float
     ema_fast: float
     ema_slow: float
     listing_age_days: int
-    vwap_consolidated: bool   
-
-    # Contextual Info
+    vwap_z_score: float
+    is_ema_crossed_down: bool
+    vwap_consolidated: bool
     session_tag: str
     day_of_week: int
     hour_of_day: int
 
-    # --- NEW FEATURES FOR THE PREDICTIVE MODEL ---
-    vwap_z_score: float
-    is_ema_crossed_down: bool
-    win_probability: float = 0.0 # Default to 0.0
-    vwap_consolidated: bool = False
+    # --- All optional fields (with a default value) ---
+    win_probability: float = 0.0
 
-    # This is for the old gap filter, not the model
+    def __post_init__(self):
+        """This function runs after the object is created."""
+        LOG.info(f"Successfully created Signal object for {self.symbol} using correct class definition.")
 
 
 
