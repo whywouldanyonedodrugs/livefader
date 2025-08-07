@@ -63,23 +63,27 @@ async def main():
         df['is_win'] = df['pnl'] > 0
         LOG.info(f"Loaded {len(df)} trades for training.")
 
-        # --- THIS IS THE FIX ---
-        # Force all feature columns to a numeric type, coercing errors.
-        # This handles any non-standard number types (like Decimal) from the database.
+        # --- THE DEFINITIVE FIX ---
+        # 1. Force all feature columns to a numeric type as a safety measure.
         for col in FEATURES:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             else:
                 LOG.error(f"Critical error: Feature column '{col}' not found in the DataFrame.")
                 return
+        
+        # 2. Explicitly convert the boolean feature to integers (1/0).
+        # This is the key step that solves the 'dtype of object' error.
+        if 'is_ema_crossed_down_at_entry' in df.columns:
+            df['is_ema_crossed_down_at_entry'] = df['is_ema_crossed_down_at_entry'].astype(int)
         # --- END OF FIX ---
 
         # --- Model Training ---
-        # Prepare the data, dropping any rows with missing values in our features
+        # Prepare the data, dropping any rows with missing values
         df_clean = df.dropna(subset=FEATURES + [TARGET])
         
         X = df_clean[FEATURES]
-        y = df_clean[TARGET]
+        y = df_clean[TARGET].astype(int) # Also cast the target to int for consistency
 
         # Add a constant for the regression model
         X = sm.add_constant(X, prepend=True)
