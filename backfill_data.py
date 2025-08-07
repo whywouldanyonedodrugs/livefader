@@ -62,13 +62,9 @@ async def main():
 
                 # --- 1. Fetch Ground-Truth Exit Price & PnL ---
                 my_trades = await exchange.fetch_my_trades(symbol, since=int(opened_at.timestamp() * 1000), limit=100)
-                
-                # --- FIX: Use integer timestamps for comparison ---
                 start_ts_ms = int(opened_at.timestamp() * 1000)
                 end_ts_ms = int((closed_at + timedelta(minutes=1)).timestamp() * 1000)
                 position_trades = [t for t in my_trades if start_ts_ms <= t['timestamp'] <= end_ts_ms]
-                # --- END OF FIX ---
-                
                 closing_fill = next((t for t in reversed(position_trades) if t['side'] == 'buy'), None)
 
                 if not closing_fill:
@@ -83,7 +79,6 @@ async def main():
                 # --- 2. Smarter Exit Reason Inference ---
                 holding_minutes = (closed_at - opened_at).total_seconds() / 60
                 inferred_exit_reason = trade['exit_reason']
-                
                 time_exit_hours = cfg.TIME_EXIT_HOURS if cfg.TIME_EXIT_HOURS_ENABLED else cfg.TIME_EXIT_DAYS * 24
                 if abs(holding_minutes - (time_exit_hours * 60)) < 5:
                      inferred_exit_reason = "TIME_EXIT"
@@ -96,16 +91,20 @@ async def main():
                 since_ts_1d = int((opened_at - timedelta(days=cfg.STRUCTURAL_TREND_DAYS + 5)).timestamp() * 1000)
                 since_ts_4h = int((opened_at - timedelta(days=40)).timestamp() * 1000)
                 since_ts_1h = int((opened_at - timedelta(days=10)).timestamp() * 1000)
+                # Add 5m timeframe for VWAP
+                since_ts_5m = int((opened_at - timedelta(hours=cfg.GAP_VWAP_HOURS + 1)).timestamp() * 1000)
 
-                ohlcv_1d, ohlcv_4h, ohlcv_1h = await asyncio.gather(
+                ohlcv_1d, ohlcv_4h, ohlcv_1h, ohlcv_5m = await asyncio.gather(
                     exchange.fetch_ohlcv(symbol, '1d', since=since_ts_1d, limit=100),
                     exchange.fetch_ohlcv(symbol, cfg.EMA_TIMEFRAME, since=since_ts_4h, limit=500),
-                    exchange.fetch_ohlcv(symbol, cfg.RSI_TIMEFRAME, since=since_ts_1h, limit=500)
+                    exchange.fetch_ohlcv(symbol, cfg.RSI_TIMEFRAME, since=since_ts_1h, limit=500),
+                    exchange.fetch_ohlcv(symbol, '5m', since=since_ts_5m, limit=50) # Fetch enough for 2-hour VWAP
                 )
 
                 df1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[:opened_at]
                 df4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[:opened_at]
                 df1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[:opened_at]
+                df5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[:opened_at]
 
                 # --- 4. Calculate All Pre-Trade Metrics Using Bot's Logic ---
                 rsi_at_entry = ta.rsi(df1h['close'], period=cfg.RSI_PERIOD).iloc[-1]
@@ -114,24 +113,27 @@ async def main():
                 ema_slow_at_entry = ta.ema(df4h['close'], span=cfg.EMA_SLOW_PERIOD).iloc[-1]
                 ret_30d_at_entry = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS]) - 1 if len(df1d) >= cfg.STRUCTURAL_TREND_DAYS else 0.0
                 
+                # --- NEW: UNIFIED VWAP CALCULATION ---
+                tf_minutes = 5
+                vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
+                vwap_num = (df5m['close'] * df5m['volume']).shift(1).rolling(vwap_bars).sum()
+                vwap_den = df5m['volume'].shift(1).rolling(vwap_bars).sum()
+                vwap = vwap_num / vwap_den
+                vwap_at_entry = vwap.iloc[-1]
+                vwap_dev_pct_at_entry = abs(entry_price - vwap_at_entry) / vwap_at_entry if vwap_at_entry > 0 else 0.0
+                # --- END OF NEW SECTION ---
+
                 # --- 5. Accurate Post-Trade Calculations (MAE/MFE) ---
-                mae_usd, mfe_usd, btc_beta_during_trade = 0.0, 0.0, 0.0
-                
+                # ... (This section is correct as is) ...
+                mae_usd, mfe_usd = 0.0, 0.0
                 ohlcv_1m_asset = await exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000), limit=1000)
-                
                 if ohlcv_1m_asset:
                     df1m_asset = pd.DataFrame(ohlcv_1m_asset, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[opened_at:closed_at]
                     if not df1m_asset.empty:
-                        if inferred_exit_reason == "SL":
-                            mae_usd = (exit_price - entry_price) * size
-                        else:
-                            mae_usd = (df1m_asset['high'].max() - entry_price) * size
-
-                        if inferred_exit_reason == "TP":
-                            mfe_usd = (entry_price - exit_price) * size
-                        else:
-                            mfe_usd = (entry_price - df1m_asset['low'].min()) * size
-                
+                        if inferred_exit_reason == "SL": mae_usd = (exit_price - entry_price) * size
+                        else: mae_usd = (df1m_asset['high'].max() - entry_price) * size
+                        if inferred_exit_reason == "TP": mfe_usd = (entry_price - exit_price) * size
+                        else: mfe_usd = (entry_price - df1m_asset['low'].min()) * size
                 mae_usd = max(0, mae_usd)
                 mfe_usd = max(0, mfe_usd)
                 mae_over_atr = (mae_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
@@ -143,13 +145,15 @@ async def main():
                         pnl = $1, pnl_pct = $2, exit_reason = $3, holding_minutes = $4,
                         rsi_at_entry = $5, adx_at_entry = $6, ema_fast_at_entry = $7,
                         ema_slow_at_entry = $8, ret_30d_at_entry = $9, mae_usd = $10,
-                        mfe_usd = $11, mae_over_atr = $12, mfe_over_atr = $13
-                    WHERE id = $14
+                        mfe_usd = $11, mae_over_atr = $12, mfe_over_atr = $13,
+                        vwap_dev_pct_at_entry = $14 -- Added the VWAP field to the update
+                    WHERE id = $15
                 """
                 await conn.execute(
                     update_query, pnl, pnl_pct, inferred_exit_reason, holding_minutes,
                     rsi_at_entry, adx_at_entry, ema_fast_at_entry, ema_slow_at_entry,
                     ret_30d_at_entry, mae_usd, mfe_usd, mae_over_atr, mfe_over_atr,
+                    vwap_dev_pct_at_entry, # Pass the new value to the query
                     trade_id
                 )
 
@@ -164,6 +168,7 @@ async def main():
     finally:
         if conn: await conn.close()
         if exchange: await exchange.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
