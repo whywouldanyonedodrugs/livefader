@@ -593,13 +593,30 @@ class LiveTrader:
 
                 if self.win_prob_model:
                     try:
-                        model_features = self.win_prob_model.model.exog_names[1:]
-                        features_df = pd.DataFrame([signal_obj.__dict__])[model_features]
-                        features_df = sm.add_constant(features_df, prepend=True)
+                        # 1. Create a dictionary from the live signal data
+                        live_data = {
+                            'rsi_at_entry': signal_obj.rsi,
+                            'adx_at_entry': signal_obj.adx,
+                            'price_boom_pct_at_entry': signal_obj.price_boom_pct,
+                            'price_slowdown_pct_at_entry': signal_obj.price_slowdown_pct,
+                            'vwap_z_at_entry': signal_obj.vwap_z_score,
+                            'ema_spread_pct_at_entry': (signal_obj.ema_fast - signal_obj.ema_slow) / signal_obj.ema_slow if signal_obj.ema_slow > 0 else 0,
+                            'is_ema_crossed_down_at_entry': signal_obj.is_ema_crossed_down,
+                            'day_of_week_at_entry': signal_obj.day_of_week,
+                            'hour_of_day_at_entry': signal_obj.hour_of_day
+                        }
+                        
+                        # 2. Create a DataFrame from this clean dictionary
+                        features_df = pd.DataFrame([live_data])
+                        
+                        # 3. Add the constant and predict
+                        features_df = sm.add_constant(features_df, prepend=True, has_constant='add')
                         win_prob = self.win_prob_model.predict(features_df)[0]
                         signal_obj.win_probability = float(win_prob)
+                        
                     except Exception as e:
                         LOG.warning(f"Failed to score signal for {symbol}: {e}")
+                # --- END OF FIX ---
                 
                 return signal_obj
 
