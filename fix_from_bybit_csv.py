@@ -25,12 +25,14 @@ async def main(csv_path: str):
         bybit_df = pd.read_csv(csv_path)
         
         # --- Data Cleaning and Preparation ---
-        # Rename columns for easier access and remove whitespace
         bybit_df.columns = [c.strip().replace(' ', '_').replace('(UTC+0)', '') for c in bybit_df.columns]
         
-        # Convert date columns to timezone-aware datetime objects
-        bybit_df['Filled/Settlement_Time'] = pd.to_datetime(bybit_df['Filled/Settlement_Time'], utc=True)
-        bybit_df['Create_Time'] = pd.to_datetime(bybit_df['Create_Time'], utc=True)
+        # --- FIX: Specify the correct date format ---
+        # This tells pandas to expect Day/Month/Year format
+        date_format = '%d/%m/%Y %H:%M'
+        bybit_df['Filled/Settlement_Time'] = pd.to_datetime(bybit_df['Filled/Settlement_Time'], format=date_format, utc=True)
+        bybit_df['Create_Time'] = pd.to_datetime(bybit_df['Create_Time'], format=date_format, utc=True)
+        # --- END OF FIX ---
         
         LOG.info(f"Loaded and processed {len(bybit_df)} trade records from {csv_path}")
 
@@ -53,7 +55,6 @@ async def main(csv_path: str):
             symbol = true_trade.Contracts
             true_open_time = true_trade.Create_Time
             
-            # Find a trade in our DB that matches the symbol and is within a 5-minute window of the open time
             query = """
                 SELECT id, pnl FROM positions
                 WHERE symbol = $1 AND status = 'CLOSED'
@@ -69,7 +70,6 @@ async def main(csv_path: str):
                 db_pnl = float(db_match['pnl'])
                 true_pnl = float(true_trade.Realized_P_L)
 
-                # If PnL is different by more than a cent, update the record
                 if abs(db_pnl - true_pnl) > 0.01:
                     LOG.info(f"Fixing trade {pos_id} ({symbol}): DB PnL {db_pnl:.4f} -> Exchange PnL {true_pnl:.4f}")
                     
@@ -84,7 +84,6 @@ async def main(csv_path: str):
                             exit_reason = $4
                         WHERE id = $5
                     """
-                    # The exit reason is TP if PnL > 0, otherwise SL.
                     exit_reason = "TP" if true_pnl > 0 else "SL"
                     
                     await conn.execute(
