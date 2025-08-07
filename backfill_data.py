@@ -105,10 +105,9 @@ async def main():
                 ema_slow_at_entry = ta.ema(df4h['close'], span=cfg.EMA_SLOW_PERIOD).iloc[-1]
                 ret_30d_at_entry = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS]) - 1 if len(df1d) >= cfg.STRUCTURAL_TREND_DAYS else 0.0
                 
-                # --- THIS IS THE FIX ---
-                is_ema_crossed_down_at_entry = ema_fast_at_entry < ema_slow_at_entry
+                # --- FIX #1: Explicitly convert the NumPy boolean to a Python boolean ---
+                is_ema_crossed_down_at_entry = bool(ema_fast_at_entry < ema_slow_at_entry)
                 ema_spread_pct_at_entry = (ema_fast_at_entry - ema_slow_at_entry) / ema_slow_at_entry if ema_slow_at_entry > 0 else 0.0
-                # --- END OF FIX ---
 
                 tf_minutes = 5
                 vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
@@ -162,6 +161,9 @@ async def main():
             except Exception as e:
                 LOG.error(f"Failed to backfill trade ID {trade['id']} ({trade['symbol']}): {e}", exc_info=True)
                 continue
+            
+            # --- FIX #2: Add a small delay to respect API rate limits ---
+            await asyncio.sleep(0.5) # Sleep for 500ms
 
         LOG.info("Comprehensive backfilling process complete.")
 
