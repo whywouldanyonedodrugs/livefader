@@ -54,10 +54,11 @@ CREATE TABLE IF NOT EXISTS positions (
     mae_over_atr FLOAT,
     mfe_over_atr FLOAT,
     realized_vol_during_trade FLOAT,
-    btc_beta_during_trade FLOAT, -- <-- THE MISSING COMMA WAS HERE
+    btc_beta_during_trade FLOAT, 
     -- Columns for the predictive model
     vwap_z_at_entry FLOAT,
     is_ema_crossed_down_at_entry BOOLEAN,
+    ema_spread_pct_at_entry FLOAT,
     win_probability_at_entry FLOAT
 );
 CREATE TABLE IF NOT EXISTS fills (
