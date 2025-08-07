@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+import subprocess
 
 import aiohttp
 import asyncpg
@@ -1331,6 +1332,16 @@ class LiveTrader:
                 "open": len(self.open_positions),
                 "loss_streak": self.risk.loss_streak
             }, indent=2))
+
+        elif root == "/analyze":
+            await self.tg.send("🤖 Roger that. Starting the full analysis process. This requires the `bybit.csv` file to be present. The process may take a few minutes. I will send the report file here when complete.")
+            
+            # Run the master script as a non-blocking background process
+            try:
+                subprocess.Popen(["/opt/livefader/src/run_weekly_report.sh"])
+            except Exception as e:
+                await self.tg.send(f"❌ Failed to start the analysis script: {e}")
+            return
 
     async def _resume(self):
             """
