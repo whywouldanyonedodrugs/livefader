@@ -11,6 +11,7 @@ import asyncio
 import numpy as np
 import pandas as pd
 from scipy import stats
+from dotenv import load_dotenv
 
 # Optional – nice but not mandatory
 try:
