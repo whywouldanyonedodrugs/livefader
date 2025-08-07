@@ -25,6 +25,7 @@ import subprocess
 import aiohttp
 import asyncpg
 import ccxt.async_support as ccxt
+import joblib
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
@@ -186,6 +187,7 @@ class Signal:
     session_tag: str
     day_of_week: int
     hour_of_day: int
+    win_probability: float = 0.0
 
 LISTING_PATH = Path("listing_dates.json")
 
@@ -310,6 +312,17 @@ class LiveTrader:
         self.tasks: List[asyncio.Task] = []
         self.api_semaphore = asyncio.Semaphore(10)
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+        self.win_prob_model = None
+        model_path = Path("win_probability_model.joblib")
+        if model_path.exists():
+            try:
+                self.win_prob_model = joblib.load(model_path)
+                LOG.info(f"Successfully loaded predictive model from {model_path}")
+            except Exception as e:
+                LOG.error(f"Failed to load predictive model: {e}")
+        else:
+            LOG.warning(f"Predictive model file not found at {model_path}. Win probability scoring will be disabled.")
 
     def _init_ccxt(self):
         ex = ccxt.bybit({
@@ -475,22 +488,20 @@ class LiveTrader:
                         LOG.warning("DATA_ERROR for %s on %s: Detected stale data (%.0f%% zero volume). Skipping symbol.", symbol, tf, zero_volume_pct * 100)
                         return None
 
-
                 df.drop(df.index[-1], inplace=True)
                 if df.empty: return None
                 dfs[tf] = df
 
-            # 1. Define df5 from the dictionary of all dataframes
             df5 = dfs[base_tf]
 
-            # 2. Now that df5 exists, perform all calculations on it
+            # --- Indicator Calculations ---
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
             df5['rsi'] = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
             df5['atr'] = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
             df5['adx'] = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
-            tf_minutes = 5 # Assuming 5m base timeframe
+            tf_minutes = 5
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
             df5['price_boom_ago'] = df5['close'].shift(boom_bars)
@@ -499,92 +510,61 @@ class LiveTrader:
             df1d = dfs['1d']
             ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
 
-            # 3. This is the correct location for the VWAP calculation
-            if self.cfg.get("GAP_FILTER_ENABLED", True):
-                vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
-                vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
-                vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
-                df5['vwap'] = vwap_num / vwap_den
-                df5['vwap_dev'] = abs(df5['close'] - df5['vwap']) / df5['vwap']
-                df5['vwap_ok'] = df5['vwap_dev'] <= cfg.GAP_MAX_DEV_PCT
-                df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
-                df5['price_std'] = df5['close'].rolling(vwap_bars).std()
-                df5['vwap_z_score'] = df5['vwap_dev'] / df5['price_std']
-            else:
-                # If filter is disabled, create placeholder columns to prevent errors
-                df5['vwap_consolidated'] = True
-                df5['vwap_dev'] = 0.0
-                df5['vwap_ok'] = True
-                df5['vwap'] = df5['close']
+            # --- VWAP and Z-Score Calculation ---
+            vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
+            vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
+            vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
+            df5['vwap'] = vwap_num / vwap_den
+            
+            # Note: vwap_dev is price distance, not percentage
+            vwap_dev_raw = df5['close'] - df5['vwap']
+            df5['vwap_dev_pct'] = vwap_dev_raw / df5['vwap']
+            
+            df5['price_std'] = df5['close'].rolling(vwap_bars).std()
+            df5['vwap_z_score'] = vwap_dev_raw / df5['price_std']
+            
+            # This is for the old gap filter, not the signal
+            df5['vwap_ok'] = df5['vwap_dev_pct'].abs() <= cfg.GAP_MAX_DEV_PCT
+            df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
 
             df5.dropna(inplace=True)
             if df5.empty: return None
 
             last = df5.iloc[-1]
+            
+            # --- Signal Variable Preparation ---
+            is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
             now_utc = datetime.now(timezone.utc)
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
             price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
             price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
-
             atr_pct = (last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0
-
             listing_age_days = (now_utc.date() - self._listing_dates_cache[symbol]).days if symbol in self._listing_dates_cache else -1
             hour_of_day = now_utc.hour
-            day_of_week = now_utc.weekday() # Monday is 0, Sunday is 6
+            day_of_week = now_utc.weekday()
+            session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
-            session_tag = "UNKNOWN"
-            if 0 <= hour_of_day < 8: session_tag = "ASIA"
-            elif 8 <= hour_of_day < 16: session_tag = "EUROPE"
-            else: session_tag = "US"
-
-            ema_filter_enabled = self.cfg.get("EMA_FILTER_ENABLED", True)
-            if ema_filter_enabled:
-                ema_down = last['ema_fast'] < last['ema_slow']
-                ema_log_msg = f"{'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} < Slow: {last['ema_slow']:.4f})"
-            else:
-                ema_down = True
-                ema_log_msg = " DISABLED"
-            
-            trend_filter_enabled = self.cfg.get("STRUCTURAL_TREND_FILTER_ENABLED", True)
-            if trend_filter_enabled:
-                trend_ok = ret_30d <= self.cfg.get("STRUCTURAL_TREND_RET_PCT", 0.01)
-                trend_log_msg = f"{'✅' if trend_ok else '❌'} (Return: {ret_30d:+.2%})"
-            else:
-                trend_log_msg = " DISABLED"
-
-            gap_filter_enabled = self.cfg.get("GAP_FILTER_ENABLED", True)
-            if gap_filter_enabled:
-                vwap_dev_pct = last.get('vwap_dev', float('nan'))
-                vwap_dev_str = f"{vwap_dev_pct:.2%}" if pd.notna(vwap_dev_pct) else "N/A"
-                current_dev_ok = last.get('vwap_ok', False)
-                vwap_log_msg = f"{'✅' if last['vwap_consolidated'] else '❌'} (Streak Failed) | Current Dev: {'✅' if current_dev_ok else '❌'} ({vwap_dev_str})"
-            else:
-                vwap_log_msg = " DISABLED"
-
-            LOG.debug(
-                f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
-                f"  [Base Timeframe: {base_tf}]\n"
-                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h lookback): {'✅' if price_boom else '❌'} (is {boom_ret_pct:+.2%})\n"
-                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h lookback): {'✅' if price_slowdown else '❌'} (is {slowdown_ret_pct:+.2%})\n"
-                f"  - EMA Trend Down ({ema_tf}):      {ema_log_msg}\n"
-                f"  --------------------------------------------------\n"
-                f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
-                f"  - 30d Trend Filter:        {trend_log_msg}\n"
-                f"  - VWAP Consolidated:       {vwap_log_msg}\n"
-                f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
-                f"====================================================\n"
-            )
+            # --- Core Signal Logic ---
+            ema_down = True
+            if self.cfg.get("EMA_FILTER_ENABLED", True):
+                ema_down = is_ema_crossed_down
 
             if price_boom and price_slowdown and ema_down:
                 LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, last['close'])
-                return Signal(
-                    symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
-                    rsi=float(last['rsi']), adx=float(last['adx']), atr_pct=atr_pct,
+                
+                # --- STAGE 1: Create the Signal object with all known data ---
+                signal_obj = Signal(
+                    symbol=symbol,
+                    entry=float(last['close']),
+                    atr=float(last['atr']),
+                    rsi=float(last['rsi']),
+                    adx=float(last['adx']),
+                    atr_pct=atr_pct,
                     market_regime=market_regime,
                     price_boom_pct=boom_ret_pct,
                     price_slowdown_pct=slowdown_ret_pct,
-                    vwap_dev_pct=float(last.get('vwap_dev', 0.0)),
+                    vwap_dev_pct=float(last.get('vwap_dev_pct', 0.0)),
                     vwap_z_score=float(last.get('vwap_z_score', 0.0)),
                     ret_30d=ret_30d,
                     ema_fast=float(last['ema_fast']),
@@ -593,9 +573,27 @@ class LiveTrader:
                     session_tag=session_tag,
                     day_of_week=day_of_week,
                     hour_of_day=hour_of_day,
-                    # This was missing from the original Signal object creation
-                    vwap_consolidated=bool(last.get('vwap_consolidated', False))
+                    vwap_consolidated=bool(last.get('vwap_consolidated', False)),
+                    is_ema_crossed_down=bool(is_ema_crossed_down)
                 )
+
+                # --- STAGE 2: Score the signal using the loaded model ---
+                if self.win_prob_model:
+                    try:
+                        # Create a DataFrame with the exact same structure as the training data
+                        # Note: exog_names[1:] gets all feature names except the 'const'
+                        model_features = self.win_prob_model.model.exog_names[1:]
+                        features_df = pd.DataFrame([signal_obj.__dict__])[model_features]
+                        features_df = sm.add_constant(features_df, prepend=True)
+                        
+                        # Predict the probability of win (returns a value between 0 and 1)
+                        win_prob = self.win_prob_model.predict(features_df)[0]
+                        signal_obj.win_probability = float(win_prob)
+                    except Exception as e:
+                        LOG.warning(f"Failed to score signal for {symbol}: {e}")
+                
+                return signal_obj
+
             return None
 
         except ccxt.BadSymbol:
@@ -730,7 +728,8 @@ class LiveTrader:
                 "session_tag_at_entry": sig.session_tag,
                 "day_of_week_at_entry": sig.day_of_week,
                 "hour_of_day_at_entry": sig.hour_of_day,
-                "config_snapshot": json.dumps(config_snapshot) # Convert dict to JSON string
+                "config_snapshot": json.dumps(config_snapshot),
+                "win_probability_at_entry": sig.win_probability
             })
 
             stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
@@ -772,7 +771,13 @@ class LiveTrader:
             )
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
-            await self.tg.send(f"🚀 Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}")
+
+            win_prob_pct = sig.win_probability * 100
+            await self.tg.send(
+                f"🚀 **({days[sig.day_of_week]})** Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}\n"
+                f"📈 **Win Probability:** {win_prob_pct:.1f}%"
+            )
+
 
         except Exception as e:
             msg = f"🚨 CRITICAL: Failed to persist or protect position for {sig.symbol} due to: {e}. Triggering emergency close."

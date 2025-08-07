@@ -153,14 +153,15 @@ async def main():
                         ema_slow_at_entry = $8, ret_30d_at_entry = $9, mae_usd = $10,
                         mfe_usd = $11, mae_over_atr = $12, mfe_over_atr = $13,
                         vwap_dev_pct_at_entry = $14,
-                        vwap_z_at_entry = $15
-                    WHERE id = $16
+                        vwap_z_at_entry = $15,
+                        is_ema_crossed_down_at_entry = $16
+                    WHERE id = $17
                 """
                 await conn.execute(
                     update_query, pnl, pnl_pct, inferred_exit_reason, holding_minutes,
                     rsi_at_entry, adx_at_entry, ema_fast_at_entry, ema_slow_at_entry,
                     ret_30d_at_entry, mae_usd, mfe_usd, mae_over_atr, mfe_over_atr,
-                    vwap_dev_pct_at_entry, vwap_z_at_entry,
+                    vwap_dev_pct_at_entry, vwap_z_at_entry, is_ema_crossed_down_at_entry,
                     trade_id
                 )
 

@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS positions (
     ret_30d_at_entry FLOAT,
     ema_fast_at_entry FLOAT,
     ema_slow_at_entry FLOAT,
+    is_ema_crossed_down_at_entry BOOLEAN,
     listing_age_days_at_entry INT,
     session_tag_at_entry TEXT,
     day_of_week_at_entry INT,
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS positions (
     mae_over_atr FLOAT,
     mfe_over_atr FLOAT,
     realized_vol_during_trade FLOAT,
-    btc_beta_during_trade FLOAT
+    btc_beta_during_trade FLOAT,
+    
 );
 CREATE TABLE IF NOT EXISTS fills (
     id SERIAL PRIMARY KEY,
