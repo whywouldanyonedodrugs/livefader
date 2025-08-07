@@ -971,10 +971,12 @@ class LiveTrader:
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
             symbol = pos["symbol"]
             opened_at = pos["opened_at"]
+            entry_price_float = float(pos["entry_price"])
+            size = float(pos["size"])
             closed_at = datetime.now(timezone.utc)
             exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
 
-            # --- 1. Find the Closing Order and its True Price ---
+            # --- 1. Determine the type of exit ---
             closing_order_cid = None
             if inferred_exit_reason:
                 closing_order_type = inferred_exit_reason
@@ -983,6 +985,8 @@ class LiveTrader:
                 elif inferred_exit_reason == "SL":
                     closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
 
+            # --- 2. Get the Accurate Exit Price ---
+            # First, try to fetch the order by its ID. This is the fastest method.
             if closing_order_cid:
                 try:
                     order = await self._fetch_by_cid(closing_order_cid, symbol)
@@ -991,48 +995,48 @@ class LiveTrader:
                         exit_qty = float(order.get('filled', 0))
                         LOG.info(f"Found closing order {closing_order_cid}. Exit Price: {exit_price}")
                 except Exception as e:
-                    LOG.warning("Could not fetch exact closing order %s: %s", closing_order_cid, e)
+                    LOG.warning("Could not fetch closing order by CID %s: %s. Using robust fallback.", closing_order_cid, e)
 
-            # --- FIX: New, more robust fallback logic ---
+            # --- THIS IS THE CRITICAL FIX: A ROBUST FALLBACK ---
+            # If the primary method fails, fetch our actual trade history. This is the ground truth.
             if not exit_price:
-                LOG.warning("Could not determine fill price from order CID. Using fetch_my_trades as fallback.")
+                LOG.warning("Primary exit price fetch failed for {symbol}. Using fetch_my_trades() as the definitive fallback.")
                 try:
-                    # Fetch the last 5 trades for this symbol
+                    # Wait a moment for the trade to be registered by the exchange API
+                    await asyncio.sleep(1.5)
                     my_trades = await self.exchange.fetch_my_trades(symbol, limit=5)
-                    # Find the most recent trade that was a 'sell' (for a short) or 'buy' (for a long)
-                    # This assumes the bot only handles one direction, which is true for this bot (short only)
+                    # The closing trade is the most recent 'buy' order (to close our short)
                     closing_trade = next((t for t in reversed(my_trades) if t.get('side') == 'buy'), None)
+                    
                     if closing_trade:
                         exit_price = float(closing_trade['price'])
                         exit_qty = float(closing_trade['amount'])
-                        closing_order_type = inferred_exit_reason or "FALLBACK_TRADE"
-                        LOG.info(f"Found closing fill via fetch_my_trades. Exit Price: {exit_price}")
+                        closing_order_type = inferred_exit_reason or "FALLBACK_FILL"
+                        LOG.info(f"Confirmed closing fill for {symbol} via fallback. Exit Price: {exit_price}")
                     else:
-                        # If all else fails, use the ticker as a last resort
-                        ticker = await self.exchange.fetch_ticker(symbol)
-                        exit_price = float(ticker["last"])
-                        exit_qty = float(pos["size"])
-                        closing_order_type = inferred_exit_reason or "FALLBACK_TICKER"
+                        # This should almost never happen
+                        LOG.error(f"CRITICAL: Could not find a closing fill for {symbol} via any method. PnL will be inaccurate.")
+                        exit_price = entry_price_float # Set PnL to zero to flag the error
+                        exit_qty = size
                 except Exception as e:
-                    LOG.error(f"Fallback to fetch_my_trades also failed: {e}. Using last resort ticker price.")
-                    ticker = await self.exchange.fetch_ticker(symbol)
-                    exit_price = float(ticker["last"])
-                    exit_qty = float(pos["size"])
+                    LOG.error(f"CRITICAL: Fallback to fetch_my_trades for {symbol} also failed: {e}. PnL will be inaccurate.")
+                    exit_price = entry_price_float # Set PnL to zero to flag the error
+                    exit_qty = size
             # --- END OF FIX ---
 
-            # --- 2. Perform All Post-Trade Calculations (This logic is now more accurate) ---
+            # --- 3. Calculate All Metrics with the Accurate Price ---
+            total_pnl = (entry_price_float - exit_price) * size
             holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
-            entry_price_float = float(pos["entry_price"])
             pnl_pct = ((entry_price_float / exit_price) - 1) * 100 if exit_price > 0 else 0.0
-
+            
             mae_usd, mfe_usd, mae_over_atr, mfe_over_atr = 0.0, 0.0, 0.0, 0.0
             realized_vol_during_trade, btc_beta_during_trade = 0.0, 0.0
 
             try:
                 if closing_order_type == "SL":
-                    mae_usd = (exit_price - entry_price_float) * float(pos["size"])
-                elif closing_order_type in ["TP", "TP1", "TP2", "TP_FINAL"]:
-                    mfe_usd = (entry_price_float - exit_price) * float(pos["size"])
+                    mae_usd = (exit_price - entry_price_float) * size
+                elif closing_order_type in ["TP", "TP1", "TP2", "TP_FINAL", "FALLBACK_FILL"]:
+                    mfe_usd = (entry_price_float - exit_price) * size
 
                 since_ts = int(opened_at.timestamp() * 1000)
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=since_ts)
@@ -1044,9 +1048,9 @@ class LiveTrader:
 
                     if not trade_df.empty:
                         if mae_usd == 0.0:
-                            mae_usd = (trade_df['h'].max() - entry_price_float) * float(pos["size"])
+                            mae_usd = (trade_df['h'].max() - entry_price_float) * size
                         if mfe_usd == 0.0:
-                            mfe_usd = (entry_price_float - trade_df['l'].min()) * float(pos["size"])
+                            mfe_usd = (entry_price_float - trade_df['l'].min()) * size
 
                         asset_returns = trade_df['c'].pct_change().dropna()
                         if not asset_returns.empty:
@@ -1073,12 +1077,12 @@ class LiveTrader:
                 if atr_at_entry > 0:
                     mae_usd = max(0, mae_usd)
                     mfe_usd = max(0, mfe_usd)
-                    mae_over_atr = (mae_usd / float(pos["size"])) / atr_at_entry
-                    mfe_over_atr = (mfe_usd / float(pos["size"])) / atr_at_entry
+                    mae_over_atr = (mae_usd / size) / atr_at_entry
+                    mfe_over_atr = (mfe_usd / size) / atr_at_entry
             except Exception as e:
                 LOG.warning("Could not calculate advanced post-trade metrics for %s: %s", symbol, e)
 
-            # --- 3. Finalize and Clean Up ---
+            # --- 4. Finalize and Clean Up ---
             try:
                 await self.exchange.cancel_all_orders(symbol, params={'category': 'linear'})
             except Exception as e:
@@ -1086,10 +1090,9 @@ class LiveTrader:
 
             await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, closed_at)
 
-            all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
-            total_pnl = sum((entry_price_float - float(f['price'])) * float(f['qty']) for f in all_fills if f['price'] is not None and f['qty'] is not None)
+            # Note: The previous logic to re-calculate PnL from all fills is now redundant
+            # because we are getting the accurate exit price. We will use the direct calculation.
 
-            # --- 4. Persist All Data to the Database ---
             await self.db.update_position(
                 pid, status="CLOSED", closed_at=closed_at, pnl=total_pnl,
                 exit_reason=closing_order_type, holding_minutes=holding_minutes,
@@ -1161,39 +1164,50 @@ class LiveTrader:
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
             symbol = pos["symbol"]
+            size = float(pos["size"])
+            entry_price = float(pos["entry_price"])
+            
             try:
+                # 1. Cancel any other open orders (like SL/TP) for this position
                 await self.exchange.cancel_all_orders(symbol)
-                await self.exchange.create_market_order(symbol, "buy", float(pos["size"]), params={'reduceOnly': True})
+                
+                # 2. Send the market order to close the position
+                await self.exchange.create_market_order(symbol, "buy", size, params={'reduceOnly': True})
+                LOG.info(f"Force-closing {symbol} (pid {pid}) with a market order due to: {tag}")
+
             except Exception as e:
                 LOG.warning("Force-close order issue on %s: %s", symbol, e)
 
-            # --- FIX: Calculate PnL and other data accurately ---
-            closed_at = datetime.now(timezone.utc)
-            
-            # Use the robust fetch_my_trades to get the real exit price
+            # --- THIS IS THE CRITICAL FIX ---
+            # 3. Wait a moment for the trade to register on the exchange
+            await asyncio.sleep(2) # 2-second buffer
+
+            # 4. Fetch the actual fill price from our trade history
             exit_price = None
             try:
+                # Fetch our most recent trades for this symbol
                 my_trades = await self.exchange.fetch_my_trades(symbol, limit=5)
+                # The closing trade is the most recent 'buy' order
                 closing_trade = next((t for t in reversed(my_trades) if t.get('side') == 'buy'), None)
+                
                 if closing_trade:
                     exit_price = float(closing_trade['price'])
+                    LOG.info(f"Confirmed force-close fill price for {symbol} at {exit_price}")
+                else:
+                    LOG.warning(f"Could not confirm fill price for force-close of {symbol} via fetch_my_trades. Falling back to ticker.")
             except Exception as e:
-                LOG.error(f"Could not fetch fill price for force-close of {symbol}: {e}")
+                LOG.error(f"Error fetching fill price for force-close of {symbol}: {e}")
 
-            # Fallback if fetching trades fails
+            # 5. Last resort fallback (should rarely be used now)
             if not exit_price:
                 exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
 
-            entry_price = float(pos["entry_price"])
-            size = float(pos["size"])
+            # 6. Calculate PnL with the accurate price
             pnl = (entry_price - exit_price) * size
+            closed_at = datetime.now(timezone.utc)
+            holding_minutes = (closed_at - pos["opened_at"]).total_seconds() / 60 if pos.get("opened_at") else 0.0
             
-            # Calculate holding time
-            holding_minutes = 0.0
-            if pos.get("opened_at"):
-                holding_minutes = (closed_at - pos["opened_at"]).total_seconds() / 60
-
-            # Update the database with ALL the correct information
+            # 7. Update the database with all the correct information
             await self.db.update_position(
                 pid, 
                 status="CLOSED", 
@@ -1208,6 +1222,7 @@ class LiveTrader:
             await self.risk.on_trade_close(pnl, self.tg)
             self.last_exit[symbol] = closed_at
             self.open_positions.pop(pid, None)
+            
             await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
     async def _main_signal_loop(self):
