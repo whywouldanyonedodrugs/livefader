@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import pandas as pd
 import statsmodels.api as sm
 import joblib # For saving the model
+from statsmodels.discrete.discrete_model import LogitFirth
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 LOG = logging.getLogger(__name__)
@@ -63,8 +64,6 @@ async def main():
         df['is_win'] = df['pnl'] > 0
         LOG.info(f"Loaded {len(df)} trades for training.")
 
-        # --- THE DEFINITIVE FIX ---
-        # 1. Force all feature columns to a numeric type as a safety measure.
         for col in FEATURES:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -72,26 +71,25 @@ async def main():
                 LOG.error(f"Critical error: Feature column '{col}' not found in the DataFrame.")
                 return
         
-        # 2. Explicitly convert the boolean feature to integers (1/0).
-        # This is the key step that solves the 'dtype of object' error.
         if 'is_ema_crossed_down_at_entry' in df.columns:
             df['is_ema_crossed_down_at_entry'] = df['is_ema_crossed_down_at_entry'].astype(int)
-        # --- END OF FIX ---
 
         # --- Model Training ---
-        # Prepare the data, dropping any rows with missing values
         df_clean = df.dropna(subset=FEATURES + [TARGET])
         
         X = df_clean[FEATURES]
-        y = df_clean[TARGET].astype(int) # Also cast the target to int for consistency
+        y = df_clean[TARGET].astype(int)
 
-        # Add a constant for the regression model
         X = sm.add_constant(X, prepend=True)
 
         LOG.info(f"Training Firth logistic regression model on {len(X)} data points...")
         
-        logit_model = sm.Logit(y, X)
-        result = logit_model.fit(method='firth', disp=False)
+        # --- THIS IS THE FIX ---
+        # Instead of sm.Logit, we instantiate the specific LogitFirth class.
+        # It does not take a 'method' argument in .fit() because the method is the class itself.
+        firth_model = LogitFirth(y, X)
+        result = firth_model.fit(disp=False)
+        # --- END OF FIX ---
 
         LOG.info("Model training complete.")
         print("--- Firth Logit Regression Results ---")
