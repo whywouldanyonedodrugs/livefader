@@ -176,18 +176,23 @@ class Signal:
     price_boom_pct: float
     price_slowdown_pct: float
     vwap_dev_pct: float
-    vwap_consolidated: bool
-    vwap_z_score: float
     ret_30d: float
     ema_fast: float
     ema_slow: float
     listing_age_days: int
     
+    # --- NEW FEATURES FOR THE PREDICTIVE MODEL ---
+    vwap_z_score: float
+    is_ema_crossed_down: bool
+    win_probability: float = 0.0 # Default to 0.0
+
+    # This is for the old gap filter, not the model
+    vwap_consolidated: bool
+
     # Contextual Info
     session_tag: str
     day_of_week: int
     hour_of_day: int
-    win_probability: float = 0.0
 
 LISTING_PATH = Path("listing_dates.json")
 
