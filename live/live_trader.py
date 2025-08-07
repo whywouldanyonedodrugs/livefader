@@ -181,6 +181,12 @@ class Signal:
     ema_slow: float
     listing_age_days: int
     vwap_consolidated: bool   
+
+    # Contextual Info
+    session_tag: str
+    day_of_week: int
+    hour_of_day: int
+
     # --- NEW FEATURES FOR THE PREDICTIVE MODEL ---
     vwap_z_score: float
     is_ema_crossed_down: bool
@@ -190,10 +196,7 @@ class Signal:
     # This is for the old gap filter, not the model
 
 
-    # Contextual Info
-    session_tag: str
-    day_of_week: int
-    hour_of_day: int
+
 
 LISTING_PATH = Path("listing_dates.json")
 
