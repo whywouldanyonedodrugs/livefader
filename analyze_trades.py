@@ -118,6 +118,15 @@ def run_analysis(df: pd.DataFrame):
     describe_continuous(df, "pct_to_ema_fast")
     describe_continuous(df, "ema_spread_pct")
     describe_continuous(df, "pct_to_vwap")
+
+    header("VWAP DEVIATION BANDS – WIN RATE BY CATEGORY")
+    df["vwap_band"] = pd.cut(
+        df["pct_to_vwap"],
+        bins=[-np.inf, 0.05, 0.10, 0.15, 0.20, np.inf],
+        labels=["<5%", "5-10%", "10-15%", "15-20%", ">20%"]
+    )
+    describe_categorical(df, "vwap_band")
+
     describe_continuous(df, "mae_over_atr")
     describe_continuous(df, "mfe_over_atr")
     describe_continuous(df, "realized_vol_during_trade")
