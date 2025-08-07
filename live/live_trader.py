@@ -188,7 +188,7 @@ class Signal:
 
     # This is for the old gap filter, not the model
     vwap_consolidated: bool
-
+    vwap_consolidated: bool = False
     # Contextual Info
     session_tag: str
     day_of_week: int
