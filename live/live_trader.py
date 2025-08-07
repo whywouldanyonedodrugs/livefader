@@ -172,7 +172,7 @@ class Signal:
     price_boom_pct: float
     price_slowdown_pct: float
     vwap_dev_pct: float
-    ret_3d: float
+    ret_30d: float
     ema_fast: float
     ema_slow: float
     listing_age_days: int
