@@ -1,48 +1,36 @@
-# analyze_trades.py
-#
-# “Swiss-army knife” console report for trade history.
-# Run with:  python analyze_trades.py --file trades.csv
-#
-# -----------------------------------------------------------
+# /opt/livefader/src/analyze_trades.py
+
 import argparse
 from pathlib import Path
 import warnings
+import os  # <--- THE PRIMARY FIX IS HERE
 import asyncio
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 from scipy import stats
+import telegram
 from dotenv import load_dotenv
 
-# Optional – nice but not mandatory
 try:
     import statsmodels.api as sm
 except ImportError:
     sm = None
     warnings.warn("statsmodels not installed – logistic regression section will be skipped.")
 
-
-# ------------------------------------------------------------------
-# Helper text printer ------------------------------------------------
-# ------------------------------------------------------------------
+# --- Helper Functions ---
 def header(txt: str):
     bar = "=" * 72
     print(f"\n{bar}\n {txt.upper()}\n{bar}")
 
-
-# ------------------------------------------------------------------
-# Core analysis steps ------------------------------------------------
-# ------------------------------------------------------------------
-
-
-# ------------------------------------------------------------------
 def describe_continuous(df, col, win_flag="is_win"):
     header(f"{col} – wins vs. losses")
     grp = df.groupby(win_flag)[col].describe()[["count", "mean", "std", "25%", "50%", "75%"]]
     print(grp.to_string())
     if df[col].notna().sum() > 10:
-        # Use a try-except block to handle cases where correlation cannot be calculated
         try:
-            r, p = stats.pointbiserialr(df[win_flag], df[col].fillna(0)) # fillna to avoid errors
+            r, p = stats.pointbiserialr(df[win_flag].fillna(False), df[col].fillna(0))
             print(f"\nPoint-biserial correlation with win flag: r={r:.3f}  p={p:.4f}")
         except ValueError:
             print("\nCould not calculate point-biserial correlation.")
@@ -53,53 +41,44 @@ def describe_categorical(df, col, win_flag="is_win"):
     if True in tab.columns:
         tab["win_rate_%"] = 100 * tab[True] / tab["All"]
     print(tab.to_string())
-    if len(tab) > 1:
+    if len(tab) > 1 and tab.shape[0] > 2 and tab.shape[1] > 2:
         chi2 = stats.chi2_contingency(tab.iloc[:-1, :-1])[0]
         n = tab["All"].iloc[-1]
         k = min(tab.shape[0] - 1, tab.shape[1] - 1)
         cramers_v = np.sqrt(chi2 / (n * k)) if n and k else np.nan
         print(f"\nCramér’s V vs. win flag: {cramers_v:.3f}")
 
-def analyze_regime_performance(df: pd.DataFrame):
-    header("Regime-Specific Performance KPIs")
-    
-    if "market_regime_at_entry" not in df.columns:
-        print("Market regime data not found.")
-        return
-
-    # Group by the market regime
-    regime_groups = df.groupby("market_regime_at_entry")
-
-    # Calculate advanced KPIs for each group
-    summary = regime_groups.agg(
-        total_trades=('pnl', 'count'),
-        total_pnl=('pnl', 'sum'),
-        win_rate=('is_win', lambda x: x.mean() * 100),
-        avg_pnl=('pnl', 'mean'),
-        avg_win=('pnl', lambda x: x[x > 0].mean()),
-        avg_loss=('pnl', lambda x: x[x < 0].mean()),
-    ).fillna(0)
-
-    # Calculate Profit Factor
-    gross_profit = regime_groups['pnl'].apply(lambda x: x[x > 0].sum())
-    gross_loss = regime_groups['pnl'].apply(lambda x: abs(x[x < 0].sum()))
-    summary['profit_factor'] = (gross_profit / gross_loss).replace([np.inf, -np.inf], 0).fillna(0)
-
-    print(summary.to_string(float_format="%.2f"))
-
-
-# ------------------------------------------------------------------
 def logistic_regression(df, features):
-    if sm is None:
-        return
+    if sm is None: return
     header("Quick logistic regression (wins=1)")
     clean_df = df.dropna(subset=features + ["is_win"])
+    if len(clean_df) < 10:
+        print("Not enough data for logistic regression.")
+        return
     X = clean_df[features]
     X = sm.add_constant(X)
     y = clean_df["is_win"].astype(int)
-    model = sm.Logit(y, X).fit(disp=False)
-    print(model.summary())
+    try:
+        model = sm.Logit(y, X).fit(disp=False)
+        print(model.summary())
+    except Exception as e:
+        print(f"Logistic regression failed: {e}")
 
+def analyze_regime_performance(df: pd.DataFrame):
+    header("Regime-Specific Performance KPIs")
+    if "market_regime_at_entry" not in df.columns: return
+    regime_groups = df.groupby("market_regime_at_entry")
+    summary = regime_groups.agg(
+        total_trades=('pnl', 'count'), total_pnl=('pnl', 'sum'),
+        win_rate=('is_win', lambda x: x.mean() * 100), avg_pnl=('pnl', 'mean'),
+        avg_win=('pnl', lambda x: x[x > 0].mean()), avg_loss=('pnl', lambda x: x[x < 0].mean()),
+    ).fillna(0)
+    gross_profit = regime_groups['pnl'].apply(lambda x: x[x > 0].sum())
+    gross_loss = regime_groups['pnl'].apply(lambda x: abs(x[x < 0].sum()))
+    summary['profit_factor'] = (gross_profit / gross_loss).replace([np.inf, -np.inf], 0).fillna(0)
+    print(summary.to_string(float_format="%.2f"))
+
+# --- Core Analysis Logic ---
 def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["is_win"] = df["pnl"] > 0
@@ -123,59 +102,40 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
-
-# ------------------------------------------------------------------
 def run_analysis(df: pd.DataFrame):
     df = feature_engineering(df)
-
-    # 1. Core edge – boom/slowdown
+    
     header("Price boom / slowdown bins")
     df["boom_bin"] = pd.qcut(df["price_boom_pct_at_entry"], q=4, labels=False, duplicates="drop")
     df["slow_bin"] = pd.qcut(df["price_slowdown_pct_at_entry"], q=4, labels=False, duplicates="drop")
     print(pd.crosstab(df["boom_bin"], df["slow_bin"], values=df["is_win"], aggfunc="mean"))
 
-    # 2. Regime performance
     analyze_regime_performance(df)
 
-    # 3. RSI bands
-    df["rsi_band"] = pd.cut(df["rsi_at_entry"], bins=[0, 50, 60, 70, 80, 100],
-                            labels=["<50", "50-60", "60-70", "70-80", ">80"])
+    df["rsi_band"] = pd.cut(df["rsi_at_entry"], bins=[0, 50, 60, 70, 80, 100], labels=["<50", "50-60", "60-70", "70-80", ">80"])
     describe_categorical(df, "rsi_band")
-
-    # 4. EMA distance
+    
     describe_continuous(df, "pct_to_ema_fast")
     describe_continuous(df, "ema_spread_pct")
-
-    # 5. VWAP distance
     describe_continuous(df, "pct_to_vwap")
-
-    # 6. ATR-normalised MAE / MFE
     describe_continuous(df, "mae_over_atr")
     describe_continuous(df, "mfe_over_atr")
     describe_continuous(df, "realized_vol_during_trade")
     describe_continuous(df, "btc_beta_during_trade")
-
-    # 7. Slippage
-    if "slippage_usd" in df.columns:
-        describe_continuous(df, "slippage_over_atr")
-    else:
-        header("Slippage column not present – skipping slippage analysis")
-
-    # 8. Time-related
+    describe_continuous(df, "slippage_over_atr")
+    
     describe_categorical(df, "session_tag_at_entry")
     describe_categorical(df, "holding_bucket")
     describe_categorical(df, "day_of_week_at_entry")
     describe_categorical(df, "hour_of_day_at_entry")
 
-    # 9. Quick correlations (top 10 absolute r)
     header("Top 10 absolute point-biserial correlations with win flag")
     cont_cols = [c for c in df.select_dtypes(include="number").columns if c not in ["is_win", "pnl"]]
-    cors = {c: stats.pointbiserialr(df["is_win"], df[c])[0] for c in cont_cols if df[c].notna().sum() > 5}
+    cors = {c: stats.pointbiserialr(df["is_win"], df[c])[0] for c in cont_cols if df[c].notna().sum() > 5 and np.std(df[c]) > 0}
     top10 = pd.Series(cors).abs().sort_values(ascending=False).head(10)
     print(top10.to_string())
 
-    # 10. Logistic model
-    logit_features = top10.index.tolist()[:6]  # take 6 strongest
+    logit_features = [col for col in top10.index.tolist() if col not in ['pnl_pct', 'mae_usd', 'mfe_usd']]
     logistic_regression(df, logit_features)
 
 def analyze_performance_ratios(df_equity: pd.DataFrame):
@@ -207,6 +167,7 @@ def analyze_performance_ratios(df_equity: pd.DataFrame):
     print(f"Sharpe Ratio:             {sharpe_ratio:.2f}")
     print(f"Sortino Ratio:            {sortino_ratio:.2f}")
 
+# --- Telegram Delivery Function ---
 async def send_telegram_report(report_file_path: str):
     load_dotenv()
     token = os.getenv("TG_BOT_TOKEN")
@@ -230,7 +191,7 @@ async def send_telegram_report(report_file_path: str):
     except Exception as e:
         print(f"Failed to send report to Telegram: {e}")
 
-# ------------------------------------------------------------------
+# --- Main Execution Logic ---
 def main():
     parser = argparse.ArgumentParser(description="Trade analytics console report")
     parser.add_argument("--file", default="trades.csv", help="CSV of closed trades")
