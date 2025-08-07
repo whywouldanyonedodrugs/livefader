@@ -7,38 +7,18 @@ import os
 from dotenv import load_dotenv
 import pandas as pd
 import statsmodels.api as sm
-import joblib # For saving the model
-from statsmodels.discrete.discrete_model import LogitFirth
+import joblib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 LOG = logging.getLogger(__name__)
 
-# --- CRITICAL: Final, Corrected Feature Selection ---
-# These are the pre-trade features the bot will use to predict win probability.
-# The names must exactly match the column names in the database.
 FEATURES = [
-    # Core Indicators
-    'rsi_at_entry',
-    'adx_at_entry',
-    
-    # Price Action / Momentum
-    'price_boom_pct_at_entry',
-    'price_slowdown_pct_at_entry',
-    
-    # Volatility-Normalized Mean Reversion
-    'vwap_z_at_entry',
-    
-    # Trend Context
-    'ema_spread_pct_at_entry', # <-- CORRECTED: Added '_at_entry' suffix
-    'is_ema_crossed_down_at_entry',
-    
-    # Time-Based Features
-    'day_of_week_at_entry',
-    'hour_of_day_at_entry'
+    'rsi_at_entry', 'adx_at_entry', 'price_boom_pct_at_entry',
+    'price_slowdown_pct_at_entry', 'vwap_z_at_entry', 'ema_spread_pct_at_entry',
+    'is_ema_crossed_down_at_entry', 'day_of_week_at_entry', 'hour_of_day_at_entry'
 ]
 TARGET = 'is_win'
 MODEL_FILE_NAME = "win_probability_model.joblib"
-
 
 async def main():
     load_dotenv()
@@ -60,7 +40,6 @@ async def main():
             return
 
         df = pd.DataFrame([dict(record) for record in data])
-            
         df['is_win'] = df['pnl'] > 0
         LOG.info(f"Loaded {len(df)} trades for training.")
 
@@ -74,7 +53,6 @@ async def main():
         if 'is_ema_crossed_down_at_entry' in df.columns:
             df['is_ema_crossed_down_at_entry'] = df['is_ema_crossed_down_at_entry'].astype(int)
 
-        # --- Model Training ---
         df_clean = df.dropna(subset=FEATURES + [TARGET])
         
         X = df_clean[FEATURES]
@@ -82,20 +60,20 @@ async def main():
 
         X = sm.add_constant(X, prepend=True)
 
-        LOG.info(f"Training Firth logistic regression model on {len(X)} data points...")
+        LOG.info(f"Training Regularized Logistic Regression model on {len(X)} data points...")
         
-        # --- THIS IS THE FIX ---
-        # Instead of sm.Logit, we instantiate the specific LogitFirth class.
-        # It does not take a 'method' argument in .fit() because the method is the class itself.
-        firth_model = LogitFirth(y, X)
-        result = firth_model.fit(disp=False)
+        # --- THIS IS THE FINAL FIX ---
+        # We use the standard Logit class and call the .fit_regularized() method.
+        # This is a robust way to handle separation and create a stable model.
+        logit_model = sm.Logit(y, X)
+        # 'l1' is a common and effective regularization method.
+        result = logit_model.fit_regularized(method='l1', disp=False)
         # --- END OF FIX ---
 
         LOG.info("Model training complete.")
-        print("--- Firth Logit Regression Results ---")
+        print("--- Regularized Logit Regression Results ---")
         print(result.summary())
 
-        # --- Save the Trained Model ---
         joblib.dump(result, MODEL_FILE_NAME)
         LOG.info(f"Successfully saved trained model to '{MODEL_FILE_NAME}'")
 
