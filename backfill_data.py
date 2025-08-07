@@ -31,7 +31,6 @@ async def main():
     exchange = None
     try:
         conn = await asyncpg.connect(dsn=db_dsn)
-        # Use the same settings as the live bot
         exchange = ccxt.bybit({
             'apiKey': os.getenv("BYBIT_API_KEY"),
             'secret': os.getenv("BYBIT_API_SECRET"),
@@ -68,10 +67,13 @@ async def main():
 
                 # --- 1. Fetch Ground-Truth Exit Price & PnL ---
                 my_trades = await exchange.fetch_my_trades(symbol, since=int(opened_at.timestamp() * 1000), limit=100)
-                # Find all trades that occurred during the position's lifetime
-                position_trades = [t for t in my_trades if opened_at <= t['datetime'].replace(tzinfo=timezone.utc) <= closed_at + timedelta(minutes=1)]
                 
-                # The closing fill is the 'buy' trade (to close a short)
+                # --- FIX: Use integer timestamps for comparison ---
+                start_ts_ms = int(opened_at.timestamp() * 1000)
+                end_ts_ms = int((closed_at + timedelta(minutes=1)).timestamp() * 1000)
+                position_trades = [t for t in my_trades if start_ts_ms <= t['timestamp'] <= end_ts_ms]
+                # --- END OF FIX ---
+                
                 closing_fill = next((t for t in reversed(position_trades) if t['side'] == 'buy'), None)
 
                 if not closing_fill:
@@ -80,7 +82,6 @@ async def main():
                 else:
                     exit_price = float(closing_fill['price'])
 
-                # Recalculate PnL based on the ground-truth exit price
                 pnl = (entry_price - exit_price) * size
                 pnl_pct = ((entry_price / exit_price) - 1) * 100 if exit_price > 0 else 0
 
@@ -88,7 +89,6 @@ async def main():
                 holding_minutes = (closed_at - opened_at).total_seconds() / 60
                 inferred_exit_reason = trade['exit_reason']
                 
-                # If holding time is very close to the limit, it was a time exit
                 time_exit_hours = cfg.TIME_EXIT_HOURS if cfg.TIME_EXIT_HOURS_ENABLED else cfg.TIME_EXIT_DAYS * 24
                 if abs(holding_minutes - (time_exit_hours * 60)) < 5:
                      inferred_exit_reason = "TIME_EXIT"
@@ -98,7 +98,6 @@ async def main():
                      inferred_exit_reason = "SL"
 
                 # --- 3. Fetch All Necessary Historical Data ---
-                # Fetch enough data to ensure indicators are fully warmed up
                 since_ts_1d = int((opened_at - timedelta(days=cfg.STRUCTURAL_TREND_DAYS + 5)).timestamp() * 1000)
                 since_ts_4h = int((opened_at - timedelta(days=40)).timestamp() * 1000)
                 since_ts_1h = int((opened_at - timedelta(days=10)).timestamp() * 1000)
