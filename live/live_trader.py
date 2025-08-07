@@ -180,15 +180,16 @@ class Signal:
     ema_fast: float
     ema_slow: float
     listing_age_days: int
-    
+    vwap_consolidated: bool   
     # --- NEW FEATURES FOR THE PREDICTIVE MODEL ---
     vwap_z_score: float
     is_ema_crossed_down: bool
     win_probability: float = 0.0 # Default to 0.0
+    vwap_consolidated: bool = False
 
     # This is for the old gap filter, not the model
-    vwap_consolidated: bool
-    vwap_consolidated: bool = False
+
+
     # Contextual Info
     session_tag: str
     day_of_week: int
