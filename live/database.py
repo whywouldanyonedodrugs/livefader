@@ -38,11 +38,9 @@ CREATE TABLE IF NOT EXISTS positions (
     price_boom_pct_at_entry FLOAT,
     price_slowdown_pct_at_entry FLOAT,
     vwap_dev_pct_at_entry FLOAT,
-    vwap_z_at_entry FLOAT,
     ret_30d_at_entry FLOAT,
     ema_fast_at_entry FLOAT,
     ema_slow_at_entry FLOAT,
-    is_ema_crossed_down_at_entry BOOLEAN,
     listing_age_days_at_entry INT,
     session_tag_at_entry TEXT,
     day_of_week_at_entry INT,
@@ -56,8 +54,11 @@ CREATE TABLE IF NOT EXISTS positions (
     mae_over_atr FLOAT,
     mfe_over_atr FLOAT,
     realized_vol_during_trade FLOAT,
-    btc_beta_during_trade FLOAT,
-    
+    btc_beta_during_trade FLOAT, -- <-- THE MISSING COMMA WAS HERE
+    -- Columns for the predictive model
+    vwap_z_at_entry FLOAT,
+    is_ema_crossed_down_at_entry BOOLEAN,
+    win_probability_at_entry FLOAT
 );
 CREATE TABLE IF NOT EXISTS fills (
     id SERIAL PRIMARY KEY,
