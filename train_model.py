@@ -12,10 +12,9 @@ import joblib # For saving the model
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 LOG = logging.getLogger(__name__)
 
-# --- CRITICAL: Feature Selection ---
-# We ONLY use pre-trade data that the bot knows at the moment of entry.
-# We EXCLUDE any post-trade data like PnL, MAE, MFE, holding_minutes etc.
-# Based on your last report, these are the most promising predictors.
+# --- CRITICAL: Final, Corrected Feature Selection ---
+# These are the pre-trade features the bot will use to predict win probability.
+# The names must exactly match the column names in the database.
 FEATURES = [
     # Core Indicators
     'rsi_at_entry',
@@ -29,8 +28,8 @@ FEATURES = [
     'vwap_z_at_entry',
     
     # Trend Context
-    'ema_spread_pct', # The % distance between fast and slow EMA
-    'is_ema_crossed_down_at_entry', # A simple 1 or 0 for trend direction
+    'ema_spread_pct_at_entry', # <-- CORRECTED: Added '_at_entry' suffix
+    'is_ema_crossed_down_at_entry',
     
     # Time-Based Features
     'day_of_week_at_entry',
@@ -58,29 +57,31 @@ async def main():
             LOG.error("No trade data found in the database. Cannot train model.")
             return
 
-        # --- THIS IS THE FIX ---
         # Explicitly convert each asyncpg.Record to a standard Python dictionary
-        # This ensures Pandas correctly identifies all column names, including 'pnl'.
+        # This ensures Pandas correctly identifies all column names.
         df = pd.DataFrame([dict(record) for record in data])
-        # --- END OF FIX ---
             
         df['is_win'] = df['pnl'] > 0
         LOG.info(f"Loaded {len(df)} trades for training.")
 
         # --- Model Training ---
+        # Prepare the data, dropping any rows with missing values in our features
         df_clean = df.dropna(subset=FEATURES + [TARGET])
         
         X = df_clean[FEATURES]
         y = df_clean[TARGET]
 
+        # Add a constant for the regression model
         X = sm.add_constant(X, prepend=True)
 
         LOG.info(f"Training Firth logistic regression model on {len(X)} data points...")
         
+        # Use method='firth' to handle potential separation in the data, which is common
         logit_model = sm.Logit(y, X)
         result = logit_model.fit(method='firth', disp=False)
 
         LOG.info("Model training complete.")
+        print("--- Firth Logit Regression Results ---")
         print(result.summary())
 
         # --- Save the Trained Model ---
