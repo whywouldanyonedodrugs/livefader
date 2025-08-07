@@ -781,6 +781,7 @@ class LiveTrader:
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
 
+            days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
             win_prob_pct = sig.win_probability * 100
             await self.tg.send(
                 f"🚀 **({days[sig.day_of_week]})** Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}\n"

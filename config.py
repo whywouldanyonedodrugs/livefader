@@ -65,7 +65,7 @@ TIME_EXIT_DAYS          = 10       # Fallback: close runner after N days
 
 # --- Coin Age Filter (Applied in filters.py) ---
 MIN_COIN_AGE_DAYS = 14  # Min days since listing
-MAX_COIN_AGE_DAYS = 1825 # Max days since listing (e.g., 5 years)
+MAX_COIN_AGE_DAYS = 9999 # Max days since listing (e.g., 5 years)
 
 # --- Structural Trend Filter (Long-Term) ---
 STRUCTURAL_TREND_FILTER_ENABLED = False 
@@ -90,11 +90,11 @@ MIN_ATR_PCT               = 0.005 # Min ATR as a percentage of price
 
 # ── portfolio / kill‑switches ─────────────────────────────────────────────
 MAX_OPEN            = 30          # max concurrent positions
-MAX_LOSS_STREAK     = 5
-KILL_EQUITY_LEVEL   = 90.0        # USDT
+MAX_LOSS_STREAK     = 10
+KILL_EQUITY_LEVEL   = 200.0        # USDT
 MIN_EQUITY_USDT     = 100.0
 MAX_LEVERAGE        = 10
-MIN_NOTIONAL        = 0.01         # exchange min order size
+MIN_NOTIONAL        = 0.001         # exchange min order size
 MIN_STOP_DIST_USD   = 0.0002
 MIN_STOP_DIST_PCT   = 0.0008      # 0.08 %
 
@@ -102,7 +102,7 @@ MIN_STOP_DIST_PCT   = 0.0008      # 0.08 %
 DD_PAUSE_ENABLED    = True     # set False to disable drawdown protection  # <--- ADD THIS
 DD_MAX_PCT          = 50.0     # Pause trading if equity drops 10% from peak # <--- ADD THIS
 DD_COOLDOWN_PCT     = 50.0     # % from equity peak
-DD_COOLDOWN_DURATION_H = 12
+DD_COOLDOWN_DURATION_H = 6
 
 
 # ── BTC / ALT EMA trend veto ──────────────────────────────────────────────
