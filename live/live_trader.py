@@ -954,142 +954,140 @@ class LiveTrader:
             LOG.info("Trail updated %s to %.4f", symbol, new_stop)
             
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
-        symbol = pos["symbol"]
-        opened_at = pos["opened_at"]
-        closed_at = datetime.now(timezone.utc)
-        exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
+            symbol = pos["symbol"]
+            opened_at = pos["opened_at"]
+            closed_at = datetime.now(timezone.utc)
+            exit_price, exit_qty, closing_order_type = None, 0.0, "UNKNOWN"
 
-        # --- 1. Find the Closing Order and its True Price ---
-        closing_order_cid = None
-        if inferred_exit_reason:
-            closing_order_type = inferred_exit_reason
-            if inferred_exit_reason == "TP":
-                closing_order_cid = pos.get("tp_final_cid") or pos.get("tp2_cid") or pos.get("tp1_cid")
-            elif inferred_exit_reason == "SL":
-                closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
+            # --- 1. Find the Closing Order and its True Price ---
+            closing_order_cid = None
+            if inferred_exit_reason:
+                closing_order_type = inferred_exit_reason
+                if inferred_exit_reason == "TP":
+                    closing_order_cid = pos.get("tp_final_cid") or pos.get("tp2_cid") or pos.get("tp1_cid")
+                elif inferred_exit_reason == "SL":
+                    closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
 
-        if closing_order_cid:
+            if closing_order_cid:
+                try:
+                    order = await self._fetch_by_cid(closing_order_cid, symbol)
+                    if order and (order.get('average') or order.get('price')):
+                        exit_price = float(order.get('average') or order.get('price'))
+                        exit_qty = float(order.get('filled', 0))
+                        LOG.info(f"Found closing order {closing_order_cid}. Exit Price: {exit_price}")
+                except Exception as e:
+                    LOG.warning("Could not fetch exact closing order %s: %s", closing_order_cid, e)
+
+            # --- FIX: New, more robust fallback logic ---
+            if not exit_price:
+                LOG.warning("Could not determine fill price from order CID. Using fetch_my_trades as fallback.")
+                try:
+                    # Fetch the last 5 trades for this symbol
+                    my_trades = await self.exchange.fetch_my_trades(symbol, limit=5)
+                    # Find the most recent trade that was a 'sell' (for a short) or 'buy' (for a long)
+                    # This assumes the bot only handles one direction, which is true for this bot (short only)
+                    closing_trade = next((t for t in reversed(my_trades) if t.get('side') == 'buy'), None)
+                    if closing_trade:
+                        exit_price = float(closing_trade['price'])
+                        exit_qty = float(closing_trade['amount'])
+                        closing_order_type = inferred_exit_reason or "FALLBACK_TRADE"
+                        LOG.info(f"Found closing fill via fetch_my_trades. Exit Price: {exit_price}")
+                    else:
+                        # If all else fails, use the ticker as a last resort
+                        ticker = await self.exchange.fetch_ticker(symbol)
+                        exit_price = float(ticker["last"])
+                        exit_qty = float(pos["size"])
+                        closing_order_type = inferred_exit_reason or "FALLBACK_TICKER"
+                except Exception as e:
+                    LOG.error(f"Fallback to fetch_my_trades also failed: {e}. Using last resort ticker price.")
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    exit_price = float(ticker["last"])
+                    exit_qty = float(pos["size"])
+            # --- END OF FIX ---
+
+            # --- 2. Perform All Post-Trade Calculations (This logic is now more accurate) ---
+            holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
+            entry_price_float = float(pos["entry_price"])
+            pnl_pct = ((entry_price_float / exit_price) - 1) * 100 if exit_price > 0 else 0.0
+
+            mae_usd, mfe_usd, mae_over_atr, mfe_over_atr = 0.0, 0.0, 0.0, 0.0
+            realized_vol_during_trade, btc_beta_during_trade = 0.0, 0.0
+
             try:
-                order = await self._fetch_by_cid(closing_order_cid, symbol)
-                if order and (order.get('average') or order.get('price')):
-                    exit_price = float(order.get('average') or order.get('price'))
-                    exit_qty = float(order.get('filled', 0))
-                    LOG.info(f"Found closing order {closing_order_cid}. Exit Price: {exit_price}")
+                if closing_order_type == "SL":
+                    mae_usd = (exit_price - entry_price_float) * float(pos["size"])
+                elif closing_order_type in ["TP", "TP1", "TP2", "TP_FINAL"]:
+                    mfe_usd = (entry_price_float - exit_price) * float(pos["size"])
+
+                since_ts = int(opened_at.timestamp() * 1000)
+                ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=since_ts)
+                
+                if ohlcv:
+                    trade_df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                    trade_df['ts'] = pd.to_datetime(trade_df['ts'], unit='ms', utc=True)
+                    trade_df = trade_df[trade_df['ts'] <= closed_at]
+
+                    if not trade_df.empty:
+                        if mae_usd == 0.0:
+                            mae_usd = (trade_df['h'].max() - entry_price_float) * float(pos["size"])
+                        if mfe_usd == 0.0:
+                            mfe_usd = (entry_price_float - trade_df['l'].min()) * float(pos["size"])
+
+                        asset_returns = trade_df['c'].pct_change().dropna()
+                        if not asset_returns.empty:
+                            realized_vol_during_trade = asset_returns.std() * np.sqrt(365 * 24 * 60)
+
+                        benchmark_symbol = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
+                        if symbol != benchmark_symbol:
+                            btc_ohlcv = await self.exchange.fetch_ohlcv(benchmark_symbol, '1m', since=since_ts)
+                            if btc_ohlcv:
+                                btc_df = pd.DataFrame(btc_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                                btc_df['ts'] = pd.to_datetime(btc_df['ts'], unit='ms', utc=True)
+                                btc_df = btc_df[btc_df['ts'] <= closed_at]
+                                if not btc_df.empty:
+                                    asset_returns_named = asset_returns.rename('asset')
+                                    btc_returns_named = btc_df['c'].pct_change().rename('btc')
+                                    combined_df = pd.concat([asset_returns_named, btc_returns_named], axis=1).dropna()
+                                    if len(combined_df) > 5:
+                                        covariance = combined_df['asset'].cov(combined_df['btc'])
+                                        variance = combined_df['btc'].var()
+                                        if variance > 0:
+                                            btc_beta_during_trade = covariance / variance
+
+                atr_at_entry = float(pos["atr"])
+                if atr_at_entry > 0:
+                    mae_usd = max(0, mae_usd)
+                    mfe_usd = max(0, mfe_usd)
+                    mae_over_atr = (mae_usd / float(pos["size"])) / atr_at_entry
+                    mfe_over_atr = (mfe_usd / float(pos["size"])) / atr_at_entry
             except Exception as e:
-                LOG.warning("Could not fetch exact closing order %s: %s", closing_order_cid, e)
+                LOG.warning("Could not calculate advanced post-trade metrics for %s: %s", symbol, e)
 
-        if not exit_price:
-            LOG.warning("Could not determine exact fill price for %d. Using last market price.", pid)
-            ticker = await self.exchange.fetch_ticker(symbol)
-            exit_price = float(ticker["last"])
-            exit_qty = float(pos["size"])
-            closing_order_type = inferred_exit_reason or "FALLBACK"
+            # --- 3. Finalize and Clean Up ---
+            try:
+                await self.exchange.cancel_all_orders(symbol, params={'category': 'linear'})
+            except Exception as e:
+                LOG.warning(f"Final cleanup for position {pid} failed: {e}.")
 
-        # --- 2. Perform All Post-Trade Calculations ---
-        holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
-        entry_price_float = float(pos["entry_price"])
-        pnl_pct = ((entry_price_float / exit_price) - 1) * 100 if exit_price > 0 else 0.0
+            await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, closed_at)
 
-        mae_usd, mfe_usd, mae_over_atr, mfe_over_atr = 0.0, 0.0, 0.0, 0.0
-        realized_vol_during_trade, btc_beta_during_trade = 0.0, 0.0
+            all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
+            total_pnl = sum((entry_price_float - float(f['price'])) * float(f['qty']) for f in all_fills if f['price'] is not None and f['qty'] is not None)
 
-        try:
-            # For a short position: MAE is price UP, MFE is price DOWN.
-            if closing_order_type == "SL":
-                mae_usd = (exit_price - entry_price_float) * float(pos["size"])
-            elif closing_order_type in ["TP", "TP1", "TP2", "TP_FINAL"]:
-                mfe_usd = (entry_price_float - exit_price) * float(pos["size"])
-
-            # Fetch 1-minute OHLCV data for the trade's duration for remaining calculations.
-            since_ts = int(opened_at.timestamp() * 1000)
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, '1m', since=since_ts)
+            # --- 4. Persist All Data to the Database ---
+            await self.db.update_position(
+                pid, status="CLOSED", closed_at=closed_at, pnl=total_pnl,
+                exit_reason=closing_order_type, holding_minutes=holding_minutes,
+                pnl_pct=pnl_pct, mae_usd=mae_usd, mfe_usd=mfe_usd,
+                mae_over_atr=mae_over_atr, mfe_over_atr=mfe_over_atr,
+                realized_vol_during_trade=realized_vol_during_trade,
+                btc_beta_during_trade=btc_beta_during_trade
+            )
             
-            if ohlcv:
-                trade_df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-                trade_df['ts'] = pd.to_datetime(trade_df['ts'], unit='ms', utc=True)
-                trade_df = trade_df[trade_df['ts'] <= closed_at]
-
-                if not trade_df.empty:
-                    if mae_usd == 0.0:
-                        mae_usd = (trade_df['h'].max() - entry_price_float) * float(pos["size"])
-                    if mfe_usd == 0.0:
-                        mfe_usd = (entry_price_float - trade_df['l'].min()) * float(pos["size"])
-
-                    asset_returns = trade_df['c'].pct_change().dropna()
-                    if not asset_returns.empty:
-                        realized_vol_during_trade = asset_returns.std() * np.sqrt(365 * 24 * 60)
-
-                    # --- BTC BETA CALCULATION (RESTORED AND FIXED) ---
-                    benchmark_symbol = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
-                    if symbol != benchmark_symbol: # No need to calculate beta against itself
-                        btc_ohlcv = await self.exchange.fetch_ohlcv(benchmark_symbol, '1m', since=since_ts)
-                        if btc_ohlcv:
-                            btc_df = pd.DataFrame(btc_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-                            btc_df['ts'] = pd.to_datetime(btc_df['ts'], unit='ms', utc=True)
-                            btc_df = btc_df[btc_df['ts'] <= closed_at]
-
-                            if not btc_df.empty:
-                                # Prepare the two return series
-                                asset_returns_named = asset_returns.rename('asset')
-                                btc_returns_named = btc_df['c'].pct_change().rename('btc')
-                                
-                                # Combine and align them by timestamp
-                                combined_df = pd.concat([asset_returns_named, btc_returns_named], axis=1).dropna()
-                                
-                                if len(combined_df) > 5: # Ensure enough data for a meaningful calculation
-                                    covariance = combined_df['asset'].cov(combined_df['btc'])
-                                    variance = combined_df['btc'].var()
-                                    if variance > 0:
-                                        btc_beta_during_trade = covariance / variance
-                                        LOG.info(f"Calculated BTC Beta for {symbol}: {btc_beta_during_trade:.4f}")
-
-            atr_at_entry = float(pos["atr"])
-            if atr_at_entry > 0:
-                mae_usd = max(0, mae_usd)
-                mfe_usd = max(0, mfe_usd)
-                mae_over_atr = (mae_usd / float(pos["size"])) / atr_at_entry
-                mfe_over_atr = (mfe_usd / float(pos["size"])) / atr_at_entry
-
-        except Exception as e:
-            LOG.warning("Could not calculate advanced post-trade metrics for %s: %s", symbol, e)
-
-        # --- 3. Finalize and Clean Up ---
-        try:
-            LOG.info("Finalizing position %d for %s. Cancelling all related orders.", pid, symbol)
-            await self.exchange.cancel_all_orders(symbol, params={'category': 'linear'})
-        except Exception as e:
-            LOG.warning(f"Final cleanup for position {pid} failed: {e}.")
-
-        await self.db.add_fill(pid, closing_order_type, exit_price, exit_qty, closed_at)
-
-        all_fills = await self.db.pool.fetch("SELECT price, qty FROM fills WHERE position_id=$1", pid)
-        total_pnl = 0
-        for fill in all_fills:
-            if fill['price'] is not None and fill['qty'] is not None:
-                total_pnl += (entry_price_float - float(fill['price'])) * float(fill['qty'])
-
-        # --- 4. Persist All Data to the Database ---
-        await self.db.update_position(
-            pid,
-            status="CLOSED",
-            closed_at=closed_at,
-            pnl=total_pnl,
-            exit_reason=closing_order_type,
-            holding_minutes=holding_minutes,
-            pnl_pct=pnl_pct,
-            mae_usd=mae_usd,
-            mfe_usd=mfe_usd,
-            mae_over_atr=mae_over_atr,
-            mfe_over_atr=mfe_over_atr,
-            realized_vol_during_trade=realized_vol_during_trade,
-            btc_beta_during_trade=btc_beta_during_trade # Added back to the database update
-        )
-
-        await self.risk.on_trade_close(total_pnl, self.tg)
-
-        del self.open_positions[pid]
-        self.last_exit[symbol] = closed_at
-        await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
+            await self.risk.on_trade_close(total_pnl, self.tg)
+            self.open_positions.pop(pid, None)
+            self.last_exit[symbol] = closed_at
+            await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
 
     async def _force_open_position(self, symbol: str):
         """
@@ -1149,29 +1147,52 @@ class LiveTrader:
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
             symbol = pos["symbol"]
             try:
-                # This part is correct
                 await self.exchange.cancel_all_orders(symbol)
                 await self.exchange.create_market_order(symbol, "buy", float(pos["size"]), params={'reduceOnly': True})
             except Exception as e:
                 LOG.warning("Force-close order issue on %s: %s", symbol, e)
 
-            # This part is correct
-            last_price = float((await self.exchange.fetch_ticker(symbol))["last"])
+            # --- FIX: Calculate PnL and other data accurately ---
+            closed_at = datetime.now(timezone.utc)
+            
+            # Use the robust fetch_my_trades to get the real exit price
+            exit_price = None
+            try:
+                my_trades = await self.exchange.fetch_my_trades(symbol, limit=5)
+                closing_trade = next((t for t in reversed(my_trades) if t.get('side') == 'buy'), None)
+                if closing_trade:
+                    exit_price = float(closing_trade['price'])
+            except Exception as e:
+                LOG.error(f"Could not fetch fill price for force-close of {symbol}: {e}")
+
+            # Fallback if fetching trades fails
+            if not exit_price:
+                exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
+
             entry_price = float(pos["entry_price"])
             size = float(pos["size"])
-            pnl = (entry_price - last_price) * size
+            pnl = (entry_price - exit_price) * size
             
-            # This part is correct
-            await self.db.update_position(pid, status="CLOSED", closed_at=datetime.now(timezone.utc), pnl=pnl)
-            await self.db.add_fill(pid, tag, last_price, size, datetime.now(timezone.utc))
+            # Calculate holding time
+            holding_minutes = 0.0
+            if pos.get("opened_at"):
+                holding_minutes = (closed_at - pos["opened_at"]).total_seconds() / 60
+
+            # Update the database with ALL the correct information
+            await self.db.update_position(
+                pid, 
+                status="CLOSED", 
+                closed_at=closed_at, 
+                pnl=pnl,
+                exit_reason=tag, # Use the tag (e.g., "TIME_EXIT") as the reason
+                holding_minutes=holding_minutes
+            )
+            # --- END OF FIX ---
+            
+            await self.db.add_fill(pid, tag, exit_price, size, closed_at)
             await self.risk.on_trade_close(pnl, self.tg)
-            self.last_exit[symbol] = datetime.now(timezone.utc)
-            
-            # --- FIX: Use .pop() for safe deletion ---
-            # This will remove the pid from the dictionary if it exists,
-            # and do nothing if it doesn't (preventing the KeyError on startup).
+            self.last_exit[symbol] = closed_at
             self.open_positions.pop(pid, None)
-            
             await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
     async def _main_signal_loop(self):

@@ -11,41 +11,14 @@ import numpy as np
 import ccxt.async_support as ccxt
 from tqdm import tqdm
 
+# --- Bot-Consistent Imports ---
+# Use the exact same config and indicator logic as the live bot
+import config as cfg
+from live import indicators as ta
+
 # --- Basic Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 LOG = logging.getLogger(__name__)
-
-# --- Replicated Indicator Logic from the Bot ---
-# This makes the script self-contained and guarantees consistent calculations.
-def ema(series, period): return series.ewm(span=period, adjust=False).mean()
-def atr(df, period=14):
-    tr = pd.DataFrame({'h-l': df['h'] - df['l'], 'h-pc': abs(df['h'] - df['c'].shift()), 'l-pc': abs(df['l'] - df['c'].shift())}).max(axis=1)
-    return ema(tr, period)
-def rsi(series, period=14):
-    delta = series.diff()
-    gain, loss = delta.copy(), delta.copy()
-    gain[gain < 0] = 0
-    loss[loss > 0] = 0
-    avg_gain = gain.rolling(window=period, min_periods=1).mean()
-    avg_loss = abs(loss.rolling(window=period, min_periods=1).mean())
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-def adx(df, period=14):
-    plus_dm = df['h'].diff()
-    minus_dm = df['l'].diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm > 0] = 0
-    tr = pd.DataFrame({'h-l': df['h'] - df['l'], 'h-pc': abs(df['h'] - df['c'].shift()), 'l-pc': abs(df['l'] - df['c'].shift())}).max(axis=1)
-    atr_val = ema(tr, period)
-    plus_di = 100 * (ema(plus_dm, period) / atr_val)
-    minus_di = 100 * (ema(abs(minus_dm), period) / atr_val)
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
-    return ema(dx, period)
-
-async def calculate_historical_regime(exchange, opened_at: datetime) -> str:
-    # This is a complex calculation, for now we will keep it simple
-    # In a future version, we can replicate the full logic from the live bot
-    return "BACKFILLED"
 
 async def main():
     load_dotenv()
@@ -58,23 +31,27 @@ async def main():
     exchange = None
     try:
         conn = await asyncpg.connect(dsn=db_dsn)
-        exchange = ccxt.bybit({'enableRateLimit': True})
+        # Use the same settings as the live bot
+        exchange = ccxt.bybit({
+            'apiKey': os.getenv("BYBIT_API_KEY"),
+            'secret': os.getenv("BYBIT_API_SECRET"),
+            'enableRateLimit': True
+        })
         await exchange.load_markets()
         
-        # The comprehensive query to find all trades that need fixing
         query = """
             SELECT * FROM positions 
             WHERE status = 'CLOSED' AND (
-                adx_at_entry IS NULL OR
-                (pnl < 0 AND (mae_over_atr IS NULL OR mae_over_atr < 2.0)) OR
+                pnl_pct IS NULL OR
+                mae_over_atr IS NULL OR
                 exit_reason IS NULL OR
-                exit_reason IN ('UNKNOWN', 'FALLBACK', 'UNKNOWN_CLOSE')
+                exit_reason IN ('UNKNOWN', 'FALLBACK', 'FALLBACK_TICKER', 'FALLBACK_TRADE')
             ) ORDER BY id
         """
         trades_to_fix = await conn.fetch(query)
 
         if not trades_to_fix:
-            LOG.info("No trades found with missing or incorrect data. Database is up-to-date.")
+            LOG.info("No trades found needing correction. Database is up-to-date.")
             return
 
         LOG.info(f"Found {len(trades_to_fix)} trades to correct. Starting process...")
@@ -83,123 +60,113 @@ async def main():
             try:
                 trade_id = trade['id']
                 symbol = trade['symbol']
-                opened_at = trade['opened_at']
-                closed_at = trade['closed_at']
+                opened_at = trade['opened_at'].replace(tzinfo=timezone.utc)
+                closed_at = trade['closed_at'].replace(tzinfo=timezone.utc)
                 entry_price = float(trade['entry_price'])
                 size = float(trade['size'])
-                pnl = float(trade['pnl'])
-                atr_at_entry_db = float(trade['atr'])
+                atr_at_entry_db = float(trade['atr']) if trade['atr'] is not None else 0.01
 
-                # --- 1. Fix Exit Reason & Contextual Metrics ---
-                inferred_exit_reason = 'TP' if pnl > 0 else 'SL'
-                hour_of_day = opened_at.hour
-                day_of_week = opened_at.weekday()
-                session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
+                # --- 1. Fetch Ground-Truth Exit Price & PnL ---
+                my_trades = await exchange.fetch_my_trades(symbol, since=int(opened_at.timestamp() * 1000), limit=100)
+                # Find all trades that occurred during the position's lifetime
+                position_trades = [t for t in my_trades if opened_at <= t['datetime'].replace(tzinfo=timezone.utc) <= closed_at + timedelta(minutes=1)]
+                
+                # The closing fill is the 'buy' trade (to close a short)
+                closing_fill = next((t for t in reversed(position_trades) if t['side'] == 'buy'), None)
 
-                # --- 2. Fetch All Necessary Historical Data ---
-                since_ts_1d = int((opened_at - timedelta(days=40)).timestamp() * 1000)
-                since_ts_4h = int((opened_at - timedelta(days=100)).timestamp() * 1000)
-                since_ts_1h = int((opened_at - timedelta(days=25)).timestamp() * 1000)
-                since_ts_5m = int((opened_at - timedelta(days=5)).timestamp() * 1000)
+                if not closing_fill:
+                    LOG.warning(f"Could not find closing fill for trade {trade_id}. Using DB PnL to infer exit price.")
+                    exit_price = entry_price - (float(trade['pnl']) / size) if size > 0 else 0
+                else:
+                    exit_price = float(closing_fill['price'])
 
-                ohlcv_1d, ohlcv_4h, ohlcv_1h, ohlcv_5m = await asyncio.gather(
-                    exchange.fetch_ohlcv(symbol, '1d', since=since_ts_1d, limit=40),
-                    exchange.fetch_ohlcv(symbol, '4h', since=since_ts_4h, limit=600),
-                    exchange.fetch_ohlcv(symbol, '1h', since=since_ts_1h, limit=600),
-                    exchange.fetch_ohlcv(symbol, '5m', since=since_ts_5m, limit=1440)
+                # Recalculate PnL based on the ground-truth exit price
+                pnl = (entry_price - exit_price) * size
+                pnl_pct = ((entry_price / exit_price) - 1) * 100 if exit_price > 0 else 0
+
+                # --- 2. Smarter Exit Reason Inference ---
+                holding_minutes = (closed_at - opened_at).total_seconds() / 60
+                inferred_exit_reason = trade['exit_reason']
+                
+                # If holding time is very close to the limit, it was a time exit
+                time_exit_hours = cfg.TIME_EXIT_HOURS if cfg.TIME_EXIT_HOURS_ENABLED else cfg.TIME_EXIT_DAYS * 24
+                if abs(holding_minutes - (time_exit_hours * 60)) < 5:
+                     inferred_exit_reason = "TIME_EXIT"
+                elif pnl > 0:
+                     inferred_exit_reason = "TP"
+                else:
+                     inferred_exit_reason = "SL"
+
+                # --- 3. Fetch All Necessary Historical Data ---
+                # Fetch enough data to ensure indicators are fully warmed up
+                since_ts_1d = int((opened_at - timedelta(days=cfg.STRUCTURAL_TREND_DAYS + 5)).timestamp() * 1000)
+                since_ts_4h = int((opened_at - timedelta(days=40)).timestamp() * 1000)
+                since_ts_1h = int((opened_at - timedelta(days=10)).timestamp() * 1000)
+
+                ohlcv_1d, ohlcv_4h, ohlcv_1h = await asyncio.gather(
+                    exchange.fetch_ohlcv(symbol, '1d', since=since_ts_1d, limit=100),
+                    exchange.fetch_ohlcv(symbol, cfg.EMA_TIMEFRAME, since=since_ts_4h, limit=500),
+                    exchange.fetch_ohlcv(symbol, cfg.RSI_TIMEFRAME, since=since_ts_1h, limit=500)
                 )
 
-                df1d = pd.DataFrame(ohlcv_1d, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
-                df4h = pd.DataFrame(ohlcv_4h, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
-                df1h = pd.DataFrame(ohlcv_1h, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
-                df5m = pd.DataFrame(ohlcv_5m, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[:opened_at]
+                df1d = pd.DataFrame(ohlcv_1d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[:opened_at]
+                df4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[:opened_at]
+                df1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[:opened_at]
 
-                # --- 3. Calculate All Pre-Trade Metrics ---
-                rsi_at_entry = rsi(df1h['c'], 14).iloc[-1]
-                adx_at_entry = adx(df1h, 14).iloc[-1]
-                ema_fast_at_entry = ema(df4h['c'], 12).iloc[-1]
-                ema_slow_at_entry = ema(df4h['c'], 26).iloc[-1]
-                ret_30d_at_entry = (df1d['c'].iloc[-1] / df1d['c'].iloc[-30]) - 1 if len(df1d) >= 30 else 0.0
+                # --- 4. Calculate All Pre-Trade Metrics Using Bot's Logic ---
+                rsi_at_entry = ta.rsi(df1h['close'], period=cfg.RSI_PERIOD).iloc[-1]
+                adx_at_entry = ta.adx(df1h, period=cfg.ADX_PERIOD).iloc[-1]
+                ema_fast_at_entry = ta.ema(df4h['close'], span=cfg.EMA_FAST_PERIOD).iloc[-1]
+                ema_slow_at_entry = ta.ema(df4h['close'], span=cfg.EMA_SLOW_PERIOD).iloc[-1]
+                ret_30d_at_entry = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS]) - 1 if len(df1d) >= cfg.STRUCTURAL_TREND_DAYS else 0.0
                 
-                vwap_num = (df5m['c'] * df5m['v']).rolling(48).sum()
-                vwap_den = df5m['v'].rolling(48).sum()
-                vwap = (vwap_num / vwap_den).iloc[-1]
-                vwap_dev_pct_at_entry = abs(entry_price - vwap) / vwap if vwap > 0 else 0.0
+                # --- 5. Accurate Post-Trade Calculations (MAE/MFE) ---
+                mae_usd, mfe_usd, btc_beta_during_trade = 0.0, 0.0, 0.0
                 
-                market_regime = await calculate_historical_regime(exchange, opened_at)
-
-                # --- 4. Accurate Post-Trade Calculations ---
-                exit_price = None
-                closing_order_cid = trade.get("sl_cid") if inferred_exit_reason == "SL" else trade.get("tp_final_cid") or trade.get("tp1_cid")
-
-                if closing_order_cid:
-                    try:
-                        order = await exchange.fetch_order(None, symbol, params={"clientOrderId": closing_order_cid})
-                        if order and (order.get('average') or order.get('price')):
-                            exit_price = float(order.get('average') or order.get('price'))
-                    except Exception:
-                        pass # Fallback will be used
-
-                if not exit_price:
-                    exit_price = entry_price - (pnl / size) if size > 0 else 0
-
-                mae_over_atr, mfe_over_atr, btc_beta_during_trade = 0.0, 0.0, 0.0
-                ohlcv_1m_asset, ohlcv_1m_btc = await asyncio.gather(
-                    exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000)),
-                    exchange.fetch_ohlcv('BTCUSDT', '1m', since=int(opened_at.timestamp() * 1000))
-                )
+                ohlcv_1m_asset = await exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000), limit=1000)
                 
                 if ohlcv_1m_asset:
-                    df1m_asset = pd.DataFrame(ohlcv_1m_asset, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[opened_at:closed_at]
+                    df1m_asset = pd.DataFrame(ohlcv_1m_asset, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).assign(timestamp=lambda x: pd.to_datetime(x['timestamp'], unit='ms', utc=True)).set_index('timestamp').loc[opened_at:closed_at]
                     if not df1m_asset.empty:
-                        high_from_candles = df1m_asset['h'].max()
-                        low_from_candles = df1m_asset['l'].min()
-                        
-                        true_high_during_trade = high_from_candles
                         if inferred_exit_reason == "SL":
-                            true_high_during_trade = max(high_from_candles, exit_price)
+                            mae_usd = (exit_price - entry_price) * size
+                        else:
+                            mae_usd = (df1m_asset['high'].max() - entry_price) * size
 
-                        mae = (true_high_during_trade - entry_price)
-                        mfe = (entry_price - low_from_candles)
-                        mae_over_atr = mae / atr_at_entry_db if atr_at_entry_db > 0 else 0
-                        mfe_over_atr = mfe / atr_at_entry_db if atr_at_entry_db > 0 else 0
+                        if inferred_exit_reason == "TP":
+                            mfe_usd = (entry_price - exit_price) * size
+                        else:
+                            mfe_usd = (entry_price - df1m_asset['low'].min()) * size
+                
+                mae_usd = max(0, mae_usd)
+                mfe_usd = max(0, mfe_usd)
+                mae_over_atr = (mae_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
+                mfe_over_atr = (mfe_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
 
-                if ohlcv_1m_asset and ohlcv_1m_btc:
-                    df1m_btc = pd.DataFrame(ohlcv_1m_btc, columns=['ts', 'o', 'h', 'l', 'c', 'v']).assign(ts=lambda x: pd.to_datetime(x['ts'], unit='ms', utc=True)).set_index('ts').loc[opened_at:closed_at]
-                    if not df1m_asset.empty and not df1m_btc.empty:
-                        asset_returns = df1m_asset['c'].pct_change().rename('asset')
-                        btc_returns = df1m_btc['c'].pct_change().rename('btc')
-                        combined_df = pd.concat([asset_returns, btc_returns], axis=1).dropna()
-                        if len(combined_df) > 5:
-                            covariance = combined_df['asset'].cov(combined_df['btc'])
-                            variance = combined_df['btc'].var()
-                            btc_beta_during_trade = covariance / variance if variance > 0 else 0.0
-
-                # --- 5. Update the Database Record ---
+                # --- 6. Update the Database Record ---
                 update_query = """
                     UPDATE positions SET
-                        exit_reason = $1, adx_at_entry = $2, vwap_dev_pct_at_entry = $3,
-                        ema_fast_at_entry = $4, ema_slow_at_entry = $5, mae_over_atr = $6,
-                        mfe_over_atr = $7, session_tag_at_entry = $8, day_of_week_at_entry = $9,
-                        hour_of_day_at_entry = $10, btc_beta_during_trade = $11, ret_30d_at_entry = $12,
-                        rsi_at_entry = $13, market_regime_at_entry = $14
-                    WHERE id = $15
+                        pnl = $1, pnl_pct = $2, exit_reason = $3, holding_minutes = $4,
+                        rsi_at_entry = $5, adx_at_entry = $6, ema_fast_at_entry = $7,
+                        ema_slow_at_entry = $8, ret_30d_at_entry = $9, mae_usd = $10,
+                        mfe_usd = $11, mae_over_atr = $12, mfe_over_atr = $13
+                    WHERE id = $14
                 """
                 await conn.execute(
-                    update_query, inferred_exit_reason, adx_at_entry, vwap_dev_pct_at_entry,
-                    ema_fast_at_entry, ema_slow_at_entry, mae_over_atr, mfe_over_atr,
-                    session_tag, day_of_week, hour_of_day, btc_beta_during_trade, ret_30d_at_entry,
-                    rsi_at_entry, market_regime, trade_id
+                    update_query, pnl, pnl_pct, inferred_exit_reason, holding_minutes,
+                    rsi_at_entry, adx_at_entry, ema_fast_at_entry, ema_slow_at_entry,
+                    ret_30d_at_entry, mae_usd, mfe_usd, mae_over_atr, mfe_over_atr,
+                    trade_id
                 )
 
             except Exception as e:
-                LOG.error(f"Failed to backfill trade ID {trade['id']} ({trade['symbol']}): {e}")
+                LOG.error(f"Failed to backfill trade ID {trade['id']} ({trade['symbol']}): {e}", exc_info=True)
                 continue
 
         LOG.info("Comprehensive backfilling process complete.")
 
     except Exception as e:
-        LOG.error(f"A critical error occurred during the backfill process: {e}")
+        LOG.error(f"A critical error occurred during the backfill process: {e}", exc_info=True)
     finally:
         if conn: await conn.close()
         if exchange: await exchange.close()
