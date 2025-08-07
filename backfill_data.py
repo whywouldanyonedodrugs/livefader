@@ -40,12 +40,7 @@ async def main():
         
         query = """
             SELECT * FROM positions 
-            WHERE status = 'CLOSED' AND (
-                pnl_pct IS NULL OR
-                mae_over_atr IS NULL OR
-                exit_reason IS NULL OR
-                exit_reason IN ('UNKNOWN', 'FALLBACK', 'FALLBACK_TICKER', 'FALLBACK_TRADE')
-            ) ORDER BY id
+            WHERE status = 'CLOSED' ORDER BY id
         """
         trades_to_fix = await conn.fetch(query)
 
