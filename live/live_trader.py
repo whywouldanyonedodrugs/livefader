@@ -176,6 +176,7 @@ class Signal:
     price_slowdown_pct: float
     vwap_dev_pct: float
     vwap_consolidated: bool
+    vwap_z_score: float
     ret_30d: float
     ema_fast: float
     ema_slow: float
@@ -507,6 +508,8 @@ class LiveTrader:
                 df5['vwap_dev'] = abs(df5['close'] - df5['vwap']) / df5['vwap']
                 df5['vwap_ok'] = df5['vwap_dev'] <= cfg.GAP_MAX_DEV_PCT
                 df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
+                df5['price_std'] = df5['close'].rolling(vwap_bars).std()
+                df5['vwap_z_score'] = df5['vwap_dev'] / df5['price_std']
             else:
                 # If filter is disabled, create placeholder columns to prevent errors
                 df5['vwap_consolidated'] = True
@@ -582,6 +585,7 @@ class LiveTrader:
                     price_boom_pct=boom_ret_pct,
                     price_slowdown_pct=slowdown_ret_pct,
                     vwap_dev_pct=float(last.get('vwap_dev', 0.0)),
+                    vwap_z_score=float(last.get('vwap_z_score', 0.0)),
                     ret_30d=ret_30d,
                     ema_fast=float(last['ema_fast']),
                     ema_slow=float(last['ema_slow']),

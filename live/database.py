@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS positions (
     price_boom_pct_at_entry FLOAT,
     price_slowdown_pct_at_entry FLOAT,
     vwap_dev_pct_at_entry FLOAT,
+    vwap_z_at_entry FLOAT,
     ret_30d_at_entry FLOAT,
     ema_fast_at_entry FLOAT,
     ema_slow_at_entry FLOAT,

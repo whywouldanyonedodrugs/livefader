@@ -119,8 +119,14 @@ async def main():
                 vwap_num = (df5m['close'] * df5m['volume']).shift(1).rolling(vwap_bars).sum()
                 vwap_den = df5m['volume'].shift(1).rolling(vwap_bars).sum()
                 vwap = vwap_num / vwap_den
+                vwap_dev = df5m['close'] - vwap
+                price_std = df5m['close'].rolling(vwap_bars).std()
+                vwap_z_score = vwap_dev / price_std
+
+                # Get the values at the time of entry
                 vwap_at_entry = vwap.iloc[-1]
                 vwap_dev_pct_at_entry = abs(entry_price - vwap_at_entry) / vwap_at_entry if vwap_at_entry > 0 else 0.0
+                vwap_z_at_entry = vwap_z_score.iloc[-1]
                 # --- END OF NEW SECTION ---
 
                 # --- 5. Accurate Post-Trade Calculations (MAE/MFE) ---
@@ -146,14 +152,15 @@ async def main():
                         rsi_at_entry = $5, adx_at_entry = $6, ema_fast_at_entry = $7,
                         ema_slow_at_entry = $8, ret_30d_at_entry = $9, mae_usd = $10,
                         mfe_usd = $11, mae_over_atr = $12, mfe_over_atr = $13,
-                        vwap_dev_pct_at_entry = $14 -- Added the VWAP field to the update
-                    WHERE id = $15
+                        vwap_dev_pct_at_entry = $14,
+                        vwap_z_at_entry = $15
+                    WHERE id = $16
                 """
                 await conn.execute(
                     update_query, pnl, pnl_pct, inferred_exit_reason, holding_minutes,
                     rsi_at_entry, adx_at_entry, ema_fast_at_entry, ema_slow_at_entry,
                     ret_30d_at_entry, mae_usd, mfe_usd, mae_over_atr, mfe_over_atr,
-                    vwap_dev_pct_at_entry, # Pass the new value to the query
+                    vwap_dev_pct_at_entry, vwap_z_at_entry,
                     trade_id
                 )
 
