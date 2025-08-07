@@ -51,31 +51,32 @@ async def main():
         conn = await asyncpg.connect(dsn=db_dsn)
         
         LOG.info("Fetching clean trade history from the database...")
-        # Fetch all closed trades to use as training data
         query = "SELECT * FROM positions WHERE status = 'CLOSED'"
         data = await conn.fetch(query)
-        df = pd.DataFrame(data)
         
-        if df.empty:
+        if not data:
             LOG.error("No trade data found in the database. Cannot train model.")
             return
+
+        # --- THIS IS THE FIX ---
+        # Explicitly convert each asyncpg.Record to a standard Python dictionary
+        # This ensures Pandas correctly identifies all column names, including 'pnl'.
+        df = pd.DataFrame([dict(record) for record in data])
+        # --- END OF FIX ---
             
         df['is_win'] = df['pnl'] > 0
         LOG.info(f"Loaded {len(df)} trades for training.")
 
         # --- Model Training ---
-        # Prepare the data, dropping any rows with missing values in our features
         df_clean = df.dropna(subset=FEATURES + [TARGET])
         
         X = df_clean[FEATURES]
         y = df_clean[TARGET]
 
-        # Add a constant for the regression model
         X = sm.add_constant(X, prepend=True)
 
         LOG.info(f"Training Firth logistic regression model on {len(X)} data points...")
         
-        # Here is the key: method='firth' tells statsmodels to use this robust method
         logit_model = sm.Logit(y, X)
         result = logit_model.fit(method='firth', disp=False)
 
