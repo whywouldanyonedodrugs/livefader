@@ -38,6 +38,7 @@ FEATURES = [
 TARGET = 'is_win'
 MODEL_FILE_NAME = "win_probability_model.joblib"
 
+
 async def main():
     load_dotenv()
     db_dsn = os.getenv("DATABASE_URL")
@@ -57,12 +58,21 @@ async def main():
             LOG.error("No trade data found in the database. Cannot train model.")
             return
 
-        # Explicitly convert each asyncpg.Record to a standard Python dictionary
-        # This ensures Pandas correctly identifies all column names.
         df = pd.DataFrame([dict(record) for record in data])
             
         df['is_win'] = df['pnl'] > 0
         LOG.info(f"Loaded {len(df)} trades for training.")
+
+        # --- THIS IS THE FIX ---
+        # Force all feature columns to a numeric type, coercing errors.
+        # This handles any non-standard number types (like Decimal) from the database.
+        for col in FEATURES:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            else:
+                LOG.error(f"Critical error: Feature column '{col}' not found in the DataFrame.")
+                return
+        # --- END OF FIX ---
 
         # --- Model Training ---
         # Prepare the data, dropping any rows with missing values in our features
@@ -76,7 +86,6 @@ async def main():
 
         LOG.info(f"Training Firth logistic regression model on {len(X)} data points...")
         
-        # Use method='firth' to handle potential separation in the data, which is common
         logit_model = sm.Logit(y, X)
         result = logit_model.fit(method='firth', disp=False)
 
