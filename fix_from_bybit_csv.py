@@ -27,8 +27,8 @@ async def main(csv_path: str):
         # --- FIX: Specify the correct date format ---
         date_format = '%d/%m/%Y %H:%M'
         # We apply the format to the correct columns by their original names
-        bybit_df['Filled/Settlement Time(UTC+0)'] = pd.to_datetime(bybit_df['Filled/Settlement Time(UTC+0)'], format=date_format, utc=True)
-        bybit_df['Create Time'] = pd.to_datetime(bybit_df['Create Time'], format=date_format, utc=True)
+        bybit_df['Filled/Settlement Time(UTC+0)'] = pd.to_datetime(bybit_df['Filled/Settlement Time(UTC+0)'], dayfirst=True, utc=True)
+        bybit_df['Create Time'] = pd.to_datetime(bybit_df['Create Time'], dayfirst=True, utc=True)
         
         LOG.info(f"Loaded and processed {len(bybit_df)} trade records from {csv_path}")
 
