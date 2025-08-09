@@ -43,7 +43,26 @@ async def generate_report():
     conn = None
     try:
         conn = await asyncpg.connect(dsn=db_dsn)
-        
+
+        base_query = """
+            SELECT 
+                id, symbol, side, size, entry_price, stop_price, trailing_active, atr,
+                status, opened_at, exit_deadline, closed_at, pnl, entry_cid, sl_cid,
+                tp1_cid, tp_final_cid, sl_trail_cid, market_regime_at_entry, slippage_usd,
+                risk_usd, rsi_at_entry, adx_at_entry, atr_pct_at_entry, price_boom_pct_at_entry,
+                price_slowdown_pct_at_entry, vwap_dev_pct_at_entry, ret_30d_at_entry,
+                ema_fast_at_entry, ema_slow_at_entry, listing_age_days_at_entry,
+                session_tag_at_entry, day_of_week_at_entry, hour_of_day_at_entry,
+                config_snapshot, exit_reason, holding_minutes, pnl_pct, mae_usd, mfe_usd,
+                mae_over_atr, mfe_over_atr, realized_vol_during_trade, btc_beta_during_trade,
+                vwap_z_at_entry, is_ema_crossed_down_at_entry, win_probability_at_entry,
+                ema_spread_pct_at_entry,
+                -- Counterfactual columns
+                cf_would_hit_tp_2x_atr, cf_would_hit_sl_2_5x_atr,
+                cf_mae_over_atr_4h, cf_mfe_over_atr_4h
+            FROM positions
+        """
+
         # --- Logic to Determine Report Type ---
         if args.full:
             report_type = "FULL HISTORICAL"
