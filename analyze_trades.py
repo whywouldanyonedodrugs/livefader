@@ -78,28 +78,58 @@ def analyze_regime_performance(df: pd.DataFrame):
     summary['profit_factor'] = (gross_profit / gross_loss).replace([np.inf, -np.inf], 0).fillna(0)
     print(summary.to_string(float_format="%.2f"))
 
-def analyze_time_exit_counterfactuals(df: pd.DataFrame):
-    header("Counterfactual Analysis for Time-Exited Trades")
+def analyze_counterfactuals(df: pd.DataFrame):
+    header("Counterfactual 'What If' Analysis (4-Hour Look-Forward)")
     
-    # Filter for only the trades that were closed by the time exit
-    time_exits_df = df[df['exit_reason'] == 'TIME_EXIT']
-    
-    if time_exits_df.empty:
-        print("No time-exited trades found to analyze.")
+    required_cols = [
+        'exit_reason', 'is_win', 'cf_would_hit_tp_2x_atr', 
+        'cf_would_hit_sl_2_5x_atr', 'cf_mae_over_atr_4h', 'cf_mfe_over_atr_4h'
+    ]
+    if not all(col in df.columns for col in required_cols):
+        print("Counterfactual columns not found. Skipping this analysis.")
         return
+
+    # --- Analysis 1: Time-Exited Trades (as before) ---
+    print("\n--- Analysis of TIME-EXITED Trades ---")
+    time_exits_df = df[df['exit_reason'] == 'TIME_EXIT'].copy()
+    if not time_exits_df.empty:
+        total_time_exits = len(time_exits_df)
+        would_be_winners = time_exits_df['cf_would_hit_tp_2x_atr'].sum()
+        would_be_losers = time_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
+        print(f"Total Time-Exited Trades: {total_time_exits}")
+        print(f"  - Would have become WINNERS (hit 2x ATR TP): {would_be_winners} ({would_be_winners/total_time_exits:.1%})")
+        print(f"  - Would have become LOSERS (hit 2.5x ATR SL): {would_be_losers} ({would_be_losers/total_time_exits:.1%})")
+    else:
+        print("No time-exited trades found.")
+
+    # --- Analysis 2: Stop-Loss Trades (Your New Request) ---
+    print("\n--- Analysis of STOP-LOSS Trades ---")
+    sl_exits_df = df[df['exit_reason'] == 'SL'].copy()
+    if not sl_exits_df.empty:
+        total_sl_exits = len(sl_exits_df)
+        # How many of our losers would have reversed and hit a 2x TP?
+        would_have_won = sl_exits_df['cf_would_hit_tp_2x_atr'].sum()
+        print(f"Total Stop-Loss Trades: {total_sl_exits}")
+        print(f"  - Would have REVERSED TO WIN (hit 2x ATR TP): {would_have_won} ({would_have_won/total_sl_exits:.1%})")
+    else:
+        print("No stop-loss trades found.")
         
-    total_time_exits = len(time_exits_df)
-    
-    # Of those, how many would have gone on to hit the 2x TP?
-    would_be_winners = time_exits_df['cf_would_hit_tp_2x_atr'].sum()
-    
-    # How many would have hit the 2.5x SL?
-    would_be_losers = time_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
-    
-    print(f"Total Time-Exited Trades: {total_time_exits}")
-    print("-" * 40)
-    print(f"Would have become WINNERS (hit 2x ATR TP): {would_be_winners} ({would_be_winners/total_time_exits:.1%})")
-    print(f"Would have become LOSERS (hit 2.5x ATR SL): {would_be_losers} ({would_be_losers/total_time_exits:.1%})")
+    # --- Analysis 3: Take-Profit Trades ---
+    print("\n--- Analysis of TAKE-PROFIT Trades ---")
+    tp_exits_df = df[df['exit_reason'] == 'TP'].copy()
+    if not tp_exits_df.empty:
+        total_tp_exits = len(tp_exits_df)
+        # How many of our winners would have reversed and hit a 2.5x SL?
+        would_have_lost = tp_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
+        print(f"Total Take-Profit Trades: {total_tp_exits}")
+        print(f"  - Would have REVERSED TO LOSE (hit 2.5x ATR SL): {would_have_lost} ({would_have_lost/total_tp_exits:.1%})")
+        
+        # What was the average "ultimate" MFE for our winners?
+        avg_ultimate_mfe = tp_exits_df['cf_mfe_over_atr_4h'].mean()
+        print(f"  - Average ultimate MFE over next 4h: {avg_ultimate_mfe:.2f}x ATR")
+    else:
+        print("No take-profit trades found.")
+
 
 # --- Core Analysis Logic ---
 def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
@@ -169,7 +199,7 @@ def run_analysis(df: pd.DataFrame):
 
     logit_features = [col for col in top10.index.tolist() if col not in ['pnl_pct', 'mae_usd', 'mfe_usd']]
     logistic_regression(df, logit_features)
-    analyze_time_exit_counterfactuals(df)
+    analyze_counterfactuals(df)
 
 def analyze_performance_ratios(df_equity: pd.DataFrame):
     header("Risk-Adjusted Performance Ratios (Sharpe & Sortino)")
