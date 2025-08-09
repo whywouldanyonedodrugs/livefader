@@ -143,7 +143,6 @@ def run_analysis(df: pd.DataFrame):
     describe_continuous(df, "pct_to_vwap")
     describe_continuous(df, "vwap_z_at_entry")
 
-    header("VWAP Z-SCORE BANDS – WIN RATE BY CATEGORY")
     df["z_band"] = pd.cut(
         df["vwap_z_at_entry"],
         bins=[-np.inf, 0, 0.5, 1.0, 1.5, 2.0, np.inf],
@@ -170,6 +169,7 @@ def run_analysis(df: pd.DataFrame):
 
     logit_features = [col for col in top10.index.tolist() if col not in ['pnl_pct', 'mae_usd', 'mfe_usd']]
     logistic_regression(df, logit_features)
+    analyze_time_exit_counterfactuals(df)
 
 def analyze_performance_ratios(df_equity: pd.DataFrame):
     header("Risk-Adjusted Performance Ratios (Sharpe & Sortino)")
