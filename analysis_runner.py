@@ -393,8 +393,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-with open('/mnt/data/analysis_runner.py', 'w', encoding='utf-8') as f:
-    f.write(code)
-
-print("analysis_runner.py written to /mnt/data/analysis_runner.py")
