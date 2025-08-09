@@ -83,34 +83,40 @@ def analyze_counterfactuals(df: pd.DataFrame):
     
     required_cols = [
         'exit_reason', 'is_win', 'cf_would_hit_tp_2x_atr', 
-        'cf_would_hit_sl_2_5x_atr', 'cf_mae_over_atr_4h', 'cf_mfe_over_atr_4h'
+        'cf_would_hit_sl_2_5x_atr', 'cf_mae_over_atr_4h', 'cf_mfe_over_atr_4h',
+        'cf_would_hit_tp_1x_atr' # Check for the new column
     ]
     if not all(col in df.columns for col in required_cols):
         print("Counterfactual columns not found. Skipping this analysis.")
         return
 
-    # --- Analysis 1: Time-Exited Trades (as before) ---
+    # --- Analysis 1: Time-Exited Trades ---
     print("\n--- Analysis of TIME-EXITED Trades ---")
     time_exits_df = df[df['exit_reason'] == 'TIME_EXIT'].copy()
     if not time_exits_df.empty:
         total_time_exits = len(time_exits_df)
-        would_be_winners = time_exits_df['cf_would_hit_tp_2x_atr'].sum()
-        would_be_losers = time_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
+        would_be_winners_2x = time_exits_df['cf_would_hit_tp_2x_atr'].sum()
+        would_be_losers_2_5x = time_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
         print(f"Total Time-Exited Trades: {total_time_exits}")
-        print(f"  - Would have become WINNERS (hit 2x ATR TP): {would_be_winners} ({would_be_winners/total_time_exits:.1%})")
-        print(f"  - Would have become LOSERS (hit 2.5x ATR SL): {would_be_losers} ({would_be_losers/total_time_exits:.1%})")
+        print(f"  - Would have become WINNERS (hit 2x ATR TP): {would_be_winners_2x} ({would_be_winners_2x/total_time_exits:.1%})")
+        print(f"  - Would have become LOSERS (hit 2.5x ATR SL): {would_be_losers_2_5x} ({would_be_losers_2_5x/total_time_exits:.1%})")
     else:
         print("No time-exited trades found.")
 
-    # --- Analysis 2: Stop-Loss Trades (Your New Request) ---
+    # --- Analysis 2: Stop-Loss Trades ---
     print("\n--- Analysis of STOP-LOSS Trades ---")
     sl_exits_df = df[df['exit_reason'] == 'SL'].copy()
     if not sl_exits_df.empty:
         total_sl_exits = len(sl_exits_df)
-        # How many of our losers would have reversed and hit a 2x TP?
-        would_have_won = sl_exits_df['cf_would_hit_tp_2x_atr'].sum()
+        
+        # --- THIS IS THE NEW ANALYSIS ---
+        would_have_won_1x = sl_exits_df['cf_would_hit_tp_1x_atr'].sum()
         print(f"Total Stop-Loss Trades: {total_sl_exits}")
-        print(f"  - Would have REVERSED TO WIN (hit 2x ATR TP): {would_have_won} ({would_have_won/total_sl_exits:.1%})")
+        print(f"  - Would have REVERSED TO WIN (hit 1x ATR TP): {would_have_won_1x} ({would_have_won_1x/total_sl_exits:.1%})")
+        # --- END OF NEW ANALYSIS ---
+        
+        would_have_won_2x = sl_exits_df['cf_would_hit_tp_2x_atr'].sum()
+        print(f"  - Would have REVERSED TO WIN (hit 2x ATR TP): {would_have_won_2x} ({would_have_won_2x/total_sl_exits:.1%})")
     else:
         print("No stop-loss trades found.")
         
@@ -119,12 +125,10 @@ def analyze_counterfactuals(df: pd.DataFrame):
     tp_exits_df = df[df['exit_reason'] == 'TP'].copy()
     if not tp_exits_df.empty:
         total_tp_exits = len(tp_exits_df)
-        # How many of our winners would have reversed and hit a 2.5x SL?
         would_have_lost = tp_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
         print(f"Total Take-Profit Trades: {total_tp_exits}")
         print(f"  - Would have REVERSED TO LOSE (hit 2.5x ATR SL): {would_have_lost} ({would_have_lost/total_tp_exits:.1%})")
         
-        # What was the average "ultimate" MFE for our winners?
         avg_ultimate_mfe = tp_exits_df['cf_mfe_over_atr_4h'].mean()
         print(f"  - Average ultimate MFE over next 4h: {avg_ultimate_mfe:.2f}x ATR")
     else:

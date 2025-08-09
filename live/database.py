@@ -59,7 +59,12 @@ CREATE TABLE IF NOT EXISTS positions (
     vwap_z_at_entry FLOAT,
     is_ema_crossed_down_at_entry BOOLEAN,
     ema_spread_pct_at_entry FLOAT,
-    win_probability_at_entry FLOAT
+    win_probability_at_entry FLOAT,
+    cf_would_hit_tp_1x_atr BOOLEAN,
+    cf_would_hit_tp_2x_atr BOOLEAN,
+    cf_would_hit_sl_2_5x_atr BOOLEAN,
+    cf_mae_over_atr_4h FLOAT,
+    cf_mfe_over_atr_4h FLOAT
 );
 CREATE TABLE IF NOT EXISTS fills (
     id SERIAL PRIMARY KEY,
