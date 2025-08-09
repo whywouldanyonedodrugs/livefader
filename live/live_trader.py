@@ -750,6 +750,8 @@ class LiveTrader:
                 "atr_pct_at_entry": sig.atr_pct,
                 "price_boom_pct_at_entry": sig.price_boom_pct,
                 "price_slowdown_pct_at_entry": sig.price_slowdown_pct,
+                "is_ema_crossed_down_at_entry": sig.is_ema_crossed_down,
+                "vwap_consolidated_at_entry": sig.vwap_consolidated,
                 "vwap_dev_pct_at_entry": sig.vwap_dev_pct,
                 "ret_30d_at_entry": sig.ret_30d,
                 "ema_fast_at_entry": sig.ema_fast,

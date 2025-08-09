@@ -121,6 +121,12 @@ async def main():
                 vwap_dev_pct_at_entry = abs(entry_price - vwap_at_entry) / vwap_at_entry if vwap_at_entry > 0 else 0.0
                 vwap_z_at_entry = vwap_z_score.iloc[-1]
 
+                df5m['vwap_dev_pct'] = (df5m['close'] - vwap) / vwap
+                df5m['vwap_ok'] = df5m['vwap_dev_pct'].abs() <= cfg.GAP_MAX_DEV_PCT
+                df5m['vwap_consolidated'] = df5m['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
+                
+                vwap_consolidated_at_entry = df5m['vwap_consolidated'].iloc[-1]
+
                 # --- MAE/MFE Calculation ---
                 mae_usd, mfe_usd = 0.0, 0.0
                 ohlcv_1m_asset = await exchange.fetch_ohlcv(symbol, '1m', since=int(opened_at.timestamp() * 1000), limit=1000)
@@ -145,8 +151,9 @@ async def main():
                         mfe_usd = $11, mae_over_atr = $12, mfe_over_atr = $13,
                         vwap_dev_pct_at_entry = $14, vwap_z_at_entry = $15,
                         is_ema_crossed_down_at_entry = $16,
-                        ema_spread_pct_at_entry = $17
-                    WHERE id = $18
+                        ema_spread_pct_at_entry = $17,
+                        vwap_consolidated_at_entry = $18
+                    WHERE id = $19
                 """
                 await conn.execute(
                     update_query, pnl, pnl_pct, inferred_exit_reason, holding_minutes,
@@ -155,6 +162,7 @@ async def main():
                     vwap_dev_pct_at_entry, vwap_z_at_entry,
                     is_ema_crossed_down_at_entry,
                     ema_spread_pct_at_entry,
+                    bool(vwap_consolidated_at_entry),
                     trade_id
                 )
 

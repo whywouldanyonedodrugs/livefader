@@ -195,6 +195,9 @@ def run_analysis(df: pd.DataFrame):
     describe_categorical(df, "day_of_week_at_entry")
     describe_categorical(df, "hour_of_day_at_entry")
 
+    if 'vwap_consolidated_at_entry' in df.columns:
+        describe_categorical(df, "vwap_consolidated_at_entry")
+
     header("Top 10 absolute point-biserial correlations with win flag")
     cont_cols = [c for c in df.select_dtypes(include="number").columns if c not in ["is_win", "pnl"]]
     cors = {c: stats.pointbiserialr(df["is_win"], df[c])[0] for c in cont_cols if df[c].notna().sum() > 5 and np.std(df[c]) > 0}

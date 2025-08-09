@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS positions (
     cf_would_hit_tp_2x_atr BOOLEAN,
     cf_would_hit_sl_2_5x_atr BOOLEAN,
     cf_mae_over_atr_4h FLOAT,
-    cf_mfe_over_atr_4h FLOAT
+    cf_mfe_over_atr_4h FLOAT,
+    vwap_consolidated_at_entry BOOLEAN
 );
 CREATE TABLE IF NOT EXISTS fills (
     id SERIAL PRIMARY KEY,
