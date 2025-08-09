@@ -1,11 +1,14 @@
-# Create analysis_runner.py with requested functionality
 """
-analysis_runner.py
+analysis_runner.py  (updated)
 Reads a trades CSV and runs quant checks:
 - VWAP distance and Z-score threshold grids
 - EMA / Session / Hour / Consolidation gates
 - 30d return threshold grid
 - Payoff grid "what-if" for alternative TP/SL using MAE/MFE (in ATR units)
+  * Recognizes TP exits as meeting the 1× ATR test via `exit_reason`
+  * Applies a 5% tolerance on ATR multiples (MFE/MAE comparisons)
+  * Optionally uses counterfactual columns: cf_would_hit_tp_*x_atr, cf_would_hit_sl_*x_atr
+
 Outputs a plain-text report to stdout.
 
 Assumes the CSV has at least:
@@ -17,8 +20,9 @@ Assumes the CSV has at least:
   - hour_of_day_at_entry in 0..23
   - vwap_consolidated_at_entry (0/1)    [optional]
   - mae_over_atr, mfe_over_atr (float)  [for TP/SL what-if]
-
-If columns differ by case, runner lowercases names and matches by lower name.
+  - exit_reason / exit_type (optional, used to recognize TP hits at 1× ATR)
+  - optional counterfactuals:
+      cf_would_hit_tp_1x_atr, cf_would_hit_tp_1_2x_atr, ..., cf_would_hit_sl_2_5x_atr, etc.
 """
 
 from __future__ import annotations
@@ -87,7 +91,6 @@ def mde_wr(n_in: int, n_out: int, base_wr: float, alpha: float = 0.05, power: fl
     if n_in == 0 or n_out == 0:
         return np.nan
     # z-values
-    from math import sqrt
     z_alpha = 1.6448536269514722  # one-sided 5%
     z_beta  = 0.8416212335729143  # 80% power
     delta = (z_alpha + z_beta) * math.sqrt(base_wr*(1-base_wr)*(1/n_in + 1/n_out))
@@ -164,15 +167,59 @@ def binary_gate_test(df: pd.DataFrame, mask: pd.Series, label: str = "gate") -> 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Payoff what-if using MAE/MFE in ATR units
+#  - Recognizes TP exits for 1x tests via exit_reason (TP/TP1/TP_FINAL/etc.)
+#  - 5% tolerance on thresholds
+#  - Uses cf_* columns if present
 
-def payoff_eval(df: pd.DataFrame, tp_grid: Iterable[float], sl_grid: Iterable[float]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+TP_REASON_TOKENS = {
+    "tp", "tp1", "tp2", "tp_final", "take_profit", "takeprofit", "take_profit_1", "take_profit_final"
+}
+
+def _normalize_reason(val: str) -> str:
+    if not isinstance(val, str):
+        return ""
+    return val.strip().lower().replace(" ", "_")
+
+def _has_cf_col(df: pd.DataFrame, kind: str, multiple: float) -> str | None:
+    """
+    kind: 'tp' or 'sl'
+    multiple: e.g., 1.0, 1.2, 2.5
+    Tries to find a column like:
+      cf_would_hit_tp_1x_atr
+      cf_would_hit_tp_1_2x_atr
+      cf_would_hit_sl_2_5x_atr
+    Returns the column name if found, else None.
+    """
+    base = f"cf_would_hit_{kind}_"
+    # Try "1x" style
+    s1 = f"{base}{multiple:g}x_atr"
+    if s1 in df.columns:
+        return s1
+    # Try "1_2x" style
+    mult_str = str(multiple).replace(".", "_")
+    s2 = f"{base}{mult_str}x_atr"
+    if s2 in df.columns:
+        return s2
+    # Try with possible trailing zeros stripped
+    mult_str2 = f"{multiple:.2f}".rstrip("0").rstrip(".").replace(".", "_")
+    s3 = f"{base}{mult_str2}x_atr"
+    if s3 in df.columns:
+        return s3
+    return None
+
+def payoff_eval(df: pd.DataFrame, tp_grid: Iterable[float], sl_grid: Iterable[float], tol: float = 0.05) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Evaluate alternative (TP, SL) pairs using MAE/MFE over ATR.
     Returns three tables: optimistic, pessimistic, midpoint.
     - optimistic: if MFE>=TP count as win; elif MAE>=SL loss; else 0 (unresolved)
     - pessimistic: if MAE>=SL loss; elif MFE>=TP win; else 0
     - midpoint: average of the two R outcomes
-    P&L is computed in R units where a full SL = -1R and TP = TP/SL R.
+
+    Enhancements:
+    - If 'exit_reason' indicates TP, treat TP>=1.0x as hit for thresholds <= 1.0x*(1+tol)
+    - Apply 5% tolerance: effective_tp = tp*(1-tol), effective_sl = sl*(1-tol)
+    - If cf_would_hit_tp_*x_atr / cf_would_hit_sl_*x_atr columns exist, use them
+      to override comparisons at the matching thresholds.
     """
     required = {"mae_over_atr", "mfe_over_atr"}
     if not required.issubset(set(df.columns)):
@@ -180,54 +227,89 @@ def payoff_eval(df: pd.DataFrame, tp_grid: Iterable[float], sl_grid: Iterable[fl
     mae = df["mae_over_atr"].astype(float)
     mfe = df["mfe_over_atr"].astype(float)
 
+    # Exit reason normalization
+    exit_reason = None
+    for c in ("exit_reason", "reason", "exit_type"):
+        if c in df.columns:
+            exit_reason = df[c].astype(str).map(_normalize_reason)
+            break
+
+    def hits_tp_via_reason(threshold: float) -> pd.Series:
+        """True where threshold <= ~1.0x and reason indicates a TP exit."""
+        if exit_reason is None:
+            return pd.Series(False, index=df.index)
+        # accept any threshold up to 1.0*(1+tol)
+        if threshold <= 1.0*(1+tol):
+            return exit_reason.isin(TP_REASON_TOKENS)
+        return pd.Series(False, index=df.index)
+
     def eval_table(policy: str) -> pd.DataFrame:
         rows: List[Dict] = []
         for sl in sl_grid:
             for tp in tp_grid:
-                # outcomes in R units
+                eff_tp = tp * (1 - tol)
+                eff_sl = sl * (1 - tol)
                 reward = tp / sl if sl > 0 else np.nan
+
+                # Optional counterfactual overrides (exact threshold matches)
+                cf_tp_col = _has_cf_col(df, "tp", tp)
+                cf_sl_col = _has_cf_col(df, "sl", sl)
+                cf_tp = df[cf_tp_col].astype(bool) if cf_tp_col else None
+                cf_sl = df[cf_sl_col].astype(bool) if cf_sl_col else None
+
                 pnl_R = []
                 wins = 0
                 losses = 0
                 unresolved = 0
-                for a, f in zip(mae, mfe):
-                    if np.isnan(a) or np.isnan(f):
-                        unresolved += 1
-                        pnl_R.append(0.0)
-                        continue
+                # Precompute reason-based TP hits for ~1x thresholds
+                tp_hit_by_reason = hits_tp_via_reason(tp)
+
+                for i, (a, f) in enumerate(zip(mae, mfe)):
+                    # Decide hit/sl via (cf columns) or via MFE/MAE with tolerance
+                    hit_tp = False
+                    hit_sl = False
+                    if cf_tp is not None:
+                        hit_tp = bool(cf_tp.iloc[i])
+                    else:
+                        if not np.isnan(f) and f >= eff_tp:
+                            hit_tp = True
+                        # allow reason-based TP recognition near 1x
+                        elif tp_hit_by_reason.iloc[i]:
+                            hit_tp = True
+
+                    if cf_sl is not None:
+                        hit_sl = bool(cf_sl.iloc[i])
+                    else:
+                        if not np.isnan(a) and a >= eff_sl:
+                            hit_sl = True
+
+                    # Apply policy
                     if policy == "optimistic":
-                        if f >= tp:
+                        if hit_tp:
                             pnl_R.append(reward); wins += 1
-                        elif a >= sl:
+                        elif hit_sl:
                             pnl_R.append(-1.0); losses += 1
                         else:
                             pnl_R.append(0.0); unresolved += 1
                     elif policy == "pessimistic":
-                        if a >= sl:
+                        if hit_sl:
                             pnl_R.append(-1.0); losses += 1
-                        elif f >= tp:
+                        elif hit_tp:
                             pnl_R.append(reward); wins += 1
                         else:
                             pnl_R.append(0.0); unresolved += 1
                     else:
                         # midpoint: average of optimistic and pessimistic outcomes
-                        # optimistic outcome:
-                        if f >= tp:
-                            r_opt = reward
-                        elif a >= sl:
-                            r_opt = -1.0
+                        if hit_tp and not hit_sl:
+                            r_mid = reward
+                        elif hit_sl and not hit_tp:
+                            r_mid = -1.0
+                        elif hit_tp and hit_sl:
+                            # unknown order → average of extremes
+                            r_mid = 0.5 * (reward + -1.0)
                         else:
-                            r_opt = 0.0
-                        # pessimistic outcome:
-                        if a >= sl:
-                            r_pes = -1.0
-                        elif f >= tp:
-                            r_pes = reward
-                        else:
-                            r_pes = 0.0
-                        r_mid = 0.5*(r_opt + r_pes)
+                            r_mid = 0.0
                         pnl_R.append(r_mid)
-                        # count wins/losses conservatively using r_mid thresholds:
                         if r_mid > 0:
                             wins += 1
                         elif r_mid < 0:
@@ -270,6 +352,7 @@ def run(path: str) -> None:
         "vwap_consolidated_at_entry": ["vwap_consolidated_at_entry", "vwap_consolidated"],
         "mae_over_atr": ["mae_over_atr", "mae_atr", "mae_x_atr"],
         "mfe_over_atr": ["mfe_over_atr", "mfe_atr", "mfe_x_atr"],
+        "exit_reason": ["exit_reason", "reason", "exit_type"],
     }
     for target, aliases in col_map.items():
         for a in aliases:
@@ -369,7 +452,7 @@ def run(path: str) -> None:
         print("========================================================================")
         tp_grid = [1.0, 1.2, 1.5, 1.8, 2.0]
         sl_grid = [1.2, 1.5, 1.8, 2.0, 2.5]
-        opt, pes, mid = payoff_eval(df, tp_grid, sl_grid)
+        opt, pes, mid = payoff_eval(df, tp_grid, sl_grid, tol=0.05)
 
         print("\n--- Optimistic (TP first when both touched) ---")
         print(opt.head(12).to_string(index=False))
