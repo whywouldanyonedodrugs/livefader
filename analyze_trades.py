@@ -236,13 +236,30 @@ def main():
         asyncio.run(send_telegram_report(args.send_report))
         return
 
-    path = Path(args.file)
-    if path.exists():
-        df = pd.read_csv(path)
+    trade_file_path = None
+    if args.file:
+        # If a specific file is provided, use it.
+        trade_file_path = Path(args.file)
+    else:
+        # Otherwise, find the newest report file automatically.
+        reports_dir = Path(__file__).parent / "live" / "reports"
+        try:
+            # Find all full history files and get the most recently modified one
+            latest_report = max(reports_dir.glob("full_trade_history_*.csv"), key=os.path.getctime)
+            trade_file_path = latest_report
+            print(f"--- Found latest report file: {trade_file_path.name} ---")
+        except (ValueError, FileNotFoundError):
+            print(f"ERROR: No 'full_trade_history_*.csv' files found in {reports_dir}.")
+            print("Please run 'python live/reporter.py --full' first.")
+            return
+    # --- END OF NEW LOGIC ---
+
+    if trade_file_path.exists():
+        df = pd.read_csv(trade_file_path)
         if not df.empty:
             run_analysis(df)
     else:
-        print(f"Trade file not found: {path}")
+        print(f"Trade file not found: {trade_file_path}")
 
     equity_path = Path(args.equity_file)
     if equity_path.exists():
