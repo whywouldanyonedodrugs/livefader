@@ -78,6 +78,29 @@ def analyze_regime_performance(df: pd.DataFrame):
     summary['profit_factor'] = (gross_profit / gross_loss).replace([np.inf, -np.inf], 0).fillna(0)
     print(summary.to_string(float_format="%.2f"))
 
+def analyze_time_exit_counterfactuals(df: pd.DataFrame):
+    header("Counterfactual Analysis for Time-Exited Trades")
+    
+    # Filter for only the trades that were closed by the time exit
+    time_exits_df = df[df['exit_reason'] == 'TIME_EXIT']
+    
+    if time_exits_df.empty:
+        print("No time-exited trades found to analyze.")
+        return
+        
+    total_time_exits = len(time_exits_df)
+    
+    # Of those, how many would have gone on to hit the 2x TP?
+    would_be_winners = time_exits_df['cf_would_hit_tp_2x_atr'].sum()
+    
+    # How many would have hit the 2.5x SL?
+    would_be_losers = time_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
+    
+    print(f"Total Time-Exited Trades: {total_time_exits}")
+    print("-" * 40)
+    print(f"Would have become WINNERS (hit 2x ATR TP): {would_be_winners} ({would_be_winners/total_time_exits:.1%})")
+    print(f"Would have become LOSERS (hit 2.5x ATR SL): {would_be_losers} ({would_be_losers/total_time_exits:.1%})")
+
 # --- Core Analysis Logic ---
 def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
