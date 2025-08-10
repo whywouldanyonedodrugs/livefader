@@ -9,10 +9,8 @@ from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 import ccxt.async_support as ccxt
-from tqdm import tqdm
 
 # --- Bot-Consistent Imports ---
-# Use the exact same config and indicator logic as the live bot
 import config as cfg
 from live import indicators as ta
 
@@ -46,13 +44,14 @@ async def main():
             return
 
         LOG.info(f"Found {len(trades_to_fix)} trades to process...")
-
-        # --- FIX #2: Removed the tqdm wrapper for better asyncio stability ---
+        
+        trade_count = 0
         for trade in trades_to_fix:
+            trade_count += 1
             try:
                 trade_id = trade['id']
                 symbol = trade['symbol']
-                LOG.info(f"Processing trade ID: {trade_id} ({symbol})") # Add manual logging
+                LOG.info(f"Processing trade {trade_count}/{len(trades_to_fix)}: ID {trade_id} ({symbol})")
                 
                 opened_at = trade['opened_at'].replace(tzinfo=timezone.utc)
                 closed_at = trade['closed_at'].replace(tzinfo=timezone.utc)
@@ -108,8 +107,7 @@ async def main():
                 ema_slow_at_entry = ta.ema(df4h['close'], span=cfg.EMA_SLOW_PERIOD).iloc[-1]
                 ret_30d_at_entry = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS]) - 1 if len(df1d) >= cfg.STRUCTURAL_TREND_DAYS else 0.0
                 
-                # --- FIX #1: Explicitly convert the NumPy boolean to a Python boolean ---
-                is_ema_crossed_down_at_entry = bool(ema_fast_at_entry < ema_slow_at_entry)
+                _is_ema_crossed_down = ema_fast_at_entry < ema_slow_at_entry
                 ema_spread_pct_at_entry = (ema_fast_at_entry - ema_slow_at_entry) / ema_slow_at_entry if ema_slow_at_entry > 0 else 0.0
 
                 tf_minutes = 5
@@ -127,9 +125,11 @@ async def main():
                 df5m['vwap_dev_pct'] = (df5m['close'] - vwap) / vwap
                 df5m['vwap_ok'] = df5m['vwap_dev_pct'].abs() <= cfg.GAP_MAX_DEV_PCT
                 df5m['vwap_consolidated'] = df5m['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
-                vwap_consolidated_at_entry = bool(df5m['vwap_consolidated'].iloc[-1])
-                
-                vwap_consolidated_at_entry = df5m['vwap_consolidated'].iloc[-1]
+                _vwap_consolidated = df5m['vwap_consolidated'].iloc[-1]
+
+                # --- Definitive Boolean Conversion Fix ---
+                is_ema_crossed_down_at_entry = True if _is_ema_crossed_down else False
+                vwap_consolidated_at_entry = True if _vwap_consolidated else False
 
                 # --- MAE/MFE Calculation ---
                 mae_usd, mfe_usd = 0.0, 0.0
@@ -146,7 +146,7 @@ async def main():
                 mae_over_atr = (mae_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
                 mfe_over_atr = (mfe_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
 
-                # --- NEW: Fetch and Calculate Historical ETH MACD ---
+                # --- ETH MACD Barometer Calculation ---
                 eth_macd_at_entry, eth_macdsignal_at_entry, eth_macdhist_at_entry = None, None, None
                 try:
                     since_ts_eth = int((opened_at - timedelta(days=50)).timestamp() * 1000)
@@ -195,7 +195,6 @@ async def main():
                     eth_macdhist_at_entry,
                     trade_id
                 )
-
 
             except Exception as e:
                 LOG.error(f"Failed to backfill trade ID {trade['id']} ({trade['symbol']}): {e}", exc_info=True)
