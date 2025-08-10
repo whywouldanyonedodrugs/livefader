@@ -372,14 +372,12 @@ class LiveTrader:
             LOG.warning("An unexpected error occurred during leverage setup for %s: %s", symbol, e)
             raise e
 
-    # --- THIS METHOD WAS MISSING ---
     async def _load_listing_dates(self) -> Dict[str, datetime.date]:
         if LISTING_PATH.exists():
-            import datetime as _dt
             raw = json.loads(LISTING_PATH.read_text())
-            return {s: _dt.date.fromisoformat(ts) for s, ts in raw.items()}
+            return {s: datetime.fromisoformat(ts).date() for s, ts in raw.items()}
 
-        LOG.info("listing_dates.json not found. Fetching from exchange...")
+        LOG.info("listing_dates.json not found. Fetching from exchange.")
         async def fetch_date(sym):
             try:
                 candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1, since=0)
@@ -390,9 +388,8 @@ class LiveTrader:
                 LOG.warning("Could not fetch listing date for %s: %s", sym, e)
             return sym, None
 
-        tasks = [fetch_date(sym) for sym in self.symbols]
-        results = await asyncio.gather(*tasks)
-        out = {sym: dt for sym, dt in results if dt}
+        results = await asyncio.gather(*(fetch_date(s) for s in self.symbols))
+        out = {sym: d for sym, d in results if d}
         LISTING_PATH.write_text(json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2))
         LOG.info("Saved %d listing dates to %s", len(out), LISTING_PATH)
         return out
@@ -410,36 +407,31 @@ class LiveTrader:
 
     async def _risk_amount(self, free_usdt: float, eth_macd_data: Optional[dict]) -> float:
         """
-        Calculates the trade risk in USDT, applying dynamic resizing rules.
+        Returns the USD risk budget for THIS trade after applying ETH barometer rules.
+        - Base risk from config (percent of free USDT or fixed).
+        - If ETH barometer is unfavorable (hist > 0 for shorts), either BLOCK or RESIZE.
         """
-        # 1. Determine the base risk amount
-        base_risk = 0.0
-        mode = self.cfg.get("RISK_MODE", "PERCENT").upper()
-        if mode == "PERCENT":
-            base_risk = free_usdt * self.cfg["RISK_PCT"]
-        else:
-            base_risk = float(self.cfg["FIXED_RISK_USDT"])
+        mode = str(self.cfg.get("RISK_MODE", "PERCENT")).upper()
+        base_risk = (free_usdt * float(self.cfg["RISK_PCT"])) if mode == "PERCENT" else float(self.cfg["FIXED_RISK_USDT"])
 
-        # 2. Apply the ETH Barometer filter if it's enabled
-        if self.cfg.get("ETH_BAROMETER_ENABLED", False) and eth_macd_data:
-            is_unfavorable = eth_macd_data.get('hist', 0) > 0
-            
-            if is_unfavorable:
-                unfavorable_mode = self.cfg.get("UNFAVORABLE_MODE", "BLOCK").upper()
-                
-                if unfavorable_mode == "BLOCK":
-                    LOG.info("ETH Barometer is UNFAVORABLE. Risk set to 0 (BLOCK mode).")
-                    return 0.0 # Returning 0 risk will veto the trade
-                
-                elif unfavorable_mode == "RESIZE":
-                    resize_factor = self.cfg.get("UNFAVORABLE_RISK_RESIZE_FACTOR", 0.5)
-                    resized_risk = base_risk * resize_factor
-                    LOG.info(f"ETH Barometer is UNFAVORABLE. Resizing risk from ${base_risk:.2f} to ${resized_risk:.2f} (factor: {resize_factor}).")
-                    return resized_risk
+        # Barometer is optional and safe by default
+        if self.cfg.get("ETH_BAROMETER_ENABLED", False) and eth_macd_data is not None:
+            # For a SHORT-only system, "unfavorable" = ETH momentum up (hist > 0)
+            unfavorable = float(eth_macd_data.get("hist", 0)) > 0
+            if unfavorable:
+                mode = str(self.cfg.get("UNFAVORABLE_MODE", "BLOCK")).upper()
+                if mode == "BLOCK":
+                    LOG.info("ETH barometer UNFAVORABLE → veto entry (risk=0).")
+                    return 0.0
+                if mode == "RESIZE":
+                    f = float(self.cfg.get("UNFAVORABLE_RISK_RESIZE_FACTOR", 0.5))
+                    resized = base_risk * f
+                    LOG.info(f"ETH barometer UNFAVORABLE → resize risk {base_risk:.2f} → {resized:.2f} (x{f}).")
+                    return resized
 
-        # 3. If no rules apply, return the base risk
-        LOG.info(f"ETH Barometer is FAVORABLE. Using base risk: ${base_risk:.2f}")
+        LOG.info(f"ETH barometer favorable/disabled → using base risk {base_risk:.2f}.")
         return base_risk
+
 
     # --- NEW, CORRECTED HELPER METHODS ---
     async def _fetch_by_cid(self, cid: str, symbol: str):
@@ -661,208 +653,212 @@ class LiveTrader:
         return None
 
     async def _get_eth_macd_barometer(self) -> Optional[dict]:
-        """Fetches and calculates the current 4H ETH MACD data."""
+        """
+        Returns latest ETHUSDT 4h MACD dict: {'macd': x, 'signal': y, 'hist': z}.
+        Used ONLY for gating/resizing risk before order placement.
+        """
         try:
-            eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=100)
-            if eth_ohlcv:
-                df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                macd_df = ta.macd(df_eth['close'])
-                latest_macd = macd_df.iloc[-1]
-                return {
-                    "macd": latest_macd['macd'],
-                    "signal": latest_macd['signal'],
-                    "hist": latest_macd['hist']
-                }
+            eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=200)
+            if not eth_ohlcv:
+                return None
+            df = pd.DataFrame(eth_ohlcv, columns=['ts','open','high','low','close','volume'])
+            macd_df = ta.macd(df['close'])
+            latest = macd_df.iloc[-1]
+            return {"macd": float(latest['macd']),
+                    "signal": float(latest['signal']),
+                    "hist": float(latest['hist'])}
         except Exception as e:
-            LOG.warning(f"Could not calculate ETH MACD barometer for risk sizing: {e}")
-        return None
+            LOG.warning(f"ETH barometer unavailable: {e}")
+            return None
 
     async def _open_position(self, sig: Signal):
         """
-        A robust and hardened hybrid entry method.
-        1. Places a market order with a globally unique CID.
-        2. Confirms the position exists on the exchange.
-        3. Persists to DB to get a position ID (pid).
-        4. Places protective orders (SL and either Partial or Final TP) using stable CIDs.
-        5. If any step fails, it performs an emergency market-close.
+        Robust short entry:
+        1) Pre-flight checks + risk sizing (with ETH barometer)
+        2) Market SELL
+        3) Confirm position on exchange
+        4) Persist to DB (pid)
+        5) Place protective SL + TP(s) with stable clientOrderId
+        6) Telegram notify
+        If (4/5) fails → emergency reduce-only market BUY to flatten and alert.
         """
-        # --- Steps 1, 2, and 3 (Pre-checks, Entry Order, Confirmation) are correct and remain unchanged ---
+        # --- Pre-flight: block duplicates and exchange-held positions ---
         if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
             return
-
         try:
             positions = await self.exchange.fetch_positions(symbols=[sig.symbol])
             if positions and positions[0] and float(positions[0].get('info', {}).get('size', 0)) > 0:
-                LOG.warning("Skipping entry for %s, pre-flight check found existing exchange position.", sig.symbol)
+                LOG.warning("Pre-flight found existing exchange position for %s. Abort new entry.", sig.symbol)
                 return
         except Exception as e:
-            LOG.error("Could not perform pre-flight position check for %s: %s", sig.symbol, e)
+            LOG.error("Pre-flight check failed for %s: %s", sig.symbol, e)
             return
 
+        # --- Risk budget BEFORE entry (the critical fix) ---
         bal = await self._fetch_platform_balance()
-        free_usdt = bal["free"]["USDT"]
-        eth_macd_data = await self._get_eth_macd_barometer() # We will create this helper function
-        risk_amt = await self._risk_amount(free_usdt, eth_macd_data)
-        
-        # If risk_amt is 0, it means a filter blocked the trade
-        if risk_amt <= 0:
-            LOG.warning(f"VETO: Risk amount calculated as {risk_amt}. Skipping trade for {sig.symbol}.")
+        free_usdt = float(bal["free"].get("USDT", 0.0))
+        eth_macd = await self._get_eth_macd_barometer()
+        risk_usd = await self._risk_amount(free_usdt, eth_macd)
+        if risk_usd <= 0:
+            LOG.info("Risk=0 → veto entry for %s.", sig.symbol)
             return
 
+        # --- Compute size from live price / ATR distance ---
         try:
-            # Fetch the most current price before calculating size
             ticker = await self.exchange.fetch_ticker(sig.symbol)
-            current_price = float(ticker['last'])
-            LOG.info(f"Signal price for {sig.symbol} was {sig.entry:.4f}, but current price is {current_price:.4f}.")
+            px = float(ticker['last'])
         except Exception as e:
-            LOG.error(f"Could not fetch live ticker for {sig.symbol} before entry. Aborting. Error: {e}")
+            LOG.error("Failed to fetch live ticker for %s: %s", sig.symbol, e)
             return
-
-        stop_price_signal = current_price + self.cfg["SL_ATR_MULT"] * sig.atr
-        stop_dist = abs(current_price - stop_price_signal)
-        
-        if stop_dist == 0:
-            LOG.warning("VETO: Stop distance is zero for %s. Skipping.", sig.symbol)
+        stop_price_preview = px + float(self.cfg["SL_ATR_MULT"]) * float(sig.atr)
+        stop_dist = abs(px - stop_price_preview)
+        if stop_dist <= 0:
+            LOG.warning("Stop distance is zero for %s. Skip.", sig.symbol)
             return
-        intended_size = risk_amt / stop_dist
+        intended_size = max(risk_usd / stop_dist, 0.0)
 
+        # --- Ensure leverage/mode ---
         try:
             await self._ensure_leverage(sig.symbol)
         except Exception:
             return
 
+        # --- Entry: market SELL with unique CID ---
         entry_cid = create_unique_cid(f"ENTRY_{sig.symbol}")
         try:
             await self.exchange.create_market_order(
                 sig.symbol, "sell", intended_size,
                 params={"clientOrderId": entry_cid, "category": "linear"}
             )
-            LOG.info("Market order sent for %s. Entry CID: %s", sig.symbol, entry_cid)
+            LOG.info("Market SELL sent for %s (CID=%s)", sig.symbol, entry_cid)
         except Exception as e:
-            LOG.error("Initial market order placement for %s failed immediately: %s", sig.symbol, e)
+            LOG.error("Market SELL failed for %s: %s", sig.symbol, e)
             return
 
-        actual_size, actual_entry_price, live_position = 0.0, 0.0, None
-        CONFIRMATION_ATTEMPTS = 20
-        for i in range(CONFIRMATION_ATTEMPTS):
+        # --- Confirm the position actually exists ---
+        actual_size, actual_entry_price = 0.0, 0.0
+        live_position = None
+        for _ in range(20):
             await asyncio.sleep(0.5)
             try:
                 positions = await self.exchange.fetch_positions(symbols=[sig.symbol])
                 pos = next((p for p in positions if p.get('info', {}).get('symbol') == sig.symbol), None)
                 if pos and float(pos.get('info', {}).get('size', 0)) > 0:
                     live_position = pos
-                    actual_size = float(live_position['info']['size'])
-                    actual_entry_price = float(live_position['info']['avgPrice'])
-                    LOG.info(f"ENTRY CONFIRMED for %s. Exchange reports size: {actual_size} @ {actual_entry_price}", sig.symbol)
+                    actual_size = float(pos['info']['size'])
+                    actual_entry_price = float(pos['info']['avgPrice'])
                     break
             except Exception as e:
-                LOG.warning("Confirmation loop check failed for %s (attempt %d/%d): %s", sig.symbol, i + 1, CONFIRMATION_ATTEMPTS, e)
-        
+                LOG.warning("Confirm loop failed for %s: %s", sig.symbol, e)
         if not live_position:
-            LOG.error("ENTRY FAILED for %s: Position did not appear on exchange after %d attempts.", sig.symbol, CONFIRMATION_ATTEMPTS)
+            LOG.error("Entry failed to confirm for %s; no exchange position appeared.", sig.symbol)
             return
-        
-        slippage_usd = (sig.entry - actual_entry_price) * actual_size
-        risk_usd = await self._risk_amount(free_usdt) # Capture the intended risk amount
-        LOG.info("Slippage for %s entry: $%.4f", sig.symbol, slippage_usd)
 
-        config_snapshot = {
-            "SL_ATR_MULT": self.cfg.get("SL_ATR_MULT"),
-            "FINAL_TP_ATR_MULT": self.cfg.get("FINAL_TP_ATR_MULT"),
-            "PARTIAL_TP_ATR_MULT": self.cfg.get("PARTIAL_TP_ATR_MULT"),
-            "PARTIAL_TP_PCT": self.cfg.get("PARTIAL_TP_PCT")
-        }
+        slippage_usd = (float(sig.entry) - actual_entry_price) * actual_size
+        LOG.info("Entry confirmed %s: size=%.6f @ %.6f (slip $%.4f)", sig.symbol, actual_size, actual_entry_price, slippage_usd)
 
-
-        # --- Step 4: Persist to DB and place protective orders (CRITICAL BLOCK) ---
+        # --- Persist + protective orders in one guarded block ---
         try:
-            # --- MODIFICATION: Prioritize hourly exit deadline calculation ---
+            # Time-exit deadline (hours preferred; fallback to days if configured)
             exit_deadline = None
             if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
-                exit_deadline = datetime.now(timezone.utc) + timedelta(hours=self.cfg.get("TIME_EXIT_HOURS", 4))
-                LOG.info(f"Setting hourly exit for {sig.symbol} at {exit_deadline.isoformat()}")
+                exit_deadline = datetime.now(timezone.utc) + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
             elif self.cfg.get("TIME_EXIT_ENABLED", False):
-                # Fallback to the daily exit if hourly is disabled
-                exit_deadline = datetime.now(timezone.utc) + timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
-                LOG.info(f"Setting daily exit for {sig.symbol} at {exit_deadline.isoformat()}")
+                exit_deadline = datetime.now(timezone.utc) + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
 
             pid = await self.db.insert_position({
-                "symbol": sig.symbol, "side": "short", "size": actual_size,
-                "entry_price": actual_entry_price, "atr": sig.atr,
-                "status": "PENDING", "opened_at": datetime.now(timezone.utc),
-                "exit_deadline": exit_deadline, # Store the calculated deadline
-                # --- ALL NEW DATA ---
-                "risk_usd": risk_usd,
-                "slippage_usd": slippage_usd,
+                "symbol": sig.symbol, "side": "short",
+                "size": actual_size, "entry_price": actual_entry_price,
+                "atr": float(sig.atr), "status": "PENDING",
+                "opened_at": datetime.now(timezone.utc),
+                "exit_deadline": exit_deadline,
+                "risk_usd": risk_usd, "slippage_usd": slippage_usd,
                 "market_regime_at_entry": sig.market_regime,
-                "rsi_at_entry": sig.rsi,
-                "adx_at_entry": sig.adx,
-                "atr_pct_at_entry": sig.atr_pct,
+                "rsi_at_entry": sig.rsi, "adx_at_entry": sig.adx, "atr_pct_at_entry": sig.atr_pct,
                 "price_boom_pct_at_entry": sig.price_boom_pct,
                 "price_slowdown_pct_at_entry": sig.price_slowdown_pct,
-                "is_ema_crossed_down_at_entry": sig.is_ema_crossed_down,
-                "vwap_consolidated_at_entry": sig.vwap_consolidated,
                 "vwap_dev_pct_at_entry": sig.vwap_dev_pct,
                 "eth_macd_at_entry": eth_macd.get('macd') if eth_macd else None,
                 "eth_macdsignal_at_entry": eth_macd.get('signal') if eth_macd else None,
                 "eth_macdhist_at_entry": eth_macd.get('hist') if eth_macd else None,
-                "ret_30d_at_entry": sig.ret_30d,
-                "ema_fast_at_entry": sig.ema_fast,
-                "ema_slow_at_entry": sig.ema_slow,
-                "listing_age_days_at_entry": sig.listing_age_days,
-                "session_tag_at_entry": sig.session_tag,
-                "day_of_week_at_entry": sig.day_of_week,
+                "ret_30d_at_entry": sig.ret_30d, "ema_fast_at_entry": sig.ema_fast,
+                "ema_slow_at_entry": sig.ema_slow, "listing_age_days_at_entry": sig.listing_age_days,
+                "session_tag_at_entry": sig.session_tag, "day_of_week_at_entry": sig.day_of_week,
                 "hour_of_day_at_entry": sig.hour_of_day,
-                "config_snapshot": json.dumps(config_snapshot),
-                "win_probability_at_entry": sig.win_probability
+                "config_snapshot": json.dumps({
+                    "SL_ATR_MULT": self.cfg.get("SL_ATR_MULT"),
+                    "FINAL_TP_ATR_MULT": self.cfg.get("FINAL_TP_ATR_MULT"),
+                    "PARTIAL_TP_ATR_MULT": self.cfg.get("PARTIAL_TP_ATR_MULT"),
+                    "PARTIAL_TP_PCT": self.cfg.get("PARTIAL_TP_PCT"),
+                }),
+                "win_probability_at_entry": float(getattr(sig, "win_probability", 0.0)),
             })
 
-            stop_price_actual = actual_entry_price + self.cfg["SL_ATR_MULT"] * sig.atr
+            # --- Protective orders (Bybit V5 conditional orders) ---
+            # BUY stop-loss above entry for short; trigger when price rises to stop → triggerDirection=1
+            stop_price = actual_entry_price + float(self.cfg["SL_ATR_MULT"]) * float(sig.atr)
             sl_cid = create_stable_cid(pid, "SL")
-            
-            # FIX: Add closeOnTrigger to the SL params
-            sl_params = {
-                "triggerPrice": stop_price_actual, "clientOrderId": sl_cid,
-                'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 1, 'category': 'linear'
-            }
-            await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=sl_params)
+            await self.exchange.create_order(
+                sig.symbol, 'market', 'buy', actual_size, None,
+                params={
+                    "triggerPrice": stop_price,
+                    "clientOrderId": sl_cid, "category": "linear",
+                    "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 1
+                }
+            )
 
-            tp1_cid = None
-            tp_final_cid = None
-
+            tp1_cid, tp_final_cid = None, None
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
+                # Partial TP below entry for short; trigger when price falls to target → triggerDirection=2
                 tp1_cid = create_stable_cid(pid, "TP1")
-                tp_price = actual_entry_price - self.cfg["PARTIAL_TP_ATR_MULT"] * sig.atr
-                qty = actual_size * self.cfg["PARTIAL_TP_PCT"]
-                # FIX: Add closeOnTrigger to the TP params
-                tp_params = {
-                    "triggerPrice": tp_price, "clientOrderId": tp1_cid,
-                    'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 2, 'category': 'linear'
-                }
-                await self.exchange.create_order(sig.symbol, 'market', "buy", qty, None, params=tp_params)
-            elif self.cfg.get("FINAL_TP_ENABLED", False):
+                tp_price = actual_entry_price - float(self.cfg["PARTIAL_TP_ATR_MULT"]) * float(sig.atr)
+                qty = actual_size * float(self.cfg["PARTIAL_TP_PCT"])
+                await self.exchange.create_order(
+                    sig.symbol, 'market', 'buy', qty, None,
+                    params={
+                        "triggerPrice": tp_price,
+                        "clientOrderId": tp1_cid, "category": "linear",
+                        "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 2
+                    }
+                )
+            elif self.cfg.get("FINAL_TP_ENABLED", True):
                 tp_final_cid = create_stable_cid(pid, "TP_FINAL")
-                tp_price = actual_entry_price - self.cfg["FINAL_TP_ATR_MULT"] * sig.atr
-                # FIX: Add closeOnTrigger to the TP params
-                tp_params = {
-                    "triggerPrice": tp_price, "clientOrderId": tp_final_cid,
-                    'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 2, 'category': 'linear'
-                }
-                await self.exchange.create_order(sig.symbol, 'market', "buy", actual_size, None, params=tp_params)
-            
+                tp_price = actual_entry_price - float(self.cfg["FINAL_TP_ATR_MULT"]) * float(sig.atr)
+                await self.exchange.create_order(
+                    sig.symbol, 'market', 'buy', actual_size, None,
+                    params={
+                        "triggerPrice": tp_price,
+                        "clientOrderId": tp_final_cid, "category": "linear",
+                        "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 2
+                    }
+                )
+
             await self.db.update_position(
-                pid, status="OPEN", stop_price=stop_price_actual,
+                pid, status="OPEN", stop_price=stop_price,
                 sl_cid=sl_cid, tp1_cid=tp1_cid, tp_final_cid=tp_final_cid
             )
             row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
             self.open_positions[pid] = dict(row)
 
-            days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-            win_prob_pct = sig.win_probability * 100
+            days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
             await self.tg.send(
-                f"🚀 **({days[sig.day_of_week]})** Opened {sig.symbol} short {actual_size:.3f} @ {actual_entry_price:.4f}\n"
-                f"📈 **Win Probability:** {win_prob_pct:.1f}%"
+                f"🚀 **({days[sig.day_of_week]})** Opened {sig.symbol} short {actual_size:.4f} @ {actual_entry_price:.6f}\n"
+                f"🛡️ SL: {stop_price:.6f} | TP: {'TP1' if tp1_cid else 'FINAL'}\n"
+                f"🎯 WinProb: {getattr(sig,'win_probability',0.0)*100:.1f}%"
             )
+
+        except Exception as e:
+            # EMERGENCY CLOSE to prevent naked position
+            msg = f"🚨 CRITICAL: Failed to persist/protect {sig.symbol}: {e}. Emergency closing now."
+            LOG.critical(msg)
+            await self.tg.send(msg)
+            try:
+                await self.exchange.create_market_order(
+                    sig.symbol, 'buy', actual_size, params={'reduceOnly': True, 'category': 'linear'}
+                )
+                await self.tg.send(f"✅ Emergency close filled for {sig.symbol}.")
+            except Exception as close_e:
+                await self.tg.send(f"🚨 FAILED EMERGENCY CLOSE for {sig.symbol}: {close_e}")
 
 
         except Exception as e:
@@ -1014,40 +1010,52 @@ class LiveTrader:
                 LOG.error(f"Failed to place final TP2 order for {pid}: {e}")
 
     async def _trail_stop(self, pid: int, pos: Dict[str, Any], first: bool = False):
+        """
+        Trailing BUY stop for a SHORT position:
+        new_stop = price + k*ATR  (always ABOVE current price)
+        Move it only in the favorable direction (downwards for shorts).
+        """
         symbol = pos["symbol"]
         price = float((await self.exchange.fetch_ticker(symbol))["last"])
         atr = float(pos["atr"])
-        stop_price = float(pos["stop_price"])
+        prev_stop = float(pos.get("stop_price", 0) or 0.0)
 
-        new_stop = price - self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0) * atr
-        is_favorable_move = stop_price == 0 or new_stop < stop_price
-        min_move_required = price * self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001)
-        is_significant_move = abs(stop_price - new_stop) > min_move_required
+        # Correct formula for shorts: stop ABOVE price
+        new_stop = price + float(self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0)) * atr
 
-        if first or (is_favorable_move and is_significant_move):
-            qty_left = float(pos["size"]) * (1 - self.cfg.get("PARTIAL_TP_PCT", 0.7))
+        # Favorable move for shorts: lower stop (new_stop < prev_stop)
+        favorable = (prev_stop == 0.0) or (new_stop < prev_stop)
+        min_move = price * float(self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001))
+        significant = abs(prev_stop - new_stop) > min_move
+
+        if first or (favorable and significant):
+            qty_left = float(pos["size"]) * (1 - float(self.cfg.get("PARTIAL_TP_PCT", 0.7)))
             sl_trail_cid = create_stable_cid(pid, "SL_TRAIL")
 
+            # Cancel previous trailing SL if any
             try:
-                if not first and pos.get("sl_trail_cid"):
+                if (not first) and pos.get("sl_trail_cid"):
                     await self._cancel_by_cid(pos["sl_trail_cid"], symbol)
             except ccxt.OrderNotFound:
                 pass
             except Exception as e:
-                LOG.warning("Trail cancel failed for %s: %s. Will retry.", symbol, e)
+                LOG.warning("Trail cancel failed for %s: %s", symbol, e)
                 return
-            
-            # FIX: Add closeOnTrigger to the trailing SL params
-            sl_params = {
-                "triggerPrice": new_stop, "clientOrderId": sl_trail_cid,
-                'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 1, 'category': 'linear'
-            }
-            await self.exchange.create_order(symbol, 'market', "buy", qty_left, None, params=sl_params)
-            
+
+            # Place new conditional BUY stop; trigger when price rises to it → triggerDirection=1
+            await self.exchange.create_order(
+                symbol, 'market', 'buy', qty_left, None,
+                params={
+                    "triggerPrice": new_stop,
+                    "clientOrderId": sl_trail_cid, "category": "linear",
+                    "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 1
+                }
+            )
             await self.db.update_position(pid, stop_price=new_stop, sl_trail_cid=sl_trail_cid)
             pos["stop_price"] = new_stop
             pos["sl_trail_cid"] = sl_trail_cid
-            LOG.info("Trail updated %s to %.4f", symbol, new_stop)
+            LOG.info("Trail updated %s to %.6f", symbol, new_stop)
+
             
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
             symbol = pos["symbol"]
@@ -1614,12 +1622,11 @@ class LiveTrader:
 
     async def run(self):
         await self.db.init()
-        
+
         if self.settings.bybit_testnet:
             LOG.warning("="*60)
             LOG.warning("RUNNING ON TESTNET")
             LOG.warning("Testnet data is unreliable for most altcoins.")
-            LOG.warning("Signals may be incorrect. Use for order logic testing only.")
             LOG.warning("="*60)
 
         LOG.info("Loading exchange market data...")
@@ -1627,7 +1634,7 @@ class LiveTrader:
             await self.exchange._exchange.load_markets()
             LOG.info("Market data loaded.")
         except Exception as e:
-            LOG.error("Could not load exchange market data: %s. Exiting.", e)
+            LOG.error("Could not load markets: %s. Exiting.", e)
             return
 
         LOG.info("Loading symbol listing dates...")
@@ -1643,9 +1650,8 @@ class LiveTrader:
                 tg.create_task(self._telegram_loop())
                 tg.create_task(self._equity_loop())
                 tg.create_task(self._reporting_loop())
-            LOG.info("All tasks finished gracefully.")
         except* (asyncio.CancelledError, KeyboardInterrupt):
-            LOG.info("Shutdown signal received. Closing connections...")
+            LOG.info("Shutdown signal received.")
         finally:
             await self.exchange.close()
             if self.db.pool:
