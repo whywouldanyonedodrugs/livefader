@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS positions (
     eth_macd_at_entry FLOAT,
     eth_macdsignal_at_entry FLOAT,
     eth_macdhist_at_entry FLOAT,
+    eth_macd_1h_at_entry FLOAT,
+    eth_macdhist_1h_at_entry FLOAT,
     vwap_consolidated_at_entry BOOLEAN
 );
 CREATE TABLE IF NOT EXISTS fills (

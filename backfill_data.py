@@ -146,22 +146,37 @@ async def main():
                 mae_over_atr = (mae_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
                 mfe_over_atr = (mfe_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
 
-                # --- ETH MACD Barometer Calculation ---
-                eth_macd_at_entry, eth_macdsignal_at_entry, eth_macdhist_at_entry = None, None, None
+                # --- ETH MACD Barometer Calculation (4H and 1H) ---
+                eth_macd_4h, eth_macdsignal_4h, eth_macdhist_4h = None, None, None
+                eth_macd_1h, eth_macdsignal_1h, eth_macdhist_1h = None, None, None
                 try:
-                    since_ts_eth = int((opened_at - timedelta(days=50)).timestamp() * 1000)
-                    eth_ohlcv = await exchange.fetch_ohlcv('ETHUSDT', '4h', since=since_ts_eth, limit=300)
-                    if eth_ohlcv:
-                        df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                        df_eth['timestamp'] = pd.to_datetime(df_eth['timestamp'], unit='ms', utc=True)
-                        df_eth = df_eth.set_index('timestamp').loc[:opened_at]
-                        
-                        if not df_eth.empty:
-                            macd_df = ta.macd(df_eth['close'])
-                            latest_macd = macd_df.iloc[-1]
-                            eth_macd_at_entry = latest_macd['macd']
-                            eth_macdsignal_at_entry = latest_macd['signal']
-                            eth_macdhist_at_entry = latest_macd['hist']
+                    # Fetch 4H data
+                    since_ts_eth_4h = int((opened_at - timedelta(days=50)).timestamp() * 1000)
+                    eth_ohlcv_4h = await exchange.fetch_ohlcv('ETHUSDT', '4h', since=since_ts_eth_4h, limit=300)
+                    if eth_ohlcv_4h:
+                        df_eth_4h = pd.DataFrame(eth_ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        df_eth_4h['timestamp'] = pd.to_datetime(df_eth_4h['timestamp'], unit='ms', utc=True)
+                        df_eth_4h = df_eth_4h.set_index('timestamp').loc[:opened_at]
+                        if not df_eth_4h.empty:
+                            macd_df_4h = ta.macd(df_eth_4h['close'])
+                            latest_macd_4h = macd_df_4h.iloc[-1]
+                            eth_macd_4h = latest_macd_4h['macd']
+                            eth_macdsignal_4h = latest_macd_4h['signal']
+                            eth_macdhist_4h = latest_macd_4h['hist']
+                    
+                    # Fetch 1H data
+                    since_ts_eth_1h = int((opened_at - timedelta(days=15)).timestamp() * 1000)
+                    eth_ohlcv_1h = await exchange.fetch_ohlcv('ETHUSDT', '1h', since=since_ts_eth_1h, limit=360)
+                    if eth_ohlcv_1h:
+                        df_eth_1h = pd.DataFrame(eth_ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        df_eth_1h['timestamp'] = pd.to_datetime(df_eth_1h['timestamp'], unit='ms', utc=True)
+                        df_eth_1h = df_eth_1h.set_index('timestamp').loc[:opened_at]
+                        if not df_eth_1h.empty:
+                            macd_df_1h = ta.macd(df_eth_1h['close'])
+                            latest_macd_1h = macd_df_1h.iloc[-1]
+                            eth_macd_1h = latest_macd_1h['macd']
+                            eth_macdsignal_1h = latest_macd_1h['signal']
+                            eth_macdhist_1h = latest_macd_1h['hist']
                 except Exception as e:
                     LOG.warning(f"Could not backfill ETH MACD for trade {trade_id}: {e}")
 
@@ -178,8 +193,11 @@ async def main():
                         vwap_consolidated_at_entry = $18,
                         eth_macd_at_entry = $19,
                         eth_macdsignal_at_entry = $20,
-                        eth_macdhist_at_entry = $21
-                    WHERE id = $22
+                        eth_macdhist_at_entry = $21,
+                        eth_macd_1h_at_entry = $22,
+                        eth_macdsignal_1h_at_entry = $23,
+                        eth_macdhist_1h_at_entry = $24
+                    WHERE id = $25
                 """
                 await conn.execute(
                     update_query,
@@ -190,9 +208,12 @@ async def main():
                     is_ema_crossed_down_at_entry,
                     ema_spread_pct_at_entry,
                     vwap_consolidated_at_entry,
-                    eth_macd_at_entry,
-                    eth_macdsignal_at_entry,
-                    eth_macdhist_at_entry,
+                    eth_macd_4h,
+                    eth_macdsignal_4h,
+                    eth_macdhist_4h,
+                    eth_macd_1h,
+                    eth_macdsignal_1h,
+                    eth_macdhist_1h,
                     trade_id
                 )
 
