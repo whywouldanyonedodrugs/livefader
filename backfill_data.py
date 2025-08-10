@@ -150,29 +150,35 @@ async def main():
                 eth_macd_4h, eth_macdsignal_4h, eth_macdhist_4h = None, None, None
                 eth_macd_1h, eth_macdsignal_1h, eth_macdhist_1h = None, None, None
                 try:
-                    # Fetch 4H data
+                    # --- 4H Calculation (Corrected for robustness) ---
                     since_ts_eth_4h = int((opened_at - timedelta(days=50)).timestamp() * 1000)
                     eth_ohlcv_4h = await exchange.fetch_ohlcv('ETHUSDT', '4h', since=since_ts_eth_4h, limit=300)
                     if eth_ohlcv_4h:
                         df_eth_4h = pd.DataFrame(eth_ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         df_eth_4h['timestamp'] = pd.to_datetime(df_eth_4h['timestamp'], unit='ms', utc=True)
-                        df_eth_4h = df_eth_4h.set_index('timestamp').loc[:opened_at]
-                        if not df_eth_4h.empty:
-                            macd_df_4h = ta.macd(df_eth_4h['close'])
+                        df_eth_4h = df_eth_4h.set_index('timestamp')
+                        
+                        # Find the last candle that started before or at the open time
+                        last_candle_4h = df_eth_4h[df_eth_4h.index <= opened_at]
+                        if not last_candle_4h.empty:
+                            macd_df_4h = ta.macd(last_candle_4h['close'])
                             latest_macd_4h = macd_df_4h.iloc[-1]
                             eth_macd_4h = latest_macd_4h['macd']
                             eth_macdsignal_4h = latest_macd_4h['signal']
                             eth_macdhist_4h = latest_macd_4h['hist']
-                    
-                    # Fetch 1H data
+
+                    # --- 1H Calculation (Corrected for robustness) ---
                     since_ts_eth_1h = int((opened_at - timedelta(days=15)).timestamp() * 1000)
                     eth_ohlcv_1h = await exchange.fetch_ohlcv('ETHUSDT', '1h', since=since_ts_eth_1h, limit=360)
                     if eth_ohlcv_1h:
                         df_eth_1h = pd.DataFrame(eth_ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         df_eth_1h['timestamp'] = pd.to_datetime(df_eth_1h['timestamp'], unit='ms', utc=True)
-                        df_eth_1h = df_eth_1h.set_index('timestamp').loc[:opened_at]
-                        if not df_eth_1h.empty:
-                            macd_df_1h = ta.macd(df_eth_1h['close'])
+                        df_eth_1h = df_eth_1h.set_index('timestamp')
+
+                        # Find the last candle that started before or at the open time
+                        last_candle_1h = df_eth_1h[df_eth_1h.index <= opened_at]
+                        if not last_candle_1h.empty:
+                            macd_df_1h = ta.macd(last_candle_1h['close'])
                             latest_macd_1h = macd_df_1h.iloc[-1]
                             eth_macd_1h = latest_macd_1h['macd']
                             eth_macdsignal_1h = latest_macd_1h['signal']
