@@ -157,4 +157,8 @@ REGIME_MA_PERIOD: 100       # Long-term moving average period.
 REGIME_ATR_PERIOD: 20       # ATR period for Keltner Channel width.
 REGIME_ATR_MULT: 2.0        # ATR multiplier for the Keltner bands.
 
-    
+
+# --- ETH MACD BAROMETER FILTER (NEW) ---
+ETH_BAROMETER_ENABLED = True
+UNFAVORABLE_MODE = "RESIZE" 
+UNFAVORABLE_RISK_RESIZE_FACTOR = 0.2   

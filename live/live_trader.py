@@ -408,11 +408,38 @@ class LiveTrader:
             LOG.error("Failed to fetch %s account balance: %s", account_type, e)
             return {"total": {"USDT": 0.0}, "free": {"USDT": 0.0}}
 
-    async def _risk_amount(self, free_usdt: float) -> float:
+    async def _risk_amount(self, free_usdt: float, eth_macd_data: Optional[dict]) -> float:
+        """
+        Calculates the trade risk in USDT, applying dynamic resizing rules.
+        """
+        # 1. Determine the base risk amount
+        base_risk = 0.0
         mode = self.cfg.get("RISK_MODE", "PERCENT").upper()
         if mode == "PERCENT":
-            return free_usdt * self.cfg["RISK_PCT"]
-        return float(self.cfg["FIXED_RISK_USDT"])
+            base_risk = free_usdt * self.cfg["RISK_PCT"]
+        else:
+            base_risk = float(self.cfg["FIXED_RISK_USDT"])
+
+        # 2. Apply the ETH Barometer filter if it's enabled
+        if self.cfg.get("ETH_BAROMETER_ENABLED", False) and eth_macd_data:
+            is_unfavorable = eth_macd_data.get('hist', 0) > 0
+            
+            if is_unfavorable:
+                unfavorable_mode = self.cfg.get("UNFAVORABLE_MODE", "BLOCK").upper()
+                
+                if unfavorable_mode == "BLOCK":
+                    LOG.info("ETH Barometer is UNFAVORABLE. Risk set to 0 (BLOCK mode).")
+                    return 0.0 # Returning 0 risk will veto the trade
+                
+                elif unfavorable_mode == "RESIZE":
+                    resize_factor = self.cfg.get("UNFAVORABLE_RISK_RESIZE_FACTOR", 0.5)
+                    resized_risk = base_risk * resize_factor
+                    LOG.info(f"ETH Barometer is UNFAVORABLE. Resizing risk from ${base_risk:.2f} to ${resized_risk:.2f} (factor: {resize_factor}).")
+                    return resized_risk
+
+        # 3. If no rules apply, return the base risk
+        LOG.info(f"ETH Barometer is FAVORABLE. Using base risk: ${base_risk:.2f}")
+        return base_risk
 
     # --- NEW, CORRECTED HELPER METHODS ---
     async def _fetch_by_cid(self, cid: str, symbol: str):
@@ -633,6 +660,23 @@ class LiveTrader:
             traceback.print_exc()
         return None
 
+    async def _get_eth_macd_barometer(self) -> Optional[dict]:
+        """Fetches and calculates the current 4H ETH MACD data."""
+        try:
+            eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=100)
+            if eth_ohlcv:
+                df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                macd_df = ta.macd(df_eth['close'])
+                latest_macd = macd_df.iloc[-1]
+                return {
+                    "macd": latest_macd['macd'],
+                    "signal": latest_macd['signal'],
+                    "hist": latest_macd['hist']
+                }
+        except Exception as e:
+            LOG.warning(f"Could not calculate ETH MACD barometer for risk sizing: {e}")
+        return None
+
     async def _open_position(self, sig: Signal):
         """
         A robust and hardened hybrid entry method.
@@ -657,7 +701,13 @@ class LiveTrader:
 
         bal = await self._fetch_platform_balance()
         free_usdt = bal["free"]["USDT"]
-        risk_amt = await self._risk_amount(free_usdt)
+        eth_macd_data = await self._get_eth_macd_barometer() # We will create this helper function
+        risk_amt = await self._risk_amount(free_usdt, eth_macd_data)
+        
+        # If risk_amt is 0, it means a filter blocked the trade
+        if risk_amt <= 0:
+            LOG.warning(f"VETO: Risk amount calculated as {risk_amt}. Skipping trade for {sig.symbol}.")
+            return
 
         try:
             # Fetch the most current price before calculating size
