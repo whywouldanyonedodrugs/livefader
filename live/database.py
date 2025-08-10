@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS positions (
     cf_would_hit_sl_2_5x_atr BOOLEAN,
     cf_mae_over_atr_4h FLOAT,
     cf_mfe_over_atr_4h FLOAT,
+    eth_macd_at_entry FLOAT,
+    eth_macdsignal_at_entry FLOAT,
+    eth_macdhist_at_entry FLOAT,
     vwap_consolidated_at_entry BOOLEAN
 );
 CREATE TABLE IF NOT EXISTS fills (

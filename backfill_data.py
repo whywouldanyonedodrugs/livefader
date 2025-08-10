@@ -142,6 +142,27 @@ async def main():
                 mae_over_atr = (mae_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
                 mfe_over_atr = (mfe_usd / size) / atr_at_entry_db if atr_at_entry_db > 0 and size > 0 else 0
 
+                # --- NEW: Fetch and Calculate Historical ETH MACD ---
+                eth_macd_at_entry, eth_macdsignal_at_entry, eth_macdhist_at_entry = None, None, None
+                try:
+                    # Fetch 4h ETH data leading up to the trade's open time
+                    since_ts_eth = int((opened_at - timedelta(days=50)).timestamp() * 1000)
+                    eth_ohlcv = await exchange.fetch_ohlcv('ETHUSDT', '4h', since=since_ts_eth, limit=300)
+                    if eth_ohlcv:
+                        df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        df_eth['timestamp'] = pd.to_datetime(df_eth['timestamp'], unit='ms', utc=True)
+                        df_eth = df_eth.set_index('timestamp').loc[:opened_at]
+                        
+                        if not df_eth.empty:
+                            macd_df = ta.macd(df_eth['close'])
+                            latest_macd = macd_df.iloc[-1]
+                            eth_macd_at_entry = latest_macd['macd']
+                            eth_macdsignal_at_entry = latest_macd['signal']
+                            eth_macdhist_at_entry = latest_macd['hist']
+                except Exception as e:
+                    LOG.warning(f"Could not backfill ETH MACD for trade {trade_id}: {e}")
+                # --- END OF NEW SECTION ---
+
                 # --- Final Database Update ---
                 update_query = """
                     UPDATE positions SET
@@ -152,8 +173,11 @@ async def main():
                         vwap_dev_pct_at_entry = $14, vwap_z_at_entry = $15,
                         is_ema_crossed_down_at_entry = $16,
                         ema_spread_pct_at_entry = $17,
-                        vwap_consolidated_at_entry = $18
-                    WHERE id = $19
+                        vwap_consolidated_at_entry = $18,
+                        eth_macd_at_entry = $19, -- New
+                        eth_macdsignal_at_entry = $20, -- New
+                        eth_macdhist_at_entry = $21, -- New
+                    WHERE id = $22
                 """
                 await conn.execute(
                     update_query, pnl, pnl_pct, inferred_exit_reason, holding_minutes,
@@ -163,6 +187,9 @@ async def main():
                     is_ema_crossed_down_at_entry,
                     ema_spread_pct_at_entry,
                     bool(vwap_consolidated_at_entry),
+                    eth_macd_at_entry,
+                    eth_macdsignal_at_entry,
+                    eth_macdhist_at_entry,
                     trade_id
                 )
 

@@ -462,7 +462,7 @@ class LiveTrader:
             LOG.warning("Could not fetch all open orders for all symbols: %s", e)
             return []
 
-    async def _scan_symbol_for_signal(self, symbol: str, market_regime: str) -> Optional[Signal]:
+    async def _scan_symbol_for_signal(self, symbol: str, market_regime: str, eth_macd: Optional[dict]) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
             base_tf = self.cfg.get('TIMEFRAME', '5m')
@@ -753,6 +753,9 @@ class LiveTrader:
                 "is_ema_crossed_down_at_entry": sig.is_ema_crossed_down,
                 "vwap_consolidated_at_entry": sig.vwap_consolidated,
                 "vwap_dev_pct_at_entry": sig.vwap_dev_pct,
+                "eth_macd_at_entry": eth_macd.get('macd') if eth_macd else None,
+                "eth_macdsignal_at_entry": eth_macd.get('signal') if eth_macd else None,
+                "eth_macdhist_at_entry": eth_macd.get('hist') if eth_macd else None,
                 "ret_30d_at_entry": sig.ret_30d,
                 "ema_fast_at_entry": sig.ema_fast,
                 "ema_slow_at_entry": sig.ema_slow,
@@ -1264,6 +1267,27 @@ class LiveTrader:
                 current_market_regime = await self.regime_detector.get_current_regime()
                 LOG.info("Starting new scan cycle for %d symbols with market regime: %s", len(self.symbols), current_market_regime)
 
+                # --- NEW: Calculate the ETH MACD Barometer ---
+                eth_macd_data = None
+                try:
+                    # Fetch 4-hour data for ETHUSDT
+                    eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=100)
+                    if eth_ohlcv:
+                        df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        # Calculate MACD using your indicators module
+                        macd_df = ta.macd(df_eth['close'])
+                        # Get the very last (most recent) row of MACD data
+                        latest_macd = macd_df.iloc[-1]
+                        eth_macd_data = {
+                            "macd": latest_macd['macd'],
+                            "signal": latest_macd['signal'],
+                            "hist": latest_macd['hist']
+                        }
+                        LOG.info(f"ETH Barometer MACD(4h): {latest_macd['macd']:.2f}, Hist: {latest_macd['hist']:.2f}")
+                except Exception as e:
+                    LOG.warning(f"Could not calculate ETH MACD barometer: {e}")
+                # --- END OF NEW SECTION ---
+
                 equity = await self.db.latest_equity() or 0.0
                 open_positions_count = len(self.open_positions)
                 open_symbols = {p['symbol'] for p in self.open_positions.values()}
@@ -1293,7 +1317,7 @@ class LiveTrader:
                             LOG.error("Could not perform pre-flight position check for %s: %s", sym, e)
                             continue
 
-                        signal = await self._scan_symbol_for_signal(sym, current_market_regime)
+                        signal = await self._scan_symbol_for_signal(sym, current_market_regime, eth_macd_data)
                         if signal:
                             age = (datetime.utcnow().date() - self._listing_dates_cache[sym]).days if sym in self._listing_dates_cache else None
                             ok, vetoes = filters.evaluate(
