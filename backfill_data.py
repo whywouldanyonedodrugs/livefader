@@ -29,6 +29,29 @@ async def main():
     exchange = None
     try:
         conn = await asyncpg.connect(dsn=db_dsn)
+
+        LOG.info("Connection successful. Running diagnostics...")
+        
+        # Query 1: Get the current database name
+        current_db = await conn.fetchval("SELECT current_database();")
+        LOG.info(f"SCRIPT IS CONNECTED TO DATABASE: '{current_db}'")
+        
+        # Query 2: Get the table schema as seen by the script
+        LOG.info("Fetching schema for 'positions' table as seen by this script:")
+        
+        schema_query = """
+            SELECT column_name, data_type 
+            FROM information_schema.columns
+            WHERE table_name = 'positions'
+            ORDER BY ordinal_position;
+        """
+        schema_records = await conn.fetch(schema_query)
+        
+        print("--- SCHEMA AS SEEN BY SCRIPT ---")
+        for record in schema_records:
+            print(f"Column: {record['column_name']}, Type: {record['data_type']}")
+        print("--- END OF SCHEMA ---")
+
         exchange = ccxt.bybit({
             'apiKey': os.getenv("BYBIT_API_KEY"),
             'secret': os.getenv("BYBIT_API_SECRET"),
