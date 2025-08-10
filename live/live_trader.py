@@ -612,34 +612,44 @@ class LiveTrader:
 
                 if self.win_prob_model:
                     try:
-                        # 1. Get the exact feature names the model was trained on (excluding the 'const')
-                        model_features = self.win_prob_model.model.exog_names[1:]
-                        
-                        # 2. Create a dictionary from the live signal data
+                        # 0) Get ETH 4h MACD histogram for the feature the model expects
+                        eth_bar = await self._get_eth_macd_barometer()
+                        eth_hist = float(eth_bar.get("hist", 0.0)) if eth_bar else 0.0
+
+                        # 1) Feature names the model was trained on (excluding 'const')
+                        #    Works for statsmodels results pickled via joblib.
+                        model_features = [n for n in self.win_prob_model.model.exog_names if n != "const"]
+
+                        # 2) Assemble live features (names must match training)
                         live_data = {
-                            'rsi_at_entry': signal_obj.rsi,
-                            'adx_at_entry': signal_obj.adx,
-                            'price_boom_pct_at_entry': signal_obj.price_boom_pct,
-                            'price_slowdown_pct_at_entry': signal_obj.price_slowdown_pct,
-                            'vwap_z_at_entry': signal_obj.vwap_z_score,
-                            'ema_spread_pct_at_entry': (signal_obj.ema_fast - signal_obj.ema_slow) / signal_obj.ema_slow if signal_obj.ema_slow > 0 else 0,
-                            'is_ema_crossed_down_at_entry': int(signal_obj.is_ema_crossed_down), # Convert bool to int
-                            'day_of_week_at_entry': signal_obj.day_of_week,
-                            'hour_of_day_at_entry': signal_obj.hour_of_day
+                            "rsi_at_entry": signal_obj.rsi,
+                            "adx_at_entry": signal_obj.adx,
+                            "price_boom_pct_at_entry": signal_obj.price_boom_pct,
+                            "price_slowdown_pct_at_entry": signal_obj.price_slowdown_pct,
+                            "vwap_z_at_entry": signal_obj.vwap_z_score,
+                            "ema_spread_pct_at_entry": (
+                                (signal_obj.ema_fast - signal_obj.ema_slow) / signal_obj.ema_slow
+                                if signal_obj.ema_slow > 0 else 0.0
+                            ),
+                            "is_ema_crossed_down_at_entry": int(signal_obj.is_ema_crossed_down),
+                            "day_of_week_at_entry": int(signal_obj.day_of_week),
+                            "hour_of_day_at_entry": int(signal_obj.hour_of_day),
+                            "eth_macdhist_at_entry": eth_hist,   # <-- missing before
                         }
-                        
-                        # 3. Create a DataFrame from this dictionary, and explicitly order the columns
-                        #    to perfectly match the training data.
-                        features_df = pd.DataFrame([live_data], columns=model_features)
-                        
-                        # 4. Add the constant and predict
-                        features_df = sm.add_constant(features_df, prepend=True, has_constant='add')
-                        win_prob = self.win_prob_model.predict(features_df.values)[0]
-                        signal_obj.win_probability = float(win_prob)
-                        
+
+                        # 3) DataFrame and strict column alignment to model; fill missing with 0.0
+                        features_df = pd.DataFrame([live_data], index=[0])
+                        features_df = features_df.reindex(columns=model_features, fill_value=0.0).astype(float)
+
+                        # 4) Add constant and predict
+                        features_df = sm.add_constant(features_df, prepend=True, has_constant="add")
+                        win_prob = float(self.win_prob_model.predict(features_df)[0])
+                        # Clamp and store
+                        signal_obj.win_probability = max(0.0, min(1.0, win_prob))
+
                     except Exception as e:
                         LOG.warning(f"Failed to score signal for {symbol}: {e}")
-                # --- END OF FIX ---
+                        signal_obj.win_probability = 0.0
                 
                 return signal_obj
 
@@ -1641,7 +1651,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 Bot online v6.0")
+        await self.tg.send("🤖 LIVEFADER v7.0")
 
         try:
             async with asyncio.TaskGroup() as tg:
