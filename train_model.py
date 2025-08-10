@@ -12,10 +12,30 @@ import joblib
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 LOG = logging.getLogger(__name__)
 
+# --- THE FINAL, MOST POWERFUL FEATURE SET ---
 FEATURES = [
-    'rsi_at_entry', 'adx_at_entry', 'price_boom_pct_at_entry',
-    'price_slowdown_pct_at_entry', 'vwap_z_at_entry', 'ema_spread_pct_at_entry',
-    'is_ema_crossed_down_at_entry', 'day_of_week_at_entry', 'hour_of_day_at_entry'
+    # Core Indicators
+    'rsi_at_entry',
+    'adx_at_entry',
+    
+    # Price Action / Momentum
+    'price_boom_pct_at_entry',
+    'price_slowdown_pct_at_entry',
+    
+    # Volatility-Normalized Mean Reversion
+    'vwap_z_at_entry',
+    
+    # Trend Context
+    'ema_spread_pct_at_entry',
+    'is_ema_crossed_down_at_entry',
+    
+    # Time-Based Features
+    'day_of_week_at_entry',
+    'hour_of_day_at_entry',
+    
+    # --- THE CRITICAL ADDITION ---
+    # The most powerful predictive feature we have discovered.
+    'eth_macdhist_at_entry'
 ]
 TARGET = 'is_win'
 MODEL_FILE_NAME = "win_probability_model.joblib"
@@ -62,13 +82,8 @@ async def main():
 
         LOG.info(f"Training Regularized Logistic Regression model on {len(X)} data points...")
         
-        # --- THIS IS THE FINAL FIX ---
-        # We use the standard Logit class and call the .fit_regularized() method.
-        # This is a robust way to handle separation and create a stable model.
         logit_model = sm.Logit(y, X)
-        # 'l1' is a common and effective regularization method.
         result = logit_model.fit_regularized(method='l1', disp=False)
-        # --- END OF FIX ---
 
         LOG.info("Model training complete.")
         print("--- Regularized Logit Regression Results ---")
