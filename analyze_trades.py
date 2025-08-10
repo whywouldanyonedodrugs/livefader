@@ -194,6 +194,16 @@ def run_analysis(df: pd.DataFrame):
         )
         describe_categorical(df, "eth_macd_hist_band")
 
+    if 'eth_macdhist_1h_at_entry' in df.columns:
+        header("PERFORMANCE BY ETH MACD HISTOGRAM (1H)")
+        # We use different bins for the 1H MACD as it's a faster indicator
+        df['eth_macd_hist_1h_band'] = pd.cut(
+            df['eth_macdhist_1h_at_entry'],
+            bins=[-np.inf, -0.1, 0, 0.1, np.inf],
+            labels=["Strong Down", "Weak Down", "Weak Up", "Strong Up"]
+        )
+        describe_categorical(df, "eth_macd_hist_1h_band")
+
     describe_continuous(df, "mae_over_atr")
     describe_continuous(df, "mfe_over_atr")
     describe_continuous(df, "realized_vol_during_trade")
