@@ -209,3 +209,6 @@ async def main():
     finally:
         if conn: await conn.close()
         if exchange: await exchange.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
