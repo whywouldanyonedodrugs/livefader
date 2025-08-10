@@ -47,10 +47,13 @@ async def main():
 
         LOG.info(f"Found {len(trades_to_fix)} trades to process...")
 
-        for trade in tqdm(trades_to_fix, desc="Backfilling Trades"):
+        # --- FIX #2: Removed the tqdm wrapper for better asyncio stability ---
+        for trade in trades_to_fix:
             try:
                 trade_id = trade['id']
                 symbol = trade['symbol']
+                LOG.info(f"Processing trade ID: {trade_id} ({symbol})") # Add manual logging
+                
                 opened_at = trade['opened_at'].replace(tzinfo=timezone.utc)
                 closed_at = trade['closed_at'].replace(tzinfo=timezone.utc)
                 entry_price = float(trade['entry_price'])
@@ -145,7 +148,6 @@ async def main():
                 # --- NEW: Fetch and Calculate Historical ETH MACD ---
                 eth_macd_at_entry, eth_macdsignal_at_entry, eth_macdhist_at_entry = None, None, None
                 try:
-                    # Fetch 4h ETH data leading up to the trade's open time
                     since_ts_eth = int((opened_at - timedelta(days=50)).timestamp() * 1000)
                     eth_ohlcv = await exchange.fetch_ohlcv('ETHUSDT', '4h', since=since_ts_eth, limit=300)
                     if eth_ohlcv:
@@ -161,7 +163,6 @@ async def main():
                             eth_macdhist_at_entry = latest_macd['hist']
                 except Exception as e:
                     LOG.warning(f"Could not backfill ETH MACD for trade {trade_id}: {e}")
-                # --- END OF NEW SECTION ---
 
                 # --- Final Database Update ---
                 update_query = """
@@ -174,31 +175,32 @@ async def main():
                         is_ema_crossed_down_at_entry = $16,
                         ema_spread_pct_at_entry = $17,
                         vwap_consolidated_at_entry = $18,
-                        eth_macd_at_entry = $19, -- New
-                        eth_macdsignal_at_entry = $20, -- New
-                        eth_macdhist_at_entry = $21, -- New
+                        eth_macd_at_entry = $19,
+                        eth_macdsignal_at_entry = $20,
+                        eth_macdhist_at_entry = $21
                     WHERE id = $22
                 """
                 await conn.execute(
-                    update_query, pnl, pnl_pct, inferred_exit_reason, holding_minutes,
+                    update_query,
+                    pnl, pnl_pct, inferred_exit_reason, holding_minutes,
                     rsi_at_entry, adx_at_entry, ema_fast_at_entry, ema_slow_at_entry,
                     ret_30d_at_entry, mae_usd, mfe_usd, mae_over_atr, mfe_over_atr,
                     vwap_dev_pct_at_entry, vwap_z_at_entry,
                     is_ema_crossed_down_at_entry,
                     ema_spread_pct_at_entry,
-                    bool(vwap_consolidated_at_entry),
+                    vwap_consolidated_at_entry,
                     eth_macd_at_entry,
                     eth_macdsignal_at_entry,
                     eth_macdhist_at_entry,
                     trade_id
                 )
 
+
             except Exception as e:
                 LOG.error(f"Failed to backfill trade ID {trade['id']} ({trade['symbol']}): {e}", exc_info=True)
                 continue
             
-            # --- FIX #2: Add a small delay to respect API rate limits ---
-            await asyncio.sleep(0.5) # Sleep for 500ms
+            await asyncio.sleep(0.5)
 
         LOG.info("Comprehensive backfilling process complete.")
 
@@ -207,6 +209,3 @@ async def main():
     finally:
         if conn: await conn.close()
         if exchange: await exchange.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
