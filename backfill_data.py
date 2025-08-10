@@ -127,6 +127,7 @@ async def main():
                 df5m['vwap_dev_pct'] = (df5m['close'] - vwap) / vwap
                 df5m['vwap_ok'] = df5m['vwap_dev_pct'].abs() <= cfg.GAP_MAX_DEV_PCT
                 df5m['vwap_consolidated'] = df5m['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
+                vwap_consolidated_at_entry = bool(df5m['vwap_consolidated'].iloc[-1])
                 
                 vwap_consolidated_at_entry = df5m['vwap_consolidated'].iloc[-1]
 
