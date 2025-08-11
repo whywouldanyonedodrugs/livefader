@@ -4,13 +4,20 @@ import argparse
 import joblib
 import numpy as np
 import pandas as pd
+
+# ---- robust path guard so imports work regardless of CWD ----
+import sys, pathlib
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # .../src
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from research.modeling.splits import PurgedKFold
+from research.modeling.pipeline import build_pipeline
+from research.modeling.calibration import fit_with_best_calibration
+from research.modeling.metrics import calibration_table, ece
+from research.modeling.multiple_tests import deflated_sharpe_ratio
+from research.reports.winprob_eval import write_reports
 from sklearn.metrics import roc_auc_score, brier_score_loss
-from ..modeling.splits import PurgedKFold
-from ..modeling.pipeline import build_pipeline
-from ..modeling.calibration import fit_with_best_calibration
-from ..modeling.metrics import calibration_table, ece
-from ..modeling.multiple_tests import deflated_sharpe_ratio
-from ..reports.winprob_eval import write_reports
 
 class CalibratedModelBundle:
     """
@@ -41,14 +48,14 @@ def main():
 
     # Build pipeline on available columns
     pipe, cont, cat, cyc = build_pipeline(df)
-    # Columns pipeline expects (in DF order)
     feature_names = []
     feature_names += cont
     feature_names += cat
     feature_names += cyc
+
     X = df[feature_names].copy()
     y = df["y"].astype(int).values
-    order = df["order_idx"].values
+    order = df["order_idx"].values if "order_idx" in df.columns else np.arange(len(df))
 
     # Purged K-Fold with embargo
     cv = list(PurgedKFold(n_splits=5, embargo=args.embargo_bars).split(X, y, order=order))
@@ -65,22 +72,20 @@ def main():
     print(f"OOF AUC={auc:.4f}  Brier={brier:.5f}  (baseline approx={baseline:.5f})  N={len(df)}")
     print(f"ECE={ece(y,oof):.5f}")
 
-    # Very rough DSR on a dummy equity curve = (y - oof) proxy not meaningful;
-    # Instead, approximate per-trade edge by (2*y-1) and cumulate; you’ll replace with true P&L stream.
+    # Approx DSR on simple edge proxy
     edge = (2*y - 1).astype(float)
     dsr = deflated_sharpe_ratio(edge, sr_benchmark=0.0, trials=3)
     print(f"DSR (approx)={dsr:.3f}")
 
-    # Fit final model on full data using best calibration = sigmoid (safer on small N) vs isotonic if better OOS
+    # Fit final model on full data choosing best calibration (sigmoid vs isotonic)
     final_model, scores = fit_with_best_calibration(pipe, X, y, cv=5)
-    print(f"Calibration scores: {scores} → using {min(scores, key=scores.get)}")
+    best = min(scores, key=scores.get)
+    print(f"Calibration scores: {scores} → using {best}")
 
-    # Export bundle that mimics statsmodels interface expected by live bot
     bundle = CalibratedModelBundle(final_model, feature_names)
     joblib.dump(bundle, args.model_out)
     print(f"Saved calibrated model to {args.model_out}")
 
-    # Write research reports
     os.makedirs(args.report_dir, exist_ok=True)
     write_reports(y, oof, args.report_dir)
     print(f"Reports written to {args.report_dir}")
