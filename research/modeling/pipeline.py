@@ -15,7 +15,6 @@ def _hour_cyc(X) -> np.ndarray:
     NaNs -> 0, values wrapped into [0,24).
     Returns array of shape (n, 2): [sin(hour), cos(hour)].
     """
-    # Coerce to ndarray (n, 1)
     if hasattr(X, "to_numpy"):
         arr = X.to_numpy()
     else:
@@ -23,7 +22,6 @@ def _hour_cyc(X) -> np.ndarray:
     arr = np.asarray(arr, dtype=float)
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
-    # Take first (and only) column, impute inside fn just in case
     h = arr[:, 0]
     h = np.nan_to_num(h, nan=0.0)
     h = np.mod(h, 24.0)
@@ -31,18 +29,21 @@ def _hour_cyc(X) -> np.ndarray:
     return np.c_[np.sin(angle), np.cos(angle)]
 
 def _make_ohe():
-    """
-    Build OneHotEncoder that works across sklearn versions (sparse_output vs sparse).
-    """
+    """Build OneHotEncoder compatible across sklearn versions."""
     try:
-        # sklearn >= 1.2
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
-        # older sklearn
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
+def _non_empty(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    """Keep only columns that have at least one non-NaN entry."""
+    keep = []
+    for c in cols:
+        if c in df.columns and pd.to_numeric(df[c], errors="coerce").notna().any():
+            keep.append(c)
+    return keep
+
 def build_feature_lists(df_cols: List[str]) -> Tuple[List[str], List[str], List[str]]:
-    # Continuous-ish features
     cont = [
         "rsi_at_entry","adx_at_entry",
         "price_boom_pct_at_entry","price_slowdown_pct_at_entry",
@@ -51,20 +52,22 @@ def build_feature_lists(df_cols: List[str]) -> Tuple[List[str], List[str], List[
         "funding_last_at_entry","oi_last_at_entry","oi_delta_pct_win",
         "listing_age_days_at_entry",
     ]
-    cont = [c for c in cont if c in df_cols]
-
-    # Categorical
     cat = ["day_of_week_at_entry", "session_tag_at_entry", "vwap_consolidated_at_entry"]
+    cyc = ["hour_of_day_at_entry"]
+
+    # presence filter only (we’ll apply non-empty filter in build_pipeline with df)
+    cont = [c for c in cont if c in df_cols]
     cat = [c for c in cat if c in df_cols]
-
-    # Cyclical (hour-of-day encoded to sin/cos)
-    cyc_hour = "hour_of_day_at_entry" if "hour_of_day_at_entry" in df_cols else None
-    cyc = [cyc_hour] if cyc_hour else []
-
+    cyc = [c for c in cyc if c in df_cols]
     return cont, cat, cyc
 
 def build_pipeline(df: pd.DataFrame):
     cont, cat, cyc = build_feature_lists(df.columns.tolist())
+
+    # NEW: drop NaN-only columns to avoid SimpleImputer warnings
+    cont = _non_empty(df, cont)
+    cat  = _non_empty(df, cat)
+    cyc  = _non_empty(df, cyc)
 
     transformers = []
 
@@ -92,7 +95,7 @@ def build_pipeline(df: pd.DataFrame):
     pre = ColumnTransformer(
         transformers,
         remainder="drop",
-        verbose_feature_names_out=False  # keep nice column names post-transform
+        verbose_feature_names_out=False
     )
 
     base = LogisticRegression(

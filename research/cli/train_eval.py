@@ -7,6 +7,8 @@ import pandas as pd
 
 # ---- robust sys.path guard ----
 import sys, pathlib
+from types import SimpleNamespace
+
 THIS = pathlib.Path(__file__).resolve()
 PKG_ROOT = THIS.parents[1]   # .../research
 SRC_ROOT = THIS.parents[2]   # .../src
@@ -28,14 +30,14 @@ class CalibratedModelBundle:
     Adapter so live code can keep using:
       - .model.exog_names (with a 'const')
       - .predict(X_dataframe) -> probabilities
+    TOP-LEVEL + SimpleNamespace so it's picklable.
     """
     def __init__(self, sk_model, feature_names):
         self.sk_model = sk_model
-        class _ModelLike:
-            def __init__(self, names): self.exog_names = ["const"] + names
-        self.model = _ModelLike(feature_names)
+        self.model = SimpleNamespace(exog_names=["const"] + list(feature_names))
 
     def predict(self, X_df: pd.DataFrame):
+        # our sklearn model exposes predict_proba
         return self.sk_model.predict_proba(X_df)[:, 1]
 
 def main():
@@ -70,7 +72,6 @@ def main():
             model, _ = fit_with_best_calibration(pipe, X.iloc[tr], y_tr, cv=3)
             oof[te] = model.predict_proba(X.iloc[te])[:, 1]
         except Exception as e:
-            # last-resort guard: use base rate if calibration/pipeline fails
             print(f"[WARN] fold failed ({e}); using base-rate for OOF slice")
             oof[te] = float(np.mean(y_tr))
 
@@ -86,7 +87,6 @@ def main():
 
     # Final fit on full data (with calibration selection)
     if np.unique(y).size < 2:
-        # dataset degenerate: constant model
         dummy = DummyClassifier(strategy="constant", constant=int(np.round(y.mean())))
         dummy.fit(X, y)
         final_model = dummy

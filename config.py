@@ -92,7 +92,7 @@ VWAP_STACK_FRAC_MIN: 0.50           # at least half the window near VWAP
 VWAP_STACK_FRAC_GOOD: 0.70          # solid consolidation
 
 # convert “signal quality” → risk scaling
-VWAP_STACK_MIN_MULTIPLIER: 0.20     # never risk below 20% of base (still “sizing filter”, not a veto)
+VWAP_STACK_MIN_MULTIPLIER: 1.00     # never risk below 20% of base (still “sizing filter”, not a veto)
 VWAP_STACK_MAX_MULTIPLIER: 1.00     # cap at base risk for now (can raise later to 1.2)
 VWAP_STACK_FRAC_WEIGHT: 0.6         # weight on consolidation quality
 VWAP_STACK_EXP_WEIGHT: 0.4          # weight on expansion
