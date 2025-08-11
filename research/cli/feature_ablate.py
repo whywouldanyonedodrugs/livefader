@@ -47,6 +47,22 @@ def _oof_preds(df: pd.DataFrame, feats: List[str], embargo: int) -> np.ndarray:
         return np.full(len(df), prior, dtype=float)
 
     X = df_small[used_feats]
+
+    all_nan_cols = [c for c in X.columns if X[c].isna().all()]
+    if all_nan_cols:
+        print(f"[ABATE] Dropping all-NaN features: {all_nan_cols}")
+        X = X.drop(columns=all_nan_cols)
+
+        # Remove all-NaN features from groups and drop groups that become empty
+        cleaned_groups = {}
+        for g, cols in feature_groups.items():
+            kept = [c for c in cols if c in X.columns]
+            if kept:
+                cleaned_groups[g] = kept
+            else:
+                print(f"[ABATE] Skipping empty group: {g}")
+        feature_groups = cleaned_groups
+
     y = df["y"].astype(int).values
     order = df["order_idx"].values if "order_idx" in df.columns else np.arange(len(df))
 
