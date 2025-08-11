@@ -42,8 +42,12 @@ PRICE_SLOWDOWN_PCT      = 0.01
 # ── risk sizing ────────────────────────────────────────────────────────────
 RISK_MODE          = "FIXED"     # or "FIXED"
 FIXED_RISK_USDT    = 10.0
+
 RISK_PCT           = 0.05         # 0.5 %
 SLIPPAGE_BUFFER_PCT = 0.0005
+
+WINPROB_SIZE_FLOOR = 1.00
+WINPROB_SIZE_CAP   = 1.00
 
 # ── stop / targets ─────────────────────────────────────────────────────────
 SL_ATR_MULT             = 1.8
@@ -81,21 +85,21 @@ GAP_MIN_BARS    = 3
 # VWAP_LEN = 15
 
 # --- Working ---
-VWAP_STACK_SIZING_ENABLED: True
+VWAP_STACK_SIZING_ENABLED = True
 
 # how we compute the features
-VWAP_STACK_LOOKBACK_BARS: 12        # on 5m bars ≈ 1 hour
-VWAP_STACK_BAND_PCT: 0.004          # ±0.40% “near value” band
-VWAP_STACK_EXPANSION_ABS_MIN: 0.006 # 0.6% – below this, treat as very weak
-VWAP_STACK_EXPANSION_GOOD: 0.015    # 1.5% – good expansion
-VWAP_STACK_FRAC_MIN: 0.50           # at least half the window near VWAP
-VWAP_STACK_FRAC_GOOD: 0.70          # solid consolidation
+VWAP_STACK_LOOKBACK_BARS = 12        # on 5m bars ≈ 1 hour
+VWAP_STACK_BAND_PCT = 0.004          # ±0.40% “near value” band
+VWAP_STACK_EXPANSION_ABS_MIN = 0.006 # 0.6% – below this, treat as very weak
+VWAP_STACK_EXPANSION_GOOD = 0.015    # 1.5% – good expansion
+VWAP_STACK_FRAC_MIN = 0.50           # at least half the window near VWAP
+VWAP_STACK_FRAC_GOOD = 0.70          # solid consolidation
 
 # convert “signal quality” → risk scaling
-VWAP_STACK_MIN_MULTIPLIER: 0.80     # never risk below 20% of base (still “sizing filter”, not a veto)
-VWAP_STACK_MAX_MULTIPLIER: 1.00     # cap at base risk for now (can raise later to 1.2)
-VWAP_STACK_FRAC_WEIGHT: 0.6         # weight on consolidation quality
-VWAP_STACK_EXP_WEIGHT: 0.4          # weight on expansion
+VWAP_STACK_MIN_MULTIPLIER = 0.80     # never risk below 20% of base (still “sizing filter”, not a veto)
+VWAP_STACK_MAX_MULTIPLIER = 1.00     # cap at base risk for now (can raise later to 1.2)
+VWAP_STACK_FRAC_WEIGHT = 0.6         # weight on consolidation quality
+VWAP_STACK_EXP_WEIGHT = 0.4          # weight on expansion
 
 # --- Volume Filter (Applied during Scouting) ---
 VOL_FILTER_ENABLED  = False
@@ -164,16 +168,16 @@ SYMBOL_COOLDOWN_HOURS = 4    # skip new signals for the same symbol during X h
 # Parameters for the live market regime detector.
 
 # The benchmark asset to determine the overall market state (e.g., BTCUSDT, ETHUSDT).
-REGIME_BENCHMARK_SYMBOL: "BTCUSDT"
+REGIME_BENCHMARK_SYMBOL = "BTCUSDT"
 
 # How many minutes to cache the calculated regime before re-calculating.
 # A value of 60 means it will run the calculation at most once per hour.
-REGIME_CACHE_MINUTES: 60
+REGIME_CACHE_MINUTES = 60
 
 # --- Parameters for the Trend Regime (TMA + Keltner Channel) ---
-REGIME_MA_PERIOD: 100       # Long-term moving average period.
-REGIME_ATR_PERIOD: 20       # ATR period for Keltner Channel width.
-REGIME_ATR_MULT: 2.0        # ATR multiplier for the Keltner bands.
+REGIME_MA_PERIOD = 100       # Long-term moving average period.
+REGIME_ATR_PERIOD = 20       # ATR period for Keltner Channel width.
+REGIME_ATR_MULT = 2.0        # ATR multiplier for the Keltner bands.
 
 
 # --- ETH MACD BAROMETER FILTER (NEW) ---

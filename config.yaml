@@ -1,3 +1,120 @@
-# config.yaml
-# Anything omitted here falls back to config.py.
-# Values below reproduce the sample you posted and add a few overrides for testing.
+# ===== Risk & Sizing =====
+RISK_MODE: fixed           # fixed | percent
+RISK_USD: 10.0             # used when RISK_MODE=fixed  (your code looks for RISK_USD)
+RISK_EQUITY_PCT: 0.01      # used when RISK_MODE=percent (1% of equity)
+
+# Optional caps (if omitted, no clamping is applied by code)
+RISK_USD_MIN: 
+RISK_USD_MAX: 20
+
+# Win-probability sizing
+WINPROB_SIZING_ENABLED: true    # set false to fully disable its influence
+WINPROB_SIZE_FLOOR: 1.00        # lower bound of wp range (only used if enabled)
+WINPROB_SIZE_CAP:   1.00        # upper bound of wp range (only used if enabled)
+
+# VWAP stack → sizing
+VWAP_STACK_SIZING_ENABLED: true    # set false to fully disable its influence
+VWAP_STACK_LOOKBACK_BARS: 12
+VWAP_STACK_BAND_PCT: 0.004
+VWAP_STACK_EXPANSION_ABS_MIN: 0.006
+VWAP_STACK_EXPANSION_GOOD:    0.015
+VWAP_STACK_FRAC_MIN:  0.50
+VWAP_STACK_FRAC_GOOD: 0.70
+VWAP_STACK_MIN_MULTIPLIER: 1.00   # set both min/max to 1.00 to neutralize even if enabled
+VWAP_STACK_MAX_MULTIPLIER: 1.00
+VWAP_STACK_FRAC_WEIGHT: 0.6
+VWAP_STACK_EXP_WEIGHT: 0.4
+
+# ETH MACD barometer
+ETH_BAROMETER_ENABLED: true
+ETH_MACD_HIST_CUTOFF_POS: 0.0   # threshold for “unfavorable”
+ETH_UNFAV_SIZE_MULT: 0.2        # risk multiplier when unfavorable
+# (Note: keys UNFAVORABLE_MODE/UNFAVORABLE_RISK_RESIZE_FACTOR from config.py are NOT used by live sizing right now.)
+
+# ===== Stops / Targets =====
+SL_ATR_MULT: 1.8
+FINAL_TP_ENABLED: true
+FINAL_TP_ATR_MULT: 1.0
+PARTIAL_TP_ENABLED: false
+PARTIAL_TP_PCT: 1.0
+PARTIAL_TP_ATR_MULT: 1.0
+TRAIL_ENABLED: false
+TRAIL_START_ATR_MULT: 1.0
+TRAIL_DISTANCE_ATR_MULT: 1.0
+TRAIL_MIN_MOVE_PCT: 0.001
+
+# Time exits
+TIME_EXIT_HOURS_ENABLED: true
+TIME_EXIT_HOURS: 4
+TIME_EXIT_ENABLED: true           # fallback if hourly disabled
+TIME_EXIT_DAYS: 10
+
+# ===== Entry Filters =====
+EMA_FILTER_ENABLED: false
+EMA_TIMEFRAME: "4h"
+EMA_FAST_PERIOD: 20
+EMA_SLOW_PERIOD: 200
+
+RSI_TIMEFRAME: "1h"
+RSI_PERIOD: 14
+RSI_ENTRY_MIN: 30
+RSI_ENTRY_MAX: 70
+
+ADX_FILTER_ENABLED: false
+ADX_TIMEFRAME: "1h"
+ADX_PERIOD: 14
+ADX_MIN: 10
+ADX_MAX: 25
+
+# Structural trend (long-term)
+STRUCTURAL_TREND_FILTER_ENABLED: false
+STRUCTURAL_TREND_DAYS: 30
+STRUCTURAL_TREND_RET_PCT: 0.01
+
+# Boom/slowdown rules
+PRICE_BOOM_PERIOD_H: 24
+PRICE_BOOM_PCT: 0.15
+PRICE_SLOWDOWN_PERIOD_H: 4
+PRICE_SLOWDOWN_PCT: 0.01
+
+# Legacy VWAP “gap” filter (off by default)
+GAP_FILTER_ENABLED: false
+GAP_VWAP_HOURS: 2
+GAP_MAX_DEV_PCT: 1.00
+GAP_MIN_BARS: 3
+
+# Volume/volatility filters (used during scouting if enabled)
+VOL_FILTER_ENABLED: false
+MIN_VOL_USD: 10000
+MAX_VOL_USD: 5000000000
+
+VOLATILITY_FILTER_ENABLED: false
+MIN_ATR_PCT: 0.005
+
+# ===== Portfolio / Safety =====
+MAX_OPEN: 30
+MAX_LOSS_STREAK: 10
+KILL_EQUITY_LEVEL: 100.0
+MIN_EQUITY_USDT: 100.0
+MAX_LEVERAGE: 10
+MIN_NOTIONAL: 0.001
+MIN_STOP_DIST_USD: 0.0002
+MIN_STOP_DIST_PCT: 0.0008
+
+DD_PAUSE_ENABLED: true
+DD_MAX_PCT: 50.0
+DD_COOLDOWN_PCT: 50.0
+DD_COOLDOWN_DURATION_H: 6
+
+# ===== Runtime / Misc =====
+SCAN_INTERVAL_SEC: 60
+TIMEFRAME: "5m"
+ENTRY_ORDER_TYPE: "MARKET"
+SYMBOL_COOLDOWN_HOURS: 1
+
+# Market regime detector
+REGIME_BENCHMARK_SYMBOL: "BTCUSDT"
+REGIME_CACHE_MINUTES: 60
+REGIME_MA_PERIOD: 100
+REGIME_ATR_PERIOD: 20
+REGIME_ATR_MULT: 2.0
