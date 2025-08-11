@@ -35,7 +35,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 import config as cfg
 from . import indicators as ta
-from indicators import vwap_stack_features
+from live.indicators import vwap_stack_features
 from . import filters
 from . shared_utils import is_blacklisted
 from watchdog.events import FileSystemEventHandler
