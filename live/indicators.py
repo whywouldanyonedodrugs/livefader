@@ -141,41 +141,80 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def vwap_stack_features(df: pd.DataFrame, lookback_bars: int = 12, band_pct: float = 0.004):
     """
-    df: columns ['open','high','low','close','volume'] ascending.
+    Compute VWAP-stack features from a 5m OHLCV DataFrame with columns:
+    ['ts','open','high','low','close','volume'] in ascending time.
+
     Returns:
-      vwap_frac_in_band: share of prior window closes inside ±band_pct around rolling VWAP (current bar excluded)
-      vwap_expansion_pct: |last_close / current_vwap - 1|
-      vwap_slope_pph: VWAP slope (percent per hour) over the last hour (approx)
+      {
+        "vwap_frac_in_band": float in [0,1],
+        "vwap_expansion_pct": abs(close/vwap - 1),
+        "vwap_slope_pph": slope of rolling VWAP (% per hour) over ~lookback
+      }
     """
-    px = df["close"].astype(float).values
-    vol = df["volume"].astype(float).values
+    out0 = {"vwap_frac_in_band": 0.0, "vwap_expansion_pct": 0.0, "vwap_slope_pph": 0.0}
+
+    if df is None or df.empty:
+        return out0
+
+    # Ensure numeric types
+    df = df.copy()
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
     n = len(df)
-    if n < lookback_bars + 2 or np.nansum(vol) == 0:
-        return {"vwap_frac_in_band": 0.0, "vwap_expansion_pct": 0.0, "vwap_slope_pph": 0.0}
+    # Need at least lookback+2 bars so we can exclude the current (last) bar for consolidation
+    if n < lookback_bars + 2:
+        return out0
 
+    # Rolling VWAP over 'lookback_bars'
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    tpv = (tp * df["volume"]).rolling(lookback_bars).sum()
-    vv = df["volume"].rolling(lookback_bars).sum()
-    rvwap = (tpv / vv).shift(1)  # exclude current bar for consolidation check
+    vol = df["volume"].fillna(0.0)
 
-    cur_close = df["close"].iloc[-1]
+    # Sum over window; vv can be 0 if volume sums to zero
+    tpv = (tp * vol).rolling(lookback_bars, min_periods=lookback_bars).sum()
+    vv = vol.rolling(lookback_bars, min_periods=lookback_bars).sum()
+
+    # If the most recent window has no volume, bail safely
+    if not np.isfinite(vv.iloc[-1]) or vv.iloc[-1] == 0:
+        return out0
+
+    # Current rolling VWAP (unshifted) → for expansion on the last completed bar
     cur_vwap = (tpv / vv).iloc[-1]
+    cur_close = float(df["close"].iloc[-1])
+    expansion = abs(cur_close / cur_vwap - 1.0) if np.isfinite(cur_vwap) and cur_vwap != 0 else 0.0
 
-    prior = df.iloc[-(lookback_bars+1):-1].copy()
-    vwap_prior = rvwap.iloc[-(lookback_bars): -0].values
-    band_hi = vwap_prior * (1 + band_pct)
-    band_lo = vwap_prior * (1 - band_pct)
-    closes_prior = prior["close"].astype(float).values
-    in_band = (closes_prior >= band_lo) & (closes_prior <= band_hi)
-    frac = float(in_band.mean()) if len(in_band) else 0.0
+    # Consolidation window: previous 'lookback_bars' bars ending at -1 (exclude current)
+    # Use the SAME index range for closes and RVWAP so lengths match.
+    prior_slice = slice(-lookback_bars - 1, -1)
 
-    expansion = abs(cur_close / cur_vwap - 1.0) if cur_vwap and np.isfinite(cur_vwap) else 0.0
+    rvwap = (tpv / vv)  # already aligned to bar closes
+    prior_vwap = rvwap.iloc[prior_slice].to_numpy()
+    prior_close = df["close"].iloc[prior_slice].to_numpy()
 
-    k = min(lookback_bars, 12)
-    vsub = (tpv.iloc[-k:] / vv.iloc[-k:]).values
-    slope = (vsub[-1] - vsub[0]) / vsub[0] if (len(vsub) >= 2 and vsub[0]) else 0.0
-    slope_pph = float(slope * (60/5) / k)  # convert to percent-per-hour on 5m bars
+    # Drop any pairs where VWAP is NaN/inf
+    m = np.isfinite(prior_vwap) & np.isfinite(prior_close)
+    prior_vwap = prior_vwap[m]
+    prior_close = prior_close[m]
 
-    return {"vwap_frac_in_band": float(frac),
-            "vwap_expansion_pct": float(expansion),
-            "vwap_slope_pph": float(slope_pph)}
+    if prior_vwap.size == 0 or prior_close.size == 0:
+        return out0
+
+    band_hi = prior_vwap * (1.0 + band_pct)
+    band_lo = prior_vwap * (1.0 - band_pct)
+    in_band = (prior_close >= band_lo) & (prior_close <= band_hi)
+    frac = float(in_band.mean())
+
+    # Slope of RVWAP over a short recent span (cap to 12 bars)
+    k = int(min(lookback_bars, 12))
+    vsub = rvwap.iloc[-k:].to_numpy()
+    if k >= 2 and np.isfinite(vsub[0]) and vsub[0] != 0 and np.isfinite(vsub[-1]):
+        slope = (vsub[-1] - vsub[0]) / vsub[0]           # fraction over k bars
+        slope_pph = float(slope * (60 / 5) / k)          # percent-per-hour on 5m bars
+    else:
+        slope_pph = 0.0
+
+    return {
+        "vwap_frac_in_band": float(max(0.0, min(1.0, frac))),
+        "vwap_expansion_pct": float(expansion),
+        "vwap_slope_pph": float(slope_pph),
+    }
