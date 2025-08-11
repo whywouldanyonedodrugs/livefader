@@ -486,10 +486,11 @@ class LiveTrader:
     async def _scan_symbol_for_signal(self, symbol: str, market_regime: str, eth_macd: Optional[dict]) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
+            # ---- Timeframes & OHLCV fetch ----
             base_tf = self.cfg.get('TIMEFRAME', '5m')
-            ema_tf = self.cfg.get('EMA_TIMEFRAME', '4h')
-            rsi_tf = self.cfg.get('RSI_TIMEFRAME', '1h')
-            atr_tf = self.cfg.get('ADX_TIMEFRAME', '1h')
+            ema_tf  = self.cfg.get('EMA_TIMEFRAME', '4h')
+            rsi_tf  = self.cfg.get('RSI_TIMEFRAME', '1h')
+            atr_tf  = self.cfg.get('ADX_TIMEFRAME', '1h')
             required_tfs = {base_tf, ema_tf, rsi_tf, atr_tf, '1d'}
 
             async with self.api_semaphore:
@@ -497,7 +498,7 @@ class LiveTrader:
                 results = await asyncio.gather(*tasks.values(), return_exceptions=True)
                 ohlcv_data = dict(zip(tasks.keys(), results))
 
-            dfs = {}
+            dfs: dict[str, pd.DataFrame] = {}
             for tf, data in ohlcv_data.items():
                 if isinstance(data, Exception) or not data:
                     LOG.debug("Could not fetch OHLCV for %s on %s timeframe.", symbol, tf)
@@ -505,45 +506,56 @@ class LiveTrader:
                 df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
                 df.set_index('timestamp', inplace=True)
-                
+
+                # Stale/illiquid check on the most recent 100 completed bars
                 recent_candles = df.tail(100)
                 if not recent_candles.empty:
                     zero_volume_pct = (recent_candles['volume'] == 0).sum() / len(recent_candles)
                     if zero_volume_pct > 0.25:
-                        LOG.warning("DATA_ERROR for %s on %s: Detected stale data (%.0f%% zero volume). Skipping symbol.", symbol, tf, zero_volume_pct * 100)
+                        LOG.warning("DATA_ERROR for %s on %s: Detected stale data (%.0f%% zero volume). Skipping.",
+                                    symbol, tf, zero_volume_pct * 100)
                         return None
 
-                df.drop(df.index[-1], inplace=True)
-                if df.empty: return None
+                # Drop the last (possibly incomplete) bar
+                if len(df) < 3:
+                    return None
+                df = df.iloc[:-1]
+                if df.empty:
+                    return None
                 dfs[tf] = df
 
             df5 = dfs[base_tf]
 
+            # ---- Indicators aligned to base_tf index ----
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
-            df5['rsi'] = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
-            df5['atr'] = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
-            df5['adx'] = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
+            df5['rsi']      = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
+            df5['atr']      = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
+            df5['adx']      = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
+            # ---- VWAP-stack features (safe; no signal_obj here) ----
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
             band_pct = float(self.cfg.get("VWAP_STACK_BAND_PCT", 0.004))
+            try:
+                vw = vwap_stack_features(df5[['open','high','low','close','volume']].copy(),
+                                        lookback_bars=lookback, band_pct=band_pct)
+                vwap_frac  = float(vw.get("vwap_frac_in_band", 0.0))
+                vwap_exp   = float(vw.get("vwap_expansion_pct", 0.0))
+                vwap_slope = float(vw.get("vwap_slope_pph", 0.0))
+            except Exception as e:
+                LOG.error("VWAP-stack calc failed for %s: %s", symbol, e)
+                vwap_frac = vwap_exp = vwap_slope = 0.0
 
-            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe="5m", limit=max(200, lookback+20))
-            df5 = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
-
-            vw = vwap_stack_features(df5, lookback_bars=lookback, band_pct=band_pct)
-            signal_obj.vwap_stack_frac = vw["vwap_frac_in_band"]
-            signal_obj.vwap_stack_expansion_pct = vw["vwap_expansion_pct"]
-            signal_obj.vwap_stack_slope_pph = vw["vwap_slope_pph"]
-
-            tf_minutes = 5
+            # ---- Boom/slowdown & GAP VWAP (existing logic) ----
+            tf_minutes = 5  # base_tf is '5m' in your config
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
             df5['price_boom_ago'] = df5['close'].shift(boom_bars)
             df5['price_slowdown_ago'] = df5['close'].shift(slowdown_bars)
 
             df1d = dfs['1d']
-            ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
+            ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) \
+                    if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
 
             vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
             vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
@@ -557,10 +569,10 @@ class LiveTrader:
             df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
 
             df5.dropna(inplace=True)
-            if df5.empty: return None
+            if df5.empty:
+                return None
 
             last = df5.iloc[-1]
-            
             is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
             now_utc = datetime.now(timezone.utc)
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
@@ -591,25 +603,25 @@ class LiveTrader:
                 current_dev_ok = last.get('vwap_ok', False)
                 vwap_log_msg = f"{'✅' if last['vwap_consolidated'] else '❌'} (Streak Failed) | Current Dev: {'✅' if current_dev_ok else '❌'} ({vwap_dev_str})"
 
-            # --- THIS IS THE LOGGING BLOCK THAT WAS MISSING ---
             LOG.debug(
                 f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
                 f"  [Base Timeframe: {base_tf}]\n"
-                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h lookback): {'✅' if price_boom else '❌'} (is {boom_ret_pct:+.2%})\n"
-                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h lookback): {'✅' if price_slowdown else '❌'} (is {slowdown_ret_pct:+.2%})\n"
+                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h): {'✅' if price_boom else '❌'} ({boom_ret_pct:+.2%})\n"
+                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h): {'✅' if price_slowdown else '❌'} ({slowdown_ret_pct:+.2%})\n"
                 f"  - EMA Trend Down ({ema_tf}):      {ema_log_msg}\n"
                 f"  --------------------------------------------------\n"
                 f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
                 f"  - 30d Trend Filter:        {trend_log_msg}\n"
                 f"  - VWAP Consolidated:       {vwap_log_msg}\n"
                 f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
+                f"  - VWAP stack: frac={vwap_frac:.2f}, exp={vwap_exp*100:.2f}%, slope_pph={vwap_slope:.4f}\n"
                 f"====================================================\n"
             )
-            # --- END OF MISSING BLOCK ---
 
+            # ---- Entry gate ----
             if price_boom and price_slowdown and ema_down:
                 LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, last['close'])
-                
+
                 signal_obj = Signal(
                     symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
                     rsi=float(last['rsi']), adx=float(last['adx']), atr_pct=atr_pct,
@@ -623,17 +635,18 @@ class LiveTrader:
                     is_ema_crossed_down=bool(is_ema_crossed_down)
                 )
 
+                # attach VWAP-stack diagnostics to the signal (used later for sizing + DB)
+                signal_obj.vwap_stack_frac = vwap_frac
+                signal_obj.vwap_stack_expansion_pct = vwap_exp
+                signal_obj.vwap_stack_slope_pph = vwap_slope
+
+                # ---- Win-prob scoring (if model present) ----
                 if self.win_prob_model:
                     try:
-                        # 0) Get ETH 4h MACD histogram for the feature the model expects
                         eth_bar = await self._get_eth_macd_barometer()
                         eth_hist = float(eth_bar.get("hist", 0.0)) if eth_bar else 0.0
 
-                        # 1) Feature names the model was trained on (excluding 'const')
-                        #    Works for statsmodels results pickled via joblib.
                         model_features = [n for n in self.win_prob_model.model.exog_names if n != "const"]
-
-                        # 2) Assemble live features (names must match training)
                         live_data = {
                             "rsi_at_entry": signal_obj.rsi,
                             "adx_at_entry": signal_obj.adx,
@@ -647,23 +660,17 @@ class LiveTrader:
                             "is_ema_crossed_down_at_entry": int(signal_obj.is_ema_crossed_down),
                             "day_of_week_at_entry": int(signal_obj.day_of_week),
                             "hour_of_day_at_entry": int(signal_obj.hour_of_day),
-                            "eth_macdhist_at_entry": eth_hist,   # <-- missing before
+                            "eth_macdhist_at_entry": eth_hist,
                         }
-
-                        # 3) DataFrame and strict column alignment to model; fill missing with 0.0
                         features_df = pd.DataFrame([live_data], index=[0])
                         features_df = features_df.reindex(columns=model_features, fill_value=0.0).astype(float)
-
-                        # 4) Add constant and predict
                         features_df = sm.add_constant(features_df, prepend=True, has_constant="add")
                         win_prob = float(self.win_prob_model.predict(features_df)[0])
-                        # Clamp and store
                         signal_obj.win_probability = max(0.0, min(1.0, win_prob))
-
                     except Exception as e:
-                        LOG.warning(f"Failed to score signal for {symbol}: {e}")
+                        LOG.warning("Failed to score signal for %s: %s", symbol, e)
                         signal_obj.win_probability = 0.0
-                
+
                 return signal_obj
 
             return None
