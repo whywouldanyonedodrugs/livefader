@@ -859,10 +859,23 @@ class LiveTrader:
             base_risk_usd = max(0.0, latest_eq * pct) if latest_eq > 0 else fixed_risk
 
         # --- Multipliers (environmental & model) ---
-        # 1) ETH barometer (your existing logic)
+        # 1) ETH barometer (inline – async safe)
         eth_mult = 1.0
         if bool(self.cfg.get("ETH_BAROMETER_ENABLED", True)):
-            eth_mult = self._eth_barometer_multiplier()  # assume returns 0.2..1.0 depending on regime
+            try:
+                eth = await self._get_eth_macd_barometer()
+                hist = float(eth.get("hist", 0.0)) if eth else 0.0
+                cutoff = float(self.cfg.get("ETH_MACD_HIST_CUTOFF_POS", 0.0))
+                if hist > cutoff:  # unfavorable for shorts
+                    eth_mult = float(self.cfg.get("UNFAVORABLE_RISK_RESIZE_FACTOR", 0.2))
+                    LOG.info(
+                        "ETH barometer unfavorable → reducing size by %.2f× (hist=%.3f > cutoff=%.3f).",
+                        eth_mult, hist, cutoff
+                    )
+                else:
+                    LOG.info("ETH barometer favorable/disabled → using base risk %.2f.", base_risk_usd)
+            except Exception as e:
+                LOG.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
 
         # 2) VWAP stack multiplier
         vw_mult = self._vwap_stack_multiplier(
@@ -883,7 +896,9 @@ class LiveTrader:
         if self.cfg.get("RISK_USD_MAX") is not None:
             risk_usd = min(float(self.cfg["RISK_USD_MAX"]), risk_usd)
 
-        self.log.info(
+        sig.risk_usd = float(risk_usd)  
+
+        LOG.info(
             "Sizing → base=%.2f, eth×=%.2f, vwap×=%.2f, wp=%.2f (wp×=%.2f) → risk_usd=%.2f",
             base_risk_usd, eth_mult, vw_mult, wp, wp_mult, risk_usd,
         )
