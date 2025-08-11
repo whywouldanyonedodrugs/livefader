@@ -1,101 +1,178 @@
 # /opt/livefader/src/train_model.py
-
-import asyncio
+import os, asyncio, logging, joblib
+from datetime import datetime, timezone
 import asyncpg
-import logging
-import os
-from dotenv import load_dotenv
+import numpy as np
 import pandas as pd
-import statsmodels.api as sm
-import joblib
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-LOG = logging.getLogger(__name__)
+from dotenv import load_dotenv
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn import __version__ as sk_version
 
-# --- THE FINAL, MOST POWERFUL FEATURE SET ---
-FEATURES = [
-    # Core Indicators
-    'rsi_at_entry',
-    'adx_at_entry',
-    
-    # Price Action / Momentum
-    'price_boom_pct_at_entry',
-    'price_slowdown_pct_at_entry',
-    
-    # Volatility-Normalized Mean Reversion
-    'vwap_z_at_entry',
-    
-    # Trend Context
-    'ema_spread_pct_at_entry',
-    'is_ema_crossed_down_at_entry',
-    
-    # Time-Based Features
-    'day_of_week_at_entry',
-    'hour_of_day_at_entry',
-    
-    # --- THE CRITICAL ADDITION ---
-    # The most powerful predictive feature we have discovered.
-    'eth_macdhist_at_entry'
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+LOG = logging.getLogger("train_model")
+
+MODEL_OUT = os.getenv("WINPROB_MODEL_PATH", "win_probability_model.pkl")
+
+# Raw features expected in DB (we will create any missing with 0.0)
+RAW_FEATURES = [
+    "rsi_at_entry",
+    "adx_at_entry",
+    "price_boom_pct_at_entry",
+    "price_slowdown_pct_at_entry",
+    "vwap_dev_pct_at_entry",
+    "ema_spread_pct_at_entry",
+    "is_ema_crossed_down_at_entry",
+    "eth_macdhist_at_entry",
+    "day_of_week_at_entry",
+    "hour_of_day_at_entry",
+    "ret_30d_at_entry",
+    "listing_age_days_at_entry",
 ]
-TARGET = 'is_win'
-MODEL_FILE_NAME = "win_probability_model.joblib"
+
+TARGET_COL = "is_win"
+
+def _fetch_env():
+    load_dotenv()
+    return dict(
+        PG_DSN=os.getenv("PG_DSN", "postgresql://postgres:postgres@localhost:5432/livedb"),
+        MIN_TRADES=int(os.getenv("TRAIN_MIN_TRADES", "200")),
+        C_L1=float(os.getenv("TRAIN_L1_C", "0.5")),
+        CALIB_METHOD=os.getenv("CALIB_METHOD", "auto"),  # auto|isotonic|sigmoid
+        SEED=int(os.getenv("SEED", "42")),
+    )
+
+async def _load_df(pg_dsn: str) -> pd.DataFrame:
+    LOG.info("Fetching clean trade history from the database...")
+    conn = await asyncpg.connect(pg_dsn)
+    try:
+        rows = await conn.fetch("""
+            SELECT *
+            FROM positions
+            WHERE status='CLOSED' AND pnl IS NOT NULL
+            ORDER BY id
+        """)
+        if not rows:
+            raise RuntimeError("No closed trades with PnL found.")
+        df = pd.DataFrame([dict(r) for r in rows])
+
+        # Target
+        df[TARGET_COL] = (pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0) > 0).astype(int)
+
+        # Ensure all RAW_FEATURES exist; create missing with zeros
+        for col in RAW_FEATURES:
+            if col not in df.columns:
+                df[col] = 0.0
+
+        # Coerce numerics safely (prevents IntCastingNaNError)
+        for col in RAW_FEATURES:
+            # day/hour handled below, everything else numeric
+            if col not in ("day_of_week_at_entry", "hour_of_day_at_entry"):
+                df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        # Robust day/hour handling (keep as integers but never cast until after fill)
+        df["day_of_week_at_entry"] = pd.to_numeric(df["day_of_week_at_entry"], errors="coerce").fillna(0).clip(0, 6).astype(int)
+        df["hour_of_day_at_entry"] = pd.to_numeric(df["hour_of_day_at_entry"], errors="coerce").fillna(0).clip(0, 23).astype(int)
+
+        # Derived feature backfill if missing (keep zeros if unavailable)
+        if "ema_spread_pct_at_entry" in df.columns:
+            # If zeros but ema_fast/ema_slow exist, compute spread; otherwise keep 0.0
+            if "ema_fast_at_entry" in df.columns and "ema_slow_at_entry" in df.columns:
+                ef = pd.to_numeric(df["ema_fast_at_entry"], errors="coerce")
+                es = pd.to_numeric(df["ema_slow_at_entry"], errors="coerce")
+                spread = np.where(es > 0, (ef - es) / es, 0.0)
+                # only fill entries where spread is 0.0 and we have finite values
+                mask = (pd.to_numeric(df["ema_spread_pct_at_entry"], errors="coerce").fillna(0.0) == 0.0) & np.isfinite(spread)
+                df.loc[mask, "ema_spread_pct_at_entry"] = spread[mask]
+
+        # Final NaN/inf sweep
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.fillna(0.0, inplace=True)
+
+        LOG.info("Loaded %d trades for training.", len(df))
+        return df
+    finally:
+        await conn.close()
+
+def _build_pipeline(C_L1: float, calib_method: str, n_samples: int, seed: int) -> Pipeline:
+    # cyclical hour encoder
+    def hour_to_sin_cos(x: np.ndarray) -> np.ndarray:
+        hour = x.reshape(-1, 1).astype(float)
+        sin = np.sin(2*np.pi*hour/24.0)
+        cos = np.cos(2*np.pi*hour/24.0)
+        return np.concatenate([sin, cos], axis=1)
+
+    hour_enc = Pipeline(steps=[
+        ("cyc", FunctionTransformer(hour_to_sin_cos, validate=True, feature_names_out="one-to-one"))
+    ])
+
+    # Handle OneHotEncoder API change: sparse -> sparse_output (>=1.2)
+    major, minor = map(int, sk_version.split(".")[:2])
+    if (major, minor) >= (1, 2):
+        weekday_enc = OneHotEncoder(drop=None, sparse_output=False, handle_unknown="ignore")
+    else:
+        weekday_enc = OneHotEncoder(drop=None, sparse=False, handle_unknown="ignore")
+
+    numeric_cols = [
+        "rsi_at_entry","adx_at_entry","price_boom_pct_at_entry","price_slowdown_pct_at_entry",
+        "vwap_dev_pct_at_entry","ema_spread_pct_at_entry","is_ema_crossed_down_at_entry",
+        "eth_macdhist_at_entry","ret_30d_at_entry","listing_age_days_at_entry"
+    ]
+
+    pre = ColumnTransformer([
+        ("num", "passthrough", numeric_cols),
+        ("weekday_1hot", weekday_enc, ["day_of_week_at_entry"]),
+        ("hour_sin_cos", hour_enc, ["hour_of_day_at_entry"]),
+    ], remainder="drop")
+
+    base = LogisticRegression(
+        penalty="l1", solver="liblinear", C=C_L1, max_iter=4000, random_state=seed
+    )
+
+    # Calibration choice
+    if calib_method == "auto":
+        method = "isotonic" if n_samples >= 1000 else "sigmoid"
+    else:
+        method = calib_method
+
+    calibrated = CalibratedClassifierCV(estimator=base, method=method, cv=5)
+    return Pipeline(steps=[("pre", pre), ("clf", calibrated)])
+
+def _evaluate(model: Pipeline, X: pd.DataFrame, y: pd.Series):
+    p = model.predict_proba(X)[:, 1]
+    brier = brier_score_loss(y, p)
+    auc = roc_auc_score(y, p) if len(np.unique(y)) == 2 else float("nan")
+    return brier, auc
 
 async def main():
-    load_dotenv()
-    db_dsn = os.getenv("DATABASE_URL")
-    if not db_dsn:
-        LOG.error("DATABASE_URL not found. Cannot proceed.")
-        return
+    cfg = _fetch_env()
+    df = await _load_df(cfg["PG_DSN"])
+    if len(df) < cfg["MIN_TRADES"]:
+        raise RuntimeError(f"Too few trades for training: {len(df)} < {cfg['MIN_TRADES']}")
 
-    conn = None
-    try:
-        conn = await asyncpg.connect(dsn=db_dsn)
-        
-        LOG.info("Fetching clean trade history from the database...")
-        query = "SELECT * FROM positions WHERE status = 'CLOSED'"
-        data = await conn.fetch(query)
-        
-        if not data:
-            LOG.error("No trade data found in the database. Cannot train model.")
-            return
+    X = df[RAW_FEATURES].copy()
+    y = df[TARGET_COL].astype(int)
 
-        df = pd.DataFrame([dict(record) for record in data])
-        df['is_win'] = df['pnl'] > 0
-        LOG.info(f"Loaded {len(df)} trades for training.")
+    model = _build_pipeline(cfg["C_L1"], cfg["CALIB_METHOD"], len(df), cfg["SEED"])
+    model.fit(X, y)
 
-        for col in FEATURES:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            else:
-                LOG.error(f"Critical error: Feature column '{col}' not found in the DataFrame.")
-                return
-        
-        if 'is_ema_crossed_down_at_entry' in df.columns:
-            df['is_ema_crossed_down_at_entry'] = df['is_ema_crossed_down_at_entry'].astype(int)
+    brier, auc = _evaluate(model, X, y)
+    LOG.info("In-sample Brier=%.5f  AUC=%.4f  N=%d", brier, auc, len(df))
 
-        df_clean = df.dropna(subset=FEATURES + [TARGET])
-        
-        X = df_clean[FEATURES]
-        y = df_clean[TARGET].astype(int)
-
-        X = sm.add_constant(X, prepend=True)
-
-        LOG.info(f"Training Regularized Logistic Regression model on {len(X)} data points...")
-        
-        logit_model = sm.Logit(y, X)
-        result = logit_model.fit_regularized(method='l1', disp=False)
-
-        LOG.info("Model training complete.")
-        print("--- Regularized Logit Regression Results ---")
-        print(result.summary())
-
-        joblib.dump(result, MODEL_FILE_NAME)
-        LOG.info(f"Successfully saved trained model to '{MODEL_FILE_NAME}'")
-
-    except Exception as e:
-        LOG.error(f"An error occurred during model training: {e}", exc_info=True)
-    finally:
-        if conn: await conn.close()
+    joblib.dump(
+        dict(pipeline=model, features=RAW_FEATURES, trained_at=datetime.now(timezone.utc).isoformat()),
+        MODEL_OUT
+    )
+    LOG.info("Saved calibrated model to %s", MODEL_OUT)
 
 if __name__ == "__main__":
     asyncio.run(main())
