@@ -685,34 +685,24 @@ class LiveTrader:
     # inside live_trader.py (class LiveTrader)
 
     def _vwap_stack_multiplier(self, frac: float | None, expansion_pct: float | None) -> float:
-        """
-        Size multiplier from VWAP-stack (consolidation + expansion).
-        Returns a value in [0.5, 1.2] with safe defaults when data is missing.
-        """
+        """Return a bounded [0.5, 1.2] multiplier from VWAP-stack features."""
         try:
             f = float(frac) if frac is not None else 0.0
-            e = float(expansion_pct) if expansion_pct is not None else 0.0  # e is in percent, e.g. 0.9 for 0.9%
+            e = float(expansion_pct) if expansion_pct is not None else 0.0  # already in %
         except Exception:
             f, e = 0.0, 0.0
 
-        # Baseline multiplier
         mult = 1.0
-
-        # Reward stronger consolidation
-        # >=0.65 → +10%; 0.45–0.65 → +5%; else no boost
         if f >= 0.65:
             mult *= 1.10
         elif f >= 0.45:
             mult *= 1.05
 
-        # Reward stronger expansion (use absolute)
-        # >=1.5% → +5%; 0.8–1.5% → +2%; else none
         if e >= 1.5:
             mult *= 1.05
         elif e >= 0.8:
             mult *= 1.02
 
-        # Clamp to a safe band
         return max(0.5, min(1.2, mult))
 
 
@@ -761,16 +751,14 @@ class LiveTrader:
 
         # --- Risk budget BEFORE entry (the critical fix) ---
         sig = signal  # alias for clarity
-
         base_risk_usd = float(self.cfg.get("RISK_USD", 10.0))
 
-        # ETH barometer sizing gate (your existing function/logic; keep as-is if already implemented)
+        # ETH barometer → size gate
         eth_mult = 1.0
         if self.cfg.get("ETH_BAROMETER_ENABLED", False):
             try:
                 eth = await self._get_eth_macd_barometer()
                 hist = float(eth.get("hist", 0.0)) if eth else 0.0
-                # Example gate: cut to 20% size when histogram is unfavorable
                 if hist > float(self.cfg.get("ETH_MACD_HIST_CUTOFF_POS", 0.0)):
                     eth_mult = float(self.cfg.get("ETH_UNFAV_SIZE_MULT", 0.2))
                     self.log.info("ETH barometer unfavorable → reducing size by multiplier %.2f.", eth_mult)
@@ -779,13 +767,13 @@ class LiveTrader:
             except Exception as e:
                 self.log.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
 
-        # VWAP-stack sizing multiplier (safe even if attributes missing)
+        # VWAP-stack multiplier (safe if fields missing)
         vw_mult = self._vwap_stack_multiplier(
             getattr(sig, "vwap_stack_frac", None),
             getattr(sig, "vwap_stack_expansion_pct", None),
         )
 
-        # Calibrated win-prob sizing (gentle slope). If not present, default to 1.0
+        # Calibrated win-prob sizing (gentle slope)
         wp = float(getattr(sig, "win_probability", 0.0) or 0.0)
         wp_floor = float(self.cfg.get("WINPROB_SIZE_FLOOR", 0.45))
         wp_cap   = float(self.cfg.get("WINPROB_SIZE_CAP",   0.65))
@@ -793,17 +781,15 @@ class LiveTrader:
             wp_mult = 1.0
         else:
             wp_clamped = max(wp_floor, min(wp_cap, wp))
-            # map [floor..cap] -> [0.7..1.3] for gentle sizing
             wp_mult = 0.7 + 0.6 * ((wp_clamped - wp_floor) / max(1e-9, (wp_cap - wp_floor)))
 
-        # Combine multipliers and clamp to global safety bounds
         risk_usd = base_risk_usd * eth_mult * vw_mult * wp_mult
-        risk_min = float(self.cfg.get("RISK_USD_MIN", 2.0))
-        risk_max = float(self.cfg.get("RISK_USD_MAX", 25.0))
-        risk_usd = max(risk_min, min(risk_max, risk_usd))
+        risk_usd = max(float(self.cfg.get("RISK_USD_MIN", 2.0)),
+                    min(float(self.cfg.get("RISK_USD_MAX", 25.0)), risk_usd))
+        sig.risk_usd = risk_usd
 
         self.log.info(
-            "Sizing for %s → base=%.2f, eth_mult=%.2f, vwap_mult=%.2f, wp=%.2f (wp_mult=%.2f) → final risk_usd=%.2f",
+            "Sizing for %s → base=%.2f, eth_mult=%.2f, vwap_mult=%.2f, wp=%.2f (wp_mult=%.2f) → risk_usd=%.2f",
             sig.symbol, base_risk_usd, eth_mult, vw_mult, wp, wp_mult, risk_usd
         )
 
@@ -873,37 +859,51 @@ class LiveTrader:
             elif self.cfg.get("TIME_EXIT_ENABLED", False):
                 exit_deadline = datetime.now(timezone.utc) + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
 
-            pid = await self.db.insert_position({
-                "symbol": sig.symbol, "side": "short",
-                "size": actual_size, "entry_price": actual_entry_price,
-                "atr": float(sig.atr), "status": "PENDING",
-                "opened_at": datetime.now(timezone.utc),
+            payload = {
+                "symbol": sig.symbol,
+                "side": "SHORT",
+                "size": float(qty),
+                "entry_price": float(sig.entry),
+                "stop_price": float(stop_price),
+                "trailing_active": False,
+                "atr": float(sig.atr),
+                "status": "OPEN",
+                "opened_at": now,
                 "exit_deadline": exit_deadline,
-                "risk_usd": risk_usd, "slippage_usd": slippage_usd,
+
+                "entry_cid": entry_cid,
+                "sl_cid": sl_cid,
+                "tp_final_cid": tp_cid,
+
                 "market_regime_at_entry": sig.market_regime,
-                "rsi_at_entry": sig.rsi, "adx_at_entry": sig.adx, "atr_pct_at_entry": sig.atr_pct,
-                "price_boom_pct_at_entry": sig.price_boom_pct,
-                "price_slowdown_pct_at_entry": sig.price_slowdown_pct,
-                "vwap_dev_pct_at_entry": sig.vwap_dev_pct,
-                "eth_macd_at_entry": eth_macd.get('macd') if eth_macd else None,
-                "eth_macdsignal_at_entry": eth_macd.get('signal') if eth_macd else None,
-                "eth_macdhist_at_entry": eth_macd.get('hist') if eth_macd else None,
-                "ret_30d_at_entry": sig.ret_30d, "ema_fast_at_entry": sig.ema_fast,
-                "ema_slow_at_entry": sig.ema_slow, "listing_age_days_at_entry": sig.listing_age_days,
-                "session_tag_at_entry": sig.session_tag, "day_of_week_at_entry": sig.day_of_week,
-                "hour_of_day_at_entry": sig.hour_of_day,
-                "config_snapshot": json.dumps({
-                    "SL_ATR_MULT": self.cfg.get("SL_ATR_MULT"),
-                    "FINAL_TP_ATR_MULT": self.cfg.get("FINAL_TP_ATR_MULT"),
-                    "PARTIAL_TP_ATR_MULT": self.cfg.get("PARTIAL_TP_ATR_MULT"),
-                    "PARTIAL_TP_PCT": self.cfg.get("PARTIAL_TP_PCT"),
-                }),
-                "vwap_stack_frac_at_entry": float(getattr(sig, "vwap_stack_frac", 0.0)),
-                "vwap_stack_expansion_pct_at_entry": float(getattr(sig, "vwap_stack_expansion_pct", 0.0)),
-                "vwap_stack_slope_pph_at_entry": float(getattr(sig, "vwap_stack_slope_pph", 0.0)),
-                "vwap_stack_multiplier_at_entry": float(vw_mult),
+                "risk_usd": float(sig.risk_usd),
+
+                "rsi_at_entry": float(sig.rsi),
+                "adx_at_entry": float(sig.adx),
+                "atr_pct_at_entry": float(sig.atr_pct),
+                "price_boom_pct_at_entry": float(sig.price_boom_pct),
+                "price_slowdown_pct_at_entry": float(sig.price_slowdown_pct),
+                "vwap_dev_pct_at_entry": float(getattr(sig, "vwap_dev_pct", 0.0)),
+                "vwap_z_at_entry": float(getattr(sig, "vwap_z_score", 0.0)),
+                "ret_30d_at_entry": float(sig.ret_30d),
+                "ema_fast_at_entry": float(sig.ema_fast),
+                "ema_slow_at_entry": float(sig.ema_slow),
+                "listing_age_days_at_entry": int(sig.listing_age_days),
+                "session_tag_at_entry": sig.session_tag,
+                "day_of_week_at_entry": int(sig.day_of_week),
+                "hour_of_day_at_entry": int(sig.hour_of_day),
+                "vwap_consolidated_at_entry": bool(sig.vwap_consolidated),
+                "is_ema_crossed_down_at_entry": bool(sig.is_ema_crossed_down),
                 "win_probability_at_entry": float(getattr(sig, "win_probability", 0.0)),
-            })
+
+                # VWAP-stack audit
+                "vwap_stack_frac_at_entry": float(vwap_frac) if vwap_frac is not None else None,
+                "vwap_stack_expansion_pct_at_entry": float(vwap_exp) if vwap_exp is not None else None,
+                "vwap_stack_slope_pph_at_entry": float(vwap_slope) if vwap_slope is not None else None,
+            }
+
+            pid = await self.db.insert_position(payload)
+            self.log.info("Inserted position %s (id=%s)", sig.symbol, pid)
 
             # --- Protective orders (Bybit V5 conditional orders) ---
             # BUY stop-loss above entry for short; trigger when price rises to stop → triggerDirection=1
@@ -952,12 +952,23 @@ class LiveTrader:
             self.open_positions[pid] = dict(row)
 
             days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-            await self.tg.send(
-                f"🚀 **({days[sig.day_of_week]})** Opened {sig.symbol} short {actual_size:.4f} @ {actual_entry_price:.6f}\n"
-                f"🛡️ SL: {stop_price:.6f} | TP: {'TP1' if tp1_cid else 'FINAL'}\n"
-                f"📊 VWAP mult: {vw_mult:.2f}  frac={signal_obj.vwap_stack_frac:.2f}  exp={signal_obj.vwap_stack_expansion_pct*100:.2f}%\n"
-                f"🎯 WinProb: {getattr(sig,'win_probability',0.0)*100:.1f}%"
+
+            # ---- TELEGRAM MESSAGE (NO 'signal_obj', and no double *100 on expansion %) ----
+            vwap_frac  = getattr(sig, "vwap_stack_frac", None)
+            vwap_exp   = getattr(sig, "vwap_stack_expansion_pct", None)  # already percent, e.g. 0.35 → "0.35%"
+            vwap_slope = getattr(sig, "vwap_stack_slope_pph", None)
+
+            msg = (
+                f"🔔 Opened SHORT {sig.symbol}\n"
+                f"Entry: {sig.entry:.8f}\n"
+                f"ATR(1h): {sig.atr:.8f}  ATR%: {sig.atr_pct:.2f}%\n"
+                f"Risk: ${sig.risk_usd:.2f}  (ETH×{eth_mult:.2f} · VWAP×{vw_mult:.2f} · WP×{wp_mult:.2f})\n"
+                f"VWAP stack: frac={vwap_frac if vwap_frac is not None else 'N/A'}  "
+                f"exp={f'{vwap_exp:.2f}%' if vwap_exp is not None else 'N/A'}  "
+                f"slope_pph={f'{vwap_slope:.4f}' if vwap_slope is not None else 'N/A'}\n"
+                f"WinProb: {wp:.2%}"
             )
+            await self.tg.send(msg)
 
 
         except Exception as e:
