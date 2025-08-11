@@ -1,37 +1,50 @@
 # research/data/tca.py
-import numpy as np
 import pandas as pd
+import numpy as np
 
-def approx_fee_paid_usd(row: pd.Series, taker_bps: float = 5.0) -> float:
-    """
-    Rough taker fee estimate in USD: notional * fee_rate.
-    Adjust taker_bps to your account rate (default 5 bps = 0.05%).
-    """
-    notional = float(abs(row.get("size", 0.0)) * float(row.get("entry_price", 0.0)))
-    return notional * (taker_bps / 1e4)
+def _to_float_series(s: pd.Series) -> pd.Series:
+    """Coerce a Series (Decimal/str/None/float) to float, NaNs -> 0.0."""
+    if s is None:
+        return pd.Series([], dtype=float)
+    out = pd.to_numeric(s, errors="coerce")
+    # If it's not numeric yet (object), try casting elementwise
+    if not np.issubdtype(out.dtype, np.number):
+        out = pd.to_numeric(s.astype(str), errors="coerce")
+    return out.astype(float).fillna(0.0)
 
-def realized_funding_usd(row: pd.Series, funding_rate: float, hours_held: float) -> float:
-    """
-    Approx funding transfer for perps:
-      funding_pnl ≈ notional * funding_rate * (hours_held / funding_interval_hours)
-    Most perps fund every 8h (varies by symbol; we use 8h heuristic).
-    """
-    interval_h = 8.0
-    notional = float(abs(row.get("size", 0.0)) * float(row.get("entry_price", 0.0)))
-    return notional * float(funding_rate) * (hours_held / interval_h)
-
-def add_cost_audit(df: pd.DataFrame, funding_col: str = "funding_last_at_entry", taker_bps: float = 5.0) -> pd.DataFrame:
+def add_cost_audit(
+    df: pd.DataFrame,
+    funding_col: str = "funding_last_at_entry",
+    taker_bps: float = 5.0,
+) -> pd.DataFrame:
     """
     Add rough fee + funding audit columns so reports can decompose P&L.
-    (We use funding at entry as proxy; refine later with actual funding legs if stored.)
+    Vectorized; safe for Decimal/None/object types.
+
+    Columns used (if missing, treated as 0):
+      - size, entry_price, opened_at, closed_at
+      - funding_last_at_entry (or whatever you pass via funding_col)
     """
     out = df.copy()
-    open_ts = pd.to_datetime(out["opened_at"], utc=True)
-    close_ts = pd.to_datetime(out["closed_at"], utc=True)
-    hours = (close_ts - open_ts).dt.total_seconds() / 3600.0
 
-    out["fee_usd_est"] = out.apply(lambda r: approx_fee_paid_usd(r, taker_bps=taker_bps), axis=1)
-    out["funding_usd_est"] = [
-        realized_funding_usd(r, r.get(funding_col, 0.0) or 0.0, h) for r, h in zip(out.to_dict("records"), hours)
-    ]
+    # Coerce numerics
+    size = _to_float_series(out.get("size"))
+    entry_price = _to_float_series(out.get("entry_price"))
+    funding_rate = _to_float_series(out.get(funding_col))
+
+    # Notional and fees
+    notional = size.abs() * entry_price
+    fee_rate = float(taker_bps) / 1e4  # bps -> decimal
+    out["fee_usd_est"] = notional * fee_rate
+
+    # Holding hours
+    opened = pd.to_datetime(out.get("opened_at"), utc=True, errors="coerce")
+    closed = pd.to_datetime(out.get("closed_at"), utc=True, errors="coerce")
+    hours = (closed - opened).dt.total_seconds().fillna(0.0) / 3600.0
+
+    # Funding (approx; assumes 8h funding interval)
+    interval_h = 8.0
+    out["funding_usd_est"] = notional * funding_rate * (hours / interval_h)
+
+    # If any of the required columns were missing, the result will be 0.0 gracefully.
     return out
