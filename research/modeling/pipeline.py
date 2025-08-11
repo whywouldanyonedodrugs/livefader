@@ -10,7 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from research.modeling.feature_mask import load_disabled_features, filter_feature_list
 
-# ---- tiny helpers for cyclical encoding ----
+# ---- cyclical encoders (create features inside the pipeline) ----
 def _hour_cyc(X: pd.Series | np.ndarray) -> np.ndarray:
     h = np.asarray(X).astype(float).reshape(-1, 1)
     sin = np.sin(2 * np.pi * h / 24.0)
@@ -26,10 +26,15 @@ def _dow_onehot(X: pd.Series | np.ndarray) -> np.ndarray:
 
 def build_pipeline(df: pd.DataFrame) -> tuple[Pipeline, list[str], list[str], list[str]]:
     """
-    Build the LR(L1) + encoding pipeline.
-    Returns (pipeline, cont_features, cat_features, cyc_features_names)
+    Build the LR(L1) + preprocessing pipeline.
+
+    Returns (pipeline, cont_features, cat_features, cyc_features_raw)
+
+    NOTE: cyc_features_raw contains the RAW columns expected in X (e.g., 'hour_of_day_at_entry'),
+    not the engineered names like 'hour_sin/hour_cos'. The ColumnTransformer will create those
+    internally at transform-time.
     """
-    # Candidate columns present in dataset
+    # Continuous features present
     cont = [c for c in [
         "rsi_at_entry", "adx_at_entry",
         "price_boom_pct_at_entry", "price_slowdown_pct_at_entry",
@@ -38,17 +43,19 @@ def build_pipeline(df: pd.DataFrame) -> tuple[Pipeline, list[str], list[str], li
         "vwap_stack_frac_at_entry", "vwap_stack_expansion_pct_at_entry", "vwap_stack_slope_pph_at_entry",
     ] if c in df.columns]
 
-    cat  = []  # (we don't have true categoricals yet)
+    # No true categoricals yet
+    cat: list[str] = []
+
+    # Raw cyclical columns
     cycH = ["hour_of_day_at_entry"] if "hour_of_day_at_entry" in df.columns else []
     cycD = ["day_of_week_at_entry"] if "day_of_week_at_entry" in df.columns else []
 
-    # Apply feature mask
+    # Apply feature mask (optional disable list)
     disabled = load_disabled_features()
     cont = filter_feature_list(cont, disabled)
     cycH = filter_feature_list(cycH, disabled)
     cycD = filter_feature_list(cycD, disabled)
 
-    # Column transformers
     transformers = []
     if cont:
         transformers.append(("cont", Pipeline([
@@ -69,7 +76,6 @@ def build_pipeline(df: pd.DataFrame) -> tuple[Pipeline, list[str], list[str], li
 
     pre = ColumnTransformer(transformers, remainder="drop", verbose_feature_names_out=False)
 
-    # Sparse-ish L1 logistic (robust, interpretable), balanced if needed
     clf = LogisticRegression(
         penalty="l1", solver="liblinear", C=0.5,
         class_weight=None, random_state=42, max_iter=200
@@ -80,9 +86,6 @@ def build_pipeline(df: pd.DataFrame) -> tuple[Pipeline, list[str], list[str], li
         ("clf", clf),
     ])
 
-    # names after encoding are opaque (x0..), but cont/cyc lists help with ablation/reporting
-    used_cyc = []
-    if cycH: used_cyc += ["hour_sin", "hour_cos"]
-    if cycD: used_cyc += [f"dow_{i}" for i in range(7)]
-
-    return pipe, cont, cat, used_cyc
+    # IMPORTANT: return RAW cyclical column names (the ones expected in X)
+    cyc_raw = cycH + cycD
+    return pipe, cont, cat, cyc_raw
