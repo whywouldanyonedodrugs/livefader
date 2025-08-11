@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 import warnings
-import os  # <--- THE PRIMARY FIX IS HERE
+import os
 import asyncio
 from datetime import datetime
 
@@ -18,6 +18,8 @@ try:
 except ImportError:
     sm = None
     warnings.warn("statsmodels not installed – logistic regression section will be skipped.")
+
+RESULTS_DIR = "results"
 
 # --- Helper Functions ---
 def header(txt: str):
@@ -49,14 +51,14 @@ def describe_categorical(df, col, win_flag="is_win"):
         print(f"\nCramér’s V vs. win flag: {cramers_v:.3f}")
 
 def logistic_regression(df, features):
-    if sm is None: return
+    if sm is None: 
+        return
     header("Quick logistic regression (wins=1)")
     clean_df = df.dropna(subset=features + ["is_win"])
     if len(clean_df) < 10:
         print("Not enough data for logistic regression.")
         return
-    X = clean_df[features]
-    X = sm.add_constant(X)
+    X = sm.add_constant(clean_df[features])
     y = clean_df["is_win"].astype(int)
     try:
         model = sm.Logit(y, X).fit(disp=False)
@@ -66,12 +68,16 @@ def logistic_regression(df, features):
 
 def analyze_regime_performance(df: pd.DataFrame):
     header("Regime-Specific Performance KPIs")
-    if "market_regime_at_entry" not in df.columns: return
+    if "market_regime_at_entry" not in df.columns:
+        return
     regime_groups = df.groupby("market_regime_at_entry")
     summary = regime_groups.agg(
-        total_trades=('pnl', 'count'), total_pnl=('pnl', 'sum'),
-        win_rate=('is_win', lambda x: x.mean() * 100), avg_pnl=('pnl', 'mean'),
-        avg_win=('pnl', lambda x: x[x > 0].mean()), avg_loss=('pnl', lambda x: x[x < 0].mean()),
+        total_trades=('pnl', 'count'),
+        total_pnl=('pnl', 'sum'),
+        win_rate=('is_win', lambda x: x.mean() * 100),
+        avg_pnl=('pnl', 'mean'),
+        avg_win=('pnl', lambda x: x[x > 0].mean()),
+        avg_loss=('pnl', lambda x: x[x < 0].mean()),
     ).fillna(0)
     gross_profit = regime_groups['pnl'].apply(lambda x: x[x > 0].sum())
     gross_loss = regime_groups['pnl'].apply(lambda x: abs(x[x < 0].sum()))
@@ -80,17 +86,15 @@ def analyze_regime_performance(df: pd.DataFrame):
 
 def analyze_counterfactuals(df: pd.DataFrame):
     header("Counterfactual 'What If' Analysis (4-Hour Look-Forward)")
-    
     required_cols = [
-        'exit_reason', 'is_win', 'cf_would_hit_tp_2x_atr', 
+        'exit_reason', 'is_win', 'cf_would_hit_tp_2x_atr',
         'cf_would_hit_sl_2_5x_atr', 'cf_mae_over_atr_4h', 'cf_mfe_over_atr_4h',
-        'cf_would_hit_tp_1x_atr' # Check for the new column
+        'cf_would_hit_tp_1x_atr'
     ]
     if not all(col in df.columns for col in required_cols):
         print("Counterfactual columns not found. Skipping this analysis.")
         return
 
-    # --- Analysis 1: Time-Exited Trades ---
     print("\n--- Analysis of TIME-EXITED Trades ---")
     time_exits_df = df[df['exit_reason'] == 'TIME_EXIT'].copy()
     if not time_exits_df.empty:
@@ -103,47 +107,60 @@ def analyze_counterfactuals(df: pd.DataFrame):
     else:
         print("No time-exited trades found.")
 
-    # --- Analysis 2: Stop-Loss Trades ---
     print("\n--- Analysis of STOP-LOSS Trades ---")
     sl_exits_df = df[df['exit_reason'] == 'SL'].copy()
     if not sl_exits_df.empty:
         total_sl_exits = len(sl_exits_df)
-        
-        # --- THIS IS THE NEW ANALYSIS ---
         would_have_won_1x = sl_exits_df['cf_would_hit_tp_1x_atr'].sum()
+        would_have_won_2x = sl_exits_df['cf_would_hit_tp_2x_atr'].sum()
         print(f"Total Stop-Loss Trades: {total_sl_exits}")
         print(f"  - Would have REVERSED TO WIN (hit 1x ATR TP): {would_have_won_1x} ({would_have_won_1x/total_sl_exits:.1%})")
-        # --- END OF NEW ANALYSIS ---
-        
-        would_have_won_2x = sl_exits_df['cf_would_hit_tp_2x_atr'].sum()
         print(f"  - Would have REVERSED TO WIN (hit 2x ATR TP): {would_have_won_2x} ({would_have_won_2x/total_sl_exits:.1%})")
     else:
         print("No stop-loss trades found.")
-        
-    # --- Analysis 3: Take-Profit Trades ---
+
     print("\n--- Analysis of TAKE-PROFIT Trades ---")
     tp_exits_df = df[df['exit_reason'] == 'TP'].copy()
     if not tp_exits_df.empty:
         total_tp_exits = len(tp_exits_df)
         would_have_lost = tp_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
+        avg_ultimate_mfe = tp_exits_df['cf_mfe_over_atr_4h'].mean()
         print(f"Total Take-Profit Trades: {total_tp_exits}")
         print(f"  - Would have REVERSED TO LOSE (hit 2.5x ATR SL): {would_have_lost} ({would_have_lost/total_tp_exits:.1%})")
-        
-        avg_ultimate_mfe = tp_exits_df['cf_mfe_over_atr_4h'].mean()
         print(f"  - Average ultimate MFE over next 4h: {avg_ultimate_mfe:.2f}x ATR")
     else:
         print("No take-profit trades found.")
 
+def _safe_qcut(s: pd.Series, q: int):
+    # Drop duplicate edges so tied data doesn't error out. (pandas docs)  :contentReference[oaicite:6]{index=6}
+    return pd.qcut(s, q, labels=False, duplicates="drop")
 
-# --- Core Analysis Logic ---
+def _save_table(df: pd.DataFrame, name: str):
+    if df is None or df.empty:
+        return
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    out = Path(RESULTS_DIR) / f"{name}.csv"
+    df.to_csv(out, index=False)
+    print(f"[saved] {out}")
+
 def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["is_win"] = df["pnl"] > 0
+
+    # Net PnL if fees_paid exists
+    if "fees_paid" in df.columns:
+        df["fees_paid"] = pd.to_numeric(df["fees_paid"], errors="coerce").fillna(0.0)
+        df["net_pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0) - df["fees_paid"]
+    else:
+        df["net_pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
+
+    df["is_win"] = df["net_pnl"] > 0
+
     if "slippage_usd" in df.columns and "atr" in df.columns:
-        df["slippage_abs"] = df["slippage_usd"].abs()
-        df["slippage_over_atr"] = df["slippage_abs"].divide(df["atr"]).replace([np.inf, -np.inf], np.nan)
+        df["slippage_abs"] = pd.to_numeric(df["slippage_usd"], errors="coerce").abs()
+        df["slippage_over_atr"] = df["slippage_abs"].divide(pd.to_numeric(df["atr"], errors="coerce")).replace([np.inf, -np.inf], np.nan)
     else:
         df["slippage_over_atr"] = np.nan
+
     df["price_minus_ema_fast"] = df["entry_price"] - df["ema_fast_at_entry"]
     df["price_minus_ema_slow"] = df["entry_price"] - df["ema_slow_at_entry"]
     df["pct_to_ema_fast"] = df["price_minus_ema_fast"] / df["entry_price"]
@@ -151,6 +168,7 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_spread_abs"] = df["ema_fast_at_entry"] - df["ema_slow_at_entry"]
     df["ema_spread_pct"] = df["ema_spread_abs"] / df["ema_slow_at_entry"]
     df.rename(columns={"vwap_dev_pct_at_entry": "pct_to_vwap"}, inplace=True)
+    df["holding_minutes"] = pd.to_numeric(df["holding_minutes"], errors="coerce").fillna(0.0)
     df["holding_hours"] = df["holding_minutes"] / 60.0
     df["holding_bucket"] = pd.cut(
         df["holding_hours"],
@@ -159,9 +177,35 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
+def _vwap_quintile_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    out = {}
+    if "vwap_stack_frac_at_entry" in df.columns:
+        s = pd.to_numeric(df["vwap_stack_frac_at_entry"], errors="coerce")
+        if s.notna().sum() >= 5:
+            df["vwap_frac_q"] = _safe_qcut(s, 5)
+            g = (df.groupby("vwap_frac_q")
+                   .agg(n=("id","size"),
+                        win_rate=("is_win","mean"),
+                        mean_net_pnl=("net_pnl","mean"),
+                        median_net_pnl=("net_pnl","median"))
+                   .reset_index())
+            out["vwap_frac_quintiles"] = g
+    if "vwap_stack_expansion_pct_at_entry" in df.columns:
+        s = pd.to_numeric(df["vwap_stack_expansion_pct_at_entry"], errors="coerce")
+        if s.notna().sum() >= 5:
+            df["vwap_exp_q"] = _safe_qcut(s, 5)
+            g = (df.groupby("vwap_exp_q")
+                   .agg(n=("id","size"),
+                        win_rate=("is_win","mean"),
+                        mean_net_pnl=("net_pnl","mean"),
+                        median_net_pnl=("net_pnl","median"))
+                   .reset_index())
+            out["vwap_expansion_quintiles"] = g
+    return out
+
 def run_analysis(df: pd.DataFrame):
     df = feature_engineering(df)
-    
+
     header("Price boom / slowdown bins")
     df["boom_bin"] = pd.qcut(df["price_boom_pct_at_entry"], q=4, labels=False, duplicates="drop")
     df["slow_bin"] = pd.qcut(df["price_slowdown_pct_at_entry"], q=4, labels=False, duplicates="drop")
@@ -171,7 +215,7 @@ def run_analysis(df: pd.DataFrame):
 
     df["rsi_band"] = pd.cut(df["rsi_at_entry"], bins=[0, 50, 60, 70, 80, 100], labels=["<50", "50-60", "60-70", "70-80", ">80"])
     describe_categorical(df, "rsi_band")
-    
+
     describe_continuous(df, "pct_to_ema_fast")
     describe_continuous(df, "ema_spread_pct")
     describe_continuous(df, "pct_to_vwap")
@@ -180,27 +224,25 @@ def run_analysis(df: pd.DataFrame):
     df["z_band"] = pd.cut(
         df["vwap_z_at_entry"],
         bins=[-np.inf, 0, 0.5, 1.0, 1.5, 2.0, np.inf],
-        labels=["<0", "0-0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", ">2.0"]
+        labels=["<0", "0-0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", ">2.0"],
     )
     describe_categorical(df, "z_band")
 
-    if 'eth_macdhist_at_entry' in df.columns:
+    if "eth_macdhist_at_entry" in df.columns:
         header("PERFORMANCE BY ETH MACD HISTOGRAM (4H)")
-        # Create bins for the histogram: strongly negative, negative, positive, strongly positive
-        df['eth_macd_hist_band'] = pd.cut(
-            df['eth_macdhist_at_entry'],
+        df["eth_macd_hist_band"] = pd.cut(
+            df["eth_macdhist_at_entry"],
             bins=[-np.inf, -0.5, 0, 0.5, np.inf],
-            labels=["Strong Down", "Weak Down", "Weak Up", "Strong Up"]
+            labels=["Strong Down", "Weak Down", "Weak Up", "Strong Up"],
         )
         describe_categorical(df, "eth_macd_hist_band")
 
-    if 'eth_macdhist_1h_at_entry' in df.columns:
+    if "eth_macdhist_1h_at_entry" in df.columns:
         header("PERFORMANCE BY ETH MACD HISTOGRAM (1H)")
-        # We use different bins for the 1H MACD as it's a faster indicator
-        df['eth_macd_hist_1h_band'] = pd.cut(
-            df['eth_macdhist_1h_at_entry'],
+        df["eth_macd_hist_1h_band"] = pd.cut(
+            df["eth_macdhist_1h_at_entry"],
             bins=[-np.inf, -0.1, 0, 0.1, np.inf],
-            labels=["Strong Down", "Weak Down", "Weak Up", "Strong Up"]
+            labels=["Strong Down", "Weak Down", "Weak Up", "Strong Up"],
         )
         describe_categorical(df, "eth_macd_hist_1h_band")
 
@@ -208,18 +250,27 @@ def run_analysis(df: pd.DataFrame):
     describe_continuous(df, "mfe_over_atr")
     describe_continuous(df, "realized_vol_during_trade")
     describe_continuous(df, "btc_beta_during_trade")
-    describe_continuous(df, "slippage_over_atr")
-    
+
     describe_categorical(df, "session_tag_at_entry")
     describe_categorical(df, "holding_bucket")
     describe_categorical(df, "day_of_week_at_entry")
     describe_categorical(df, "hour_of_day_at_entry")
 
-    if 'vwap_consolidated_at_entry' in df.columns:
+    if "vwap_consolidated_at_entry" in df.columns:
         describe_categorical(df, "vwap_consolidated_at_entry")
 
+    # --- VWAP-stack quintiles (saved to results/) ---
+    header("VWAP-STACK QUINTILES (frac & expansion) – win rate and net PnL")
+    vwap_tabs = _vwap_quintile_tables(df)
+    for name, tab in vwap_tabs.items():
+        print(f"\n{name}")
+        tab2 = tab.copy()
+        tab2["win_rate_%"] = 100 * tab2["win_rate"].astype(float)
+        print(tab2[["vwap_frac_q" if "frac" in name else "vwap_exp_q", "n", "win_rate_%", "mean_net_pnl", "median_net_pnl"]].to_string(index=False))
+        _save_table(tab2, name)
+
     header("Top 10 absolute point-biserial correlations with win flag")
-    cont_cols = [c for c in df.select_dtypes(include="number").columns if c not in ["is_win", "pnl"]]
+    cont_cols = [c for c in df.select_dtypes(include="number").columns if c not in ["is_win", "pnl", "net_pnl"]]
     cors = {c: stats.pointbiserialr(df["is_win"], df[c])[0] for c in cont_cols if df[c].notna().sum() > 5 and np.std(df[c]) > 0}
     top10 = pd.Series(cors).abs().sort_values(ascending=False).head(10)
     print(top10.to_string())
@@ -293,15 +344,12 @@ def main():
         asyncio.run(send_telegram_report(args.send_report))
         return
 
-    trade_file_path = None
+    # Locate trade file
     if args.file:
-        # If a specific file is provided, use it.
         trade_file_path = Path(args.file)
     else:
-        # Otherwise, find the newest report file automatically.
         reports_dir = Path(__file__).parent / "live" / "reports"
         try:
-            # Find all full history files and get the most recently modified one
             latest_report = max(reports_dir.glob("full_trade_history_*.csv"), key=os.path.getctime)
             trade_file_path = latest_report
             print(f"--- Found latest report file: {trade_file_path.name} ---")
@@ -309,7 +357,6 @@ def main():
             print(f"ERROR: No 'full_trade_history_*.csv' files found in {reports_dir}.")
             print("Please run 'python live/reporter.py --full' first.")
             return
-    # --- END OF NEW LOGIC ---
 
     if trade_file_path.exists():
         df = pd.read_csv(trade_file_path)

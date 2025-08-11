@@ -72,12 +72,30 @@ STRUCTURAL_TREND_FILTER_ENABLED = False
 STRUCTURAL_TREND_DAYS    = 30
 STRUCTURAL_TREND_RET_PCT = 0.01
 
-# --- Sideways "Gap" Filter (Pre-Entry Consolidation) ---
+# ── VWAP Stack ─────────────────────────────────────────────
+# --- Legacy ---
 GAP_FILTER_ENABLED = False
 GAP_VWAP_HOURS  = 2
-GAP_MAX_DEV_PCT = 0.01
+GAP_MAX_DEV_PCT = 1.00
 GAP_MIN_BARS    = 3
 # VWAP_LEN = 15
+
+# --- Working ---
+VWAP_STACK_SIZING_ENABLED: true
+
+# how we compute the features
+VWAP_STACK_LOOKBACK_BARS: 12        # on 5m bars ≈ 1 hour
+VWAP_STACK_BAND_PCT: 0.004          # ±0.40% “near value” band
+VWAP_STACK_EXPANSION_ABS_MIN: 0.006 # 0.6% – below this, treat as very weak
+VWAP_STACK_EXPANSION_GOOD: 0.015    # 1.5% – good expansion
+VWAP_STACK_FRAC_MIN: 0.50           # at least half the window near VWAP
+VWAP_STACK_FRAC_GOOD: 0.70          # solid consolidation
+
+# convert “signal quality” → risk scaling
+VWAP_STACK_MIN_MULTIPLIER: 0.20     # never risk below 20% of base (still “sizing filter”, not a veto)
+VWAP_STACK_MAX_MULTIPLIER: 1.00     # cap at base risk for now (can raise later to 1.2)
+VWAP_STACK_FRAC_WEIGHT: 0.6         # weight on consolidation quality
+VWAP_STACK_EXP_WEIGHT: 0.4          # weight on expansion
 
 # --- Volume Filter (Applied during Scouting) ---
 VOL_FILTER_ENABLED  = False

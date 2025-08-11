@@ -138,3 +138,44 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
         return pd.Series(dtype='float64', index=df.index)
         
     return adx_df[adx_col[0]]
+
+def vwap_stack_features(df: pd.DataFrame, lookback_bars: int = 12, band_pct: float = 0.004):
+    """
+    df: columns ['open','high','low','close','volume'] ascending.
+    Returns:
+      vwap_frac_in_band: share of prior window closes inside ±band_pct around rolling VWAP (current bar excluded)
+      vwap_expansion_pct: |last_close / current_vwap - 1|
+      vwap_slope_pph: VWAP slope (percent per hour) over the last hour (approx)
+    """
+    px = df["close"].astype(float).values
+    vol = df["volume"].astype(float).values
+    n = len(df)
+    if n < lookback_bars + 2 or np.nansum(vol) == 0:
+        return {"vwap_frac_in_band": 0.0, "vwap_expansion_pct": 0.0, "vwap_slope_pph": 0.0}
+
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    tpv = (tp * df["volume"]).rolling(lookback_bars).sum()
+    vv = df["volume"].rolling(lookback_bars).sum()
+    rvwap = (tpv / vv).shift(1)  # exclude current bar for consolidation check
+
+    cur_close = df["close"].iloc[-1]
+    cur_vwap = (tpv / vv).iloc[-1]
+
+    prior = df.iloc[-(lookback_bars+1):-1].copy()
+    vwap_prior = rvwap.iloc[-(lookback_bars): -0].values
+    band_hi = vwap_prior * (1 + band_pct)
+    band_lo = vwap_prior * (1 - band_pct)
+    closes_prior = prior["close"].astype(float).values
+    in_band = (closes_prior >= band_lo) & (closes_prior <= band_hi)
+    frac = float(in_band.mean()) if len(in_band) else 0.0
+
+    expansion = abs(cur_close / cur_vwap - 1.0) if cur_vwap and np.isfinite(cur_vwap) else 0.0
+
+    k = min(lookback_bars, 12)
+    vsub = (tpv.iloc[-k:] / vv.iloc[-k:]).values
+    slope = (vsub[-1] - vsub[0]) / vsub[0] if (len(vsub) >= 2 and vsub[0]) else 0.0
+    slope_pph = float(slope * (60/5) / k)  # convert to percent-per-hour on 5m bars
+
+    return {"vwap_frac_in_band": float(frac),
+            "vwap_expansion_pct": float(expansion),
+            "vwap_slope_pph": float(slope_pph)}

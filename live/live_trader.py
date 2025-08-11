@@ -523,6 +523,17 @@ class LiveTrader:
             df5['atr'] = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
             df5['adx'] = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
+            lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
+            band_pct = float(self.cfg.get("VWAP_STACK_BAND_PCT", 0.004))
+
+            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe="5m", limit=max(200, lookback+20))
+            df5 = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
+
+            vw = indicators.vwap_stack_features(df5, lookback_bars=lookback, band_pct=band_pct)
+            signal_obj.vwap_stack_frac = vw["vwap_frac_in_band"]
+            signal_obj.vwap_stack_expansion_pct = vw["vwap_expansion_pct"]
+            signal_obj.vwap_stack_slope_pph = vw["vwap_slope_pph"]
+
             tf_minutes = 5
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
@@ -662,6 +673,33 @@ class LiveTrader:
             traceback.print_exc()
         return None
 
+    def _vwap_stack_multiplier(self, frac: float, expansion: float) -> float:
+        if not self.cfg.get("VWAP_STACK_SIZING_ENABLED", True):
+            return 1.0
+
+        f_min = float(self.cfg.get("VWAP_STACK_FRAC_MIN", 0.50))
+        f_good = float(self.cfg.get("VWAP_STACK_FRAC_GOOD", 0.70))
+        e_min = float(self.cfg.get("VWAP_STACK_EXPANSION_ABS_MIN", 0.006))
+        e_good = float(self.cfg.get("VWAP_STACK_EXPANSION_GOOD", 0.015))
+        w_f = float(self.cfg.get("VWAP_STACK_FRAC_WEIGHT", 0.6))
+        w_e = float(self.cfg.get("VWAP_STACK_EXP_WEIGHT", 0.4))
+        m_lo = float(self.cfg.get("VWAP_STACK_MIN_MULTIPLIER", 0.20))
+        m_hi = float(self.cfg.get("VWAP_STACK_MAX_MULTIPLIER", 1.00))
+
+        # Normalize to [0,1] within bands and clamp
+        def _norm(x, lo, hi):
+            if hi <= lo: return 0.0
+            return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+        s_frac = _norm(frac, f_min, f_good)
+        s_exp  = _norm(expansion, e_min, e_good)
+        score  = w_f * s_frac + w_e * s_exp
+
+        # Map score linearly to [m_lo, m_hi]
+        mult = m_lo + (m_hi - m_lo) * score
+        return max(m_lo, min(m_hi, float(mult)))
+
+
     async def _get_eth_macd_barometer(self) -> Optional[dict]:
         """
         Returns latest ETHUSDT 4h MACD dict: {'macd': x, 'signal': y, 'hist': z}.
@@ -712,6 +750,8 @@ class LiveTrader:
         if risk_usd <= 0:
             LOG.info("Risk=0 → veto entry for %s.", sig.symbol)
             return
+        vw_mult = self._vwap_stack_multiplier(signal_obj.vwap_stack_frac, signal_obj.vwap_stack_expansion_pct)
+        risk_usd *= vw_mult
 
         # --- Compute size from live price / ATR distance ---
         try:
@@ -801,6 +841,10 @@ class LiveTrader:
                     "PARTIAL_TP_ATR_MULT": self.cfg.get("PARTIAL_TP_ATR_MULT"),
                     "PARTIAL_TP_PCT": self.cfg.get("PARTIAL_TP_PCT"),
                 }),
+                "vwap_stack_frac_at_entry": float(getattr(sig, "vwap_stack_frac", 0.0)),
+                "vwap_stack_expansion_pct_at_entry": float(getattr(sig, "vwap_stack_expansion_pct", 0.0)),
+                "vwap_stack_slope_pph_at_entry": float(getattr(sig, "vwap_stack_slope_pph", 0.0)),
+                "vwap_stack_multiplier_at_entry": float(vw_mult),
                 "win_probability_at_entry": float(getattr(sig, "win_probability", 0.0)),
             })
 
@@ -854,8 +898,10 @@ class LiveTrader:
             await self.tg.send(
                 f"🚀 **({days[sig.day_of_week]})** Opened {sig.symbol} short {actual_size:.4f} @ {actual_entry_price:.6f}\n"
                 f"🛡️ SL: {stop_price:.6f} | TP: {'TP1' if tp1_cid else 'FINAL'}\n"
+                f"📊 VWAP mult: {vw_mult:.2f}  frac={signal_obj.vwap_stack_frac:.2f}  exp={signal_obj.vwap_stack_expansion_pct*100:.2f}%\n"
                 f"🎯 WinProb: {getattr(sig,'win_probability',0.0)*100:.1f}%"
             )
+
 
         except Exception as e:
             # EMERGENCY CLOSE to prevent naked position
@@ -1632,6 +1678,7 @@ class LiveTrader:
 
     async def run(self):
         await self.db.init()
+        await self.db.migrate_schema()
 
         if self.settings.bybit_testnet:
             LOG.warning("="*60)
