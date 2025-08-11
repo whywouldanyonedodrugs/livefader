@@ -751,26 +751,20 @@ class LiveTrader:
             return
 
         # --- Base risk selection (fixed | percent) ---
-        # Backward compatible: default is fixed dollar risk via RISK_USD.
-        # Optionally set RISK_MODE="percent" to use RISK_EQUITY_PCT * latest_equity.
         mode = str(self.cfg.get("RISK_MODE", "fixed")).lower()
-
-        # Fixed-dollar fallback if equity fetch fails
         fixed_risk = float(self.cfg.get("RISK_USD", 10.0))
-
         base_risk_usd = fixed_risk
         if mode == "percent":
             try:
-                latest_eq = await self.db.latest_equity()  # may be None if no snapshots yet
+                latest_eq = await self.db.latest_equity()
                 latest_eq = float(latest_eq) if latest_eq is not None else 0.0
             except Exception:
                 latest_eq = 0.0
             pct = float(self.cfg.get("RISK_EQUITY_PCT", 0.01))  # 1% default if used
-            # If equity is missing, fall back to fixed
             base_risk_usd = max(0.0, latest_eq * pct) if latest_eq > 0 else fixed_risk
 
         # --- Multipliers (environmental & model) ---
-        # 1) ETH barometer → size gate
+        # 1) ETH barometer
         eth_mult = 1.0
         if self.cfg.get("ETH_BAROMETER_ENABLED", False):
             try:
@@ -778,11 +772,11 @@ class LiveTrader:
                 hist = float(eth.get("hist", 0.0)) if eth else 0.0
                 if hist > float(self.cfg.get("ETH_MACD_HIST_CUTOFF_POS", 0.0)):
                     eth_mult = float(self.cfg.get("ETH_UNFAV_SIZE_MULT", 0.2))
-                    self.log.info("ETH barometer unfavorable → reducing size by multiplier %.2f.", eth_mult)
+                    LOG.info("ETH barometer unfavorable → reducing size by multiplier %.2f.", eth_mult)
                 else:
-                    self.log.info("ETH barometer favorable/disabled → using base risk %.2f.", base_risk_usd)
+                    LOG.info("ETH barometer favorable/disabled → using base risk %.2f.", base_risk_usd)
             except Exception as e:
-                self.log.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
+                LOG.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
 
         # 2) VWAP-stack multiplier (safe if features missing)
         vw_mult = self._vwap_stack_multiplier(
@@ -805,7 +799,6 @@ class LiveTrader:
         risk_usd = base_risk_usd * eth_mult * vw_mult * wp_mult
 
         # --- OPTIONAL clamps (only applied if provided) ---
-        # If you don't set these in config, no clamping occurs.
         min_risk_cfg = self.cfg.get("RISK_USD_MIN", None)
         max_risk_cfg = self.cfg.get("RISK_USD_MAX", None)
         if (min_risk_cfg is not None) or (max_risk_cfg is not None):
@@ -837,9 +830,8 @@ class LiveTrader:
             LOG.error("Failed to fetch live ticker for %s: %s", sig.symbol, e)
             return
 
-        # Preview stop distance for sizing: SL above entry (short)
         sl_mult = float(self.cfg.get("SL_ATR_MULT", 1.8))
-        stop_price_preview = px + sl_mult * float(sig.atr)
+        stop_price_preview = px + sl_mult * float(sig.atr)   # short → SL above entry
         stop_dist = abs(px - stop_price_preview)
         if stop_dist <= 0:
             LOG.warning("Stop distance is zero for %s. Skip.", sig.symbol)
@@ -884,7 +876,8 @@ class LiveTrader:
             LOG.error("Entry failed to confirm for %s; no exchange position appeared.", sig.symbol)
             return
 
-        slippage_usd = (float(sig.entry) - actual_entry_price) * actual_size
+        # Use the price we just saw pre-entry for slippage vs the actual fill
+        slippage_usd = (px - actual_entry_price) * actual_size
         LOG.info("Entry confirmed %s: size=%.6f @ %.6f (slip $%.4f)",
                 sig.symbol, actual_size, actual_entry_price, slippage_usd)
 
@@ -953,7 +946,7 @@ class LiveTrader:
                 params={
                     "triggerPrice": float(stop_price),
                     "clientOrderId": sl_cid, "category": "linear",
-                    "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 1  # price rising triggers buy for short
+                    "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 1  # rising price triggers buy for short
                 }
             )
 
@@ -962,20 +955,21 @@ class LiveTrader:
                 tp1_cid = create_stable_cid(pid, "TP1")
                 tp_price = actual_entry_price - float(self.cfg.get("PARTIAL_TP_ATR_MULT", 1.0)) * float(sig.atr)
                 qty_tp1 = actual_size * float(self.cfg.get("PARTIAL_TP_PCT", 0.5))
+                qty_tp1 = max(0.0, min(qty_tp1, actual_size))  # guard remainder
                 await self.exchange.create_order(
                     sig.symbol, "market", "buy", qty_tp1, None,
                     params={
                         "triggerPrice": float(tp_price),
                         "clientOrderId": tp1_cid, "category": "linear",
-                        "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 2  # price falling triggers buy for short TP
+                        "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": 2  # falling price triggers buy for short TP
                     }
                 )
-                # final for the remainder?
                 if self.cfg.get("FINAL_TP_ENABLED", True):
                     tp_final_cid = create_stable_cid(pid, "TP_FINAL")
                     tp_final_price = actual_entry_price - float(self.cfg.get("FINAL_TP_ATR_MULT", 1.0)) * float(sig.atr)
+                    remainder = max(0.0, actual_size - qty_tp1)
                     await self.exchange.create_order(
-                        sig.symbol, "market", "buy", actual_size - qty_tp1, None,
+                        sig.symbol, "market", "buy", remainder, None,
                         params={
                             "triggerPrice": float(tp_final_price),
                             "clientOrderId": tp_final_cid, "category": "linear",
@@ -1037,6 +1031,7 @@ class LiveTrader:
                 await self.tg.send(f"✅ Emergency close filled for {sig.symbol}.")
             except Exception as close_e:
                 await self.tg.send(f"🚨 FAILED EMERGENCY CLOSE for {sig.symbol}: {close_e}")
+
 
 
     async def _manage_positions_loop(self):
