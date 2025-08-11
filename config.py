@@ -81,7 +81,7 @@ GAP_MIN_BARS    = 3
 # VWAP_LEN = 15
 
 # --- Working ---
-VWAP_STACK_SIZING_ENABLED: true
+VWAP_STACK_SIZING_ENABLED: True
 
 # how we compute the features
 VWAP_STACK_LOOKBACK_BARS: 12        # on 5m bars ≈ 1 hour
