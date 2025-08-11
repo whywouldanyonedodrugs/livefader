@@ -145,18 +145,31 @@ def _oof_cv(pipeline_builder, X: pd.DataFrame, y: pd.Series, C_L1: float, calib_
     return oof, folds, brier, auc
 
 def _coef_report(X: pd.DataFrame, y: pd.Series, C_L1: float, seed: int, top_k: int = 12):
-    """Fit an uncalibrated L1 LR (same preprocess) to report non-zero coefficients."""
+    """
+    Fit an uncalibrated L1 LR (same preprocess) to report non-zero coefficients.
+    Robust to any mismatch between transformed feature count and reported names.
+    """
     pre = _preprocessor()
     lr = LogisticRegression(penalty="l1", solver="liblinear", C=C_L1, max_iter=4000, random_state=seed)
     pipe = Pipeline(steps=[("pre", pre), ("lr", lr)])
     pipe.fit(X, y)
-    # feature names after preprocessor
-    names = pipe.named_steps["pre"].get_feature_names_out()
+
     coefs = pipe.named_steps["lr"].coef_.ravel()
+    # Try to fetch feature names; fall back to x0..x{n-1}
+    try:
+        names = pipe.named_steps["pre"].get_feature_names_out()
+    except Exception:
+        names = np.array([f"x{i}" for i in range(coefs.size)])
+
+    if len(names) != coefs.size:
+        # Final safety net: guarantee same length as coef vector
+        names = np.array([f"x{i}" for i in range(coefs.size)])
+
     nz = np.flatnonzero(coefs)
-    pairs = [(names[i], float(coefs[i])) for i in nz]
+    pairs = [(names[i], float(coefs[i])) for i in nz if i < len(names)]
     pairs.sort(key=lambda t: abs(t[1]), reverse=True)
-    return pairs[:top_k], len(nz), len(coefs)
+    return pairs[:top_k], int(len(nz)), int(coefs.size)
+
 
 async def main():
     cfg = _fetch_env()
@@ -179,10 +192,16 @@ async def main():
     LOG.info("In-sample Brier=%.5f  (baseline=%.5f)  AUC=%.4f  N=%d", brier_in, brier_baseline, auc_in, len(df))
     LOG.info("Calibration used: %s", getattr(model, "_chosen_calibration", "sigmoid"))
 
-    # OOF CV diagnostics
+    # OOF 5-fold diagnostics
     oof, folds, brier_oof, auc_oof = _oof_cv(_build_pipeline, X, y, cfg["C_L1"], cfg["CALIB_METHOD"], cfg["SEED"])
-    pd.DataFrame({"oof_proba": oof, "y": y.values, "fold": folds}).to_csv(OOF_CSV, index=False)
+    pd.DataFrame({
+        "position_id": df["id"].values,  # <-- keep IDs for joining later
+        "oof_proba": oof,
+        "y": y.values,
+        "fold": folds
+    }).to_csv(OOF_CSV, index=False)
     LOG.info("OOF 5-fold  Brier=%.5f  (baseline=%.5f)  AUC=%.4f  → saved %s", brier_oof, brier_baseline, auc_oof, OOF_CSV)
+
 
     # Coefficient report from uncalibrated L1 LR (directional signal)
     top, nnz, dim = _coef_report(X, y, cfg["C_L1"], cfg["SEED"], top_k=12)
