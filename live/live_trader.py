@@ -32,8 +32,10 @@ import statsmodels.api as sm
 import yaml
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+
 import config as cfg
 from . import indicators as ta
+from indicators import vwap_stack_features
 from . import filters
 from . shared_utils import is_blacklisted
 from watchdog.events import FileSystemEventHandler
@@ -529,7 +531,7 @@ class LiveTrader:
             ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe="5m", limit=max(200, lookback+20))
             df5 = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
 
-            vw = indicators.vwap_stack_features(df5, lookback_bars=lookback, band_pct=band_pct)
+            vw = vwap_stack_features(df5, lookback_bars=lookback, band_pct=band_pct)
             signal_obj.vwap_stack_frac = vw["vwap_frac_in_band"]
             signal_obj.vwap_stack_expansion_pct = vw["vwap_expansion_pct"]
             signal_obj.vwap_stack_slope_pph = vw["vwap_slope_pph"]
