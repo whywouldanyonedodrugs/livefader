@@ -21,7 +21,7 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 import subprocess
-
+import math
 import aiohttp
 import asyncpg
 import ccxt.async_support as ccxt
@@ -52,6 +52,32 @@ def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
     """Calculates a Triangular Moving Average (TMA). Helper function."""
     # This is a simplified and faster version of TMA
     return series.rolling(window=period, min_periods=period).mean().rolling(window=period, min_periods=period).mean()
+
+def load_config(path: str | None = None):
+    candidates = [
+        Path(path) if path else None,
+        Path(os.getenv("CONFIG_PATH", "")) if os.getenv("CONFIG_PATH") else None,
+        Path.cwd() / "config.yaml",
+        Path(__file__).resolve().parent / "config.yaml",
+        Path("/live/config.yaml"),
+    ]
+    for p in [c for c in candidates if c]:
+        if p.exists():
+            with open(p, "r") as f:
+                cfg = yaml.safe_load(f)  # safe parser recommended. :contentReference[oaicite:2]{index=2}
+            print(f"[config] loaded: {p.resolve()}")
+            print("[config] sizing snapshot:", {
+                "WINPROB_SIZING_ENABLED": cfg.get("WINPROB_SIZING_ENABLED"),
+                "WINPROB_PROB_FLOOR": cfg.get("WINPROB_PROB_FLOOR", cfg.get("WINPROB_SIZE_FLOOR")),
+                "WINPROB_PROB_CAP":   cfg.get("WINPROB_PROB_CAP",   cfg.get("WINPROB_SIZE_CAP")),
+                "WINPROB_MIN_MULTIPLIER": cfg.get("WINPROB_MIN_MULTIPLIER"),
+                "WINPROB_MAX_MULTIPLIER": cfg.get("WINPROB_MAX_MULTIPLIER"),
+                "VWAP_STACK_SIZING_ENABLED": cfg.get("VWAP_STACK_SIZING_ENABLED"),
+                "VWAP_STACK_MIN_MULTIPLIER": cfg.get("VWAP_STACK_MIN_MULTIPLIER"),
+                "VWAP_STACK_MAX_MULTIPLIER": cfg.get("VWAP_STACK_MAX_MULTIPLIER"),
+            })
+            return cfg
+    raise FileNotFoundError("config.yaml not found in expected locations")
 
 class RegimeDetector:
     """
@@ -684,28 +710,50 @@ class LiveTrader:
 
     # inside live_trader.py (class LiveTrader)
 
-    def _vwap_stack_multiplier(self, frac: float | None, expansion_pct: float | None) -> float:
-        """Return a bounded [0.5, 1.2] multiplier from VWAP-stack features."""
-        try:
-            f = float(frac) if frac is not None else 0.0
-            e = float(expansion_pct) if expansion_pct is not None else 0.0  # already in %
-        except Exception:
-            f, e = 0.0, 0.0
+    def _vwap_stack_multiplier(self, stack_frac: float | None, expansion_pct: float | None) -> float:
+        """
+        VWAP stack multiplier fully controlled by YAML.
+        If VWAP_STACK_SIZING_ENABLED is False, returns 1.0.
+        If min==max, returns that constant (neutralization).
+        Uses your weights to blend 'frac' and 'expansion' → score → multiplier.
+        """
+        cfg = self.cfg
+        if not bool(cfg.get("VWAP_STACK_SIZING_ENABLED", True)):
+            return 1.0
 
-        mult = 1.0
-        if f >= 0.65:
-            mult *= 1.10
-        elif f >= 0.45:
-            mult *= 1.05
+        # Read bounds; min==max => neutralize
+        m_lo = float(cfg.get("VWAP_STACK_MIN_MULTIPLIER", 1.00))
+        m_hi = float(cfg.get("VWAP_STACK_MAX_MULTIPLIER", 1.00))
+        if abs(m_hi - m_lo) < 1e-12:
+            return m_lo
 
-        if e >= 1.5:
-            mult *= 1.05
-        elif e >= 0.8:
-            mult *= 1.02
+        # Read thresholds and weights
+        frac_min = float(cfg.get("VWAP_STACK_FRAC_MIN", 0.50))
+        frac_good = float(cfg.get("VWAP_STACK_FRAC_GOOD", 0.70))
+        exp_abs_min = float(cfg.get("VWAP_STACK_EXPANSION_ABS_MIN", 0.006))
+        exp_good = float(cfg.get("VWAP_STACK_EXPANSION_GOOD", 0.015))
+        w_frac = float(cfg.get("VWAP_STACK_FRAC_WEIGHT", 0.6))
+        w_exp  = float(cfg.get("VWAP_STACK_EXP_WEIGHT", 0.4))
+        if (w_frac + w_exp) <= 0:
+            w_frac = 1.0; w_exp = 0.0
 
-        return max(0.5, min(1.2, mult))
+        # Safe inputs
+        frac = float(stack_frac) if stack_frac is not None and np.isfinite(stack_frac) else 0.0
+        exp  = float(expansion_pct) if expansion_pct is not None and np.isfinite(expansion_pct) else 0.0
 
+        # Normalize each component to [0,1] over its min..good window
+        def lin01(x, lo, hi):
+            if hi <= lo:
+                hi = lo + 1e-6
+            return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
 
+        s_frac = lin01(frac, frac_min, frac_good)
+        s_exp  = lin01(abs(exp), exp_abs_min, exp_good)  # absolute expansion
+
+        score = (w_frac * s_frac + w_exp * s_exp) / (w_frac + w_exp)
+
+        # Map score [0,1] → [m_lo,m_hi]
+        return float(m_lo + score * (m_hi - m_lo))
 
     async def _get_eth_macd_barometer(self) -> Optional[dict]:
         """
@@ -725,6 +773,53 @@ class LiveTrader:
         except Exception as e:
             LOG.warning(f"ETH barometer unavailable: {e}")
             return None
+
+    def _winprob_multiplier(self, wp: float) -> float:
+        """
+        Map a win-probability 'wp' to a size multiplier, controlled by YAML.
+        Features:
+        - WINPROB_SIZING_ENABLED flag
+        - Separate input prob window vs. output multiplier range
+        - Backward compatible with WINPROB_SIZE_FLOOR/CAP (as prob bounds)
+        - Neutralization when min==max (returns that constant, typically 1.0)
+        """
+        cfg = self.cfg
+
+        # Feature flag
+        if not bool(cfg.get("WINPROB_SIZING_ENABLED", True)):
+            return 1.0
+
+        # No probability? No effect.
+        try:
+            wp = float(wp)
+        except Exception:
+            return 1.0
+        if not np.isfinite(wp) or wp <= 0.0:
+            return 1.0
+        # Clamp to [0,1] just in case
+        wp = float(np.clip(wp, 0.0, 1.0))
+
+        # ---- INPUT PROB WINDOW (domain) ----
+        # New names (preferred):
+        prob_lo = float(cfg.get("WINPROB_PROB_FLOOR",
+                    cfg.get("WINPROB_SIZE_FLOOR", 0.50)))  # back-compat
+        prob_hi = float(cfg.get("WINPROB_PROB_CAP",
+                    cfg.get("WINPROB_SIZE_CAP",   0.90)))  # back-compat
+        if prob_hi <= prob_lo:
+            prob_hi = prob_lo + 1e-6
+
+        # ---- OUTPUT MULTIPLIER RANGE (codomain) ----
+        # New names (preferred). Defaults replicate your legacy 0.7..1.3 behavior.
+        mult_lo = float(cfg.get("WINPROB_MIN_MULTIPLIER", 0.70))
+        mult_hi = float(cfg.get("WINPROB_MAX_MULTIPLIER", 1.30))
+
+        # If user set both to the same (e.g., 1.0), neutralize
+        if abs(mult_hi - mult_lo) < 1e-12:
+            return mult_lo
+
+        # Linear map wp∈[prob_lo,prob_hi] -> [mult_lo,mult_hi], clamped to ends
+        x = (np.clip(wp, prob_lo, prob_hi) - prob_lo) / (prob_hi - prob_lo)
+        return float(mult_lo + x * (mult_hi - mult_lo))
 
     async def _open_position(self, sig: Signal) -> None:
         """
@@ -764,62 +859,33 @@ class LiveTrader:
             base_risk_usd = max(0.0, latest_eq * pct) if latest_eq > 0 else fixed_risk
 
         # --- Multipliers (environmental & model) ---
-        # 1) ETH barometer
+        # 1) ETH barometer (your existing logic)
         eth_mult = 1.0
-        if self.cfg.get("ETH_BAROMETER_ENABLED", False):
-            try:
-                eth = await self._get_eth_macd_barometer()
-                hist = float(eth.get("hist", 0.0)) if eth else 0.0
-                if hist > float(self.cfg.get("ETH_MACD_HIST_CUTOFF_POS", 0.0)):
-                    eth_mult = float(self.cfg.get("ETH_UNFAV_SIZE_MULT", 0.2))
-                    LOG.info("ETH barometer unfavorable → reducing size by multiplier %.2f.", eth_mult)
-                else:
-                    LOG.info("ETH barometer favorable/disabled → using base risk %.2f.", base_risk_usd)
-            except Exception as e:
-                LOG.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
+        if bool(self.cfg.get("ETH_BAROMETER_ENABLED", True)):
+            eth_mult = self._eth_barometer_multiplier()  # assume returns 0.2..1.0 depending on regime
 
-        # 2) VWAP-stack multiplier (safe if features missing)
+        # 2) VWAP stack multiplier
         vw_mult = self._vwap_stack_multiplier(
             getattr(sig, "vwap_stack_frac", None),
             getattr(sig, "vwap_stack_expansion_pct", None),
         )
 
-        # 3) Calibrated win-prob sizing (gentle slope; backward compatible if no prob)
+        # 3) Calibrated win-prob multiplier
         wp = float(getattr(sig, "win_probability", 0.0) or 0.0)
-        wp_floor = float(self.cfg.get("WINPROB_SIZE_FLOOR", 0.45))
-        wp_cap   = float(self.cfg.get("WINPROB_SIZE_CAP",   0.65))
-        if wp <= 0.0:
-            wp_mult = 1.0
-        else:
-            wp_clamped = max(wp_floor, min(wp_cap, wp))
-            denom = max(1e-9, (wp_cap - wp_floor))
-            wp_mult = 0.7 + 0.6 * ((wp_clamped - wp_floor) / denom)
+        wp_mult = self._winprob_multiplier(wp)
 
-        # --- Combine into requested risk ---
+        # 4) Combine
         risk_usd = base_risk_usd * eth_mult * vw_mult * wp_mult
 
-        # --- OPTIONAL clamps (only applied if provided) ---
-        min_risk_cfg = self.cfg.get("RISK_USD_MIN", None)
-        max_risk_cfg = self.cfg.get("RISK_USD_MAX", None)
-        if (min_risk_cfg is not None) or (max_risk_cfg is not None):
-            try:
-                min_risk = float(0.0 if min_risk_cfg is None else min_risk_cfg)
-            except Exception:
-                min_risk = 0.0
-            try:
-                max_risk = float(risk_usd if max_risk_cfg is None else max_risk_cfg)
-            except Exception:
-                max_risk = risk_usd
-            if max_risk < min_risk:
-                LOG.warning("Config RISK_USD_MAX < RISK_USD_MIN; swapping the values.")
-                min_risk, max_risk = max_risk, min_risk
-            risk_usd = max(min_risk, min(max_risk, risk_usd))
+        # 5) Optional global clamps from YAML
+        if self.cfg.get("RISK_USD_MIN") is not None:
+            risk_usd = max(float(self.cfg["RISK_USD_MIN"]), risk_usd)
+        if self.cfg.get("RISK_USD_MAX") is not None:
+            risk_usd = min(float(self.cfg["RISK_USD_MAX"]), risk_usd)
 
-        sig.risk_usd = float(risk_usd)
-
-        LOG.info(
-            "Sizing for %s → mode=%s base=%.2f, eth×=%.2f, vwap×=%.2f, wp=%.2f (wp×=%.2f) → risk_usd=%.2f",
-            sig.symbol, mode, base_risk_usd, eth_mult, vw_mult, wp, wp_mult, sig.risk_usd
+        self.log.info(
+            "Sizing → base=%.2f, eth×=%.2f, vwap×=%.2f, wp=%.2f (wp×=%.2f) → risk_usd=%.2f",
+            base_risk_usd, eth_mult, vw_mult, wp, wp_mult, risk_usd,
         )
 
         # --- Compute size from live price / ATR distance ---
@@ -1031,8 +1097,6 @@ class LiveTrader:
                 await self.tg.send(f"✅ Emergency close filled for {sig.symbol}.")
             except Exception as close_e:
                 await self.tg.send(f"🚨 FAILED EMERGENCY CLOSE for {sig.symbol}: {close_e}")
-
-
 
     async def _manage_positions_loop(self):
         while True:

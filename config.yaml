@@ -7,21 +7,25 @@ RISK_EQUITY_PCT: 0.01      # used when RISK_MODE=percent (1% of equity)
 RISK_USD_MIN: 
 RISK_USD_MAX: 20
 
-# Win-probability sizing
-WINPROB_SIZING_ENABLED: true    # set false to fully disable its influence
-WINPROB_SIZE_FLOOR: 1.00        # lower bound of wp range (only used if enabled)
-WINPROB_SIZE_CAP:   1.00        # upper bound of wp range (only used if enabled)
+# --- Win-probability sizing ---
+WINPROB_SIZING_ENABLED: true
 
-# VWAP stack → sizing
-VWAP_STACK_SIZING_ENABLED: true    # set false to fully disable its influence
-VWAP_STACK_LOOKBACK_BARS: 12
-VWAP_STACK_BAND_PCT: 0.004
-VWAP_STACK_EXPANSION_ABS_MIN: 0.006
-VWAP_STACK_EXPANSION_GOOD:    0.015
+# Input prob window (map wp∈[FLOOR, CAP] to multipliers)
+WINPROB_PROB_FLOOR: 0.50     # if absent, falls back to WINPROB_SIZE_FLOOR or 0.50
+WINPROB_PROB_CAP:   0.90     # if absent, falls back to WINPROB_SIZE_CAP   or 0.90
+
+# Output multiplier range (set both to 1.00 to neutralize)
+WINPROB_MIN_MULTIPLIER: 1.00
+WINPROB_MAX_MULTIPLIER: 1.00
+
+# --- VWAP stack sizing ---
+VWAP_STACK_SIZING_ENABLED: true
+VWAP_STACK_MIN_MULTIPLIER: 1.00   # min==max==1.00 ⇒ neutralize
+VWAP_STACK_MAX_MULTIPLIER: 1.00
 VWAP_STACK_FRAC_MIN:  0.50
 VWAP_STACK_FRAC_GOOD: 0.70
-VWAP_STACK_MIN_MULTIPLIER: 1.00   # set both min/max to 1.00 to neutralize even if enabled
-VWAP_STACK_MAX_MULTIPLIER: 1.00
+VWAP_STACK_EXPANSION_ABS_MIN: 0.006
+VWAP_STACK_EXPANSION_GOOD:    0.015
 VWAP_STACK_FRAC_WEIGHT: 0.6
 VWAP_STACK_EXP_WEIGHT: 0.4
 
