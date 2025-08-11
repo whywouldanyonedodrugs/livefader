@@ -44,7 +44,7 @@ TARGET_COL = "is_win"
 def _fetch_env():
     load_dotenv()
     return dict(
-        PG_DSN=os.getenv("PG_DSN", "postgresql://postgres:postgres@localhost:5432/livedb"),
+        PG_DSN=os.getenv("PG_DSN", "postgresql://livefader:livepw@localhost:5432/livedb"),
         MIN_TRADES=int(os.getenv("TRAIN_MIN_TRADES", "200")),
         C_L1=float(os.getenv("TRAIN_L1_C", "0.5")),
         CALIB_METHOD=os.getenv("CALIB_METHOD", "auto"),  # auto|isotonic|sigmoid
