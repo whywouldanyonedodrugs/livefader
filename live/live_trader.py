@@ -52,6 +52,24 @@ from pydantic_settings import BaseSettings
 class ModelBundle:
     pass
 
+# Cyclical hour encoder: returns [sin(hour*2π/24), cos(hour*2π/24)]
+def _hour_cyc(X):
+    import numpy as np
+    import pandas as pd
+    h = np.asarray(X).astype(float).reshape(-1, 1)
+    sin = np.sin(2 * np.pi * h / 24.0)
+    cos = np.cos(2 * np.pi * h / 24.0)
+    return np.hstack([sin, cos])
+
+# Day-of-week one-hot encoder: 7 columns, Mon=0..Sun=6 (or whatever you used)
+def _dow_onehot(X):
+    import numpy as np
+    import pandas as pd
+    d = np.asarray(X).astype(int).reshape(-1, 1)
+    out = np.zeros((d.shape[0], 7), dtype=float)
+    m = (d >= 0) & (d < 7)
+    out[np.arange(d.shape[0])[m.ravel()], d[m].ravel()] = 1.0
+    return out
 
 def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
     """Calculates a Triangular Moving Average (TMA). Helper function."""
