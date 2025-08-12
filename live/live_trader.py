@@ -31,6 +31,7 @@ import numpy as np
 import statsmodels.api as sm
 import yaml
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from live.winprob_loader import WinProbScorer
 
 
 import config as cfg
@@ -345,16 +346,11 @@ class LiveTrader:
         self.api_semaphore = asyncio.Semaphore(10)
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-        self.win_prob_model = None
-        model_path = Path("win_probability_model.joblib")
-        if model_path.exists():
-            try:
-                self.win_prob_model = joblib.load(model_path)
-                LOG.info(f"Successfully loaded predictive model from {model_path}")
-            except Exception as e:
-                LOG.error(f"Failed to load predictive model: {e}")
+        self.winprob = WinProbScorer()
+        if self.winprob.is_loaded:
+            LOG.info("WinProb ready (kind=%s, features=%d)", self.winprob.kind, len(self.winprob.expected_features))
         else:
-            LOG.warning(f"Predictive model file not found at {model_path}. Win probability scoring will be disabled.")
+            LOG.warning("WinProb not loaded; using wp=0.0")        
 
     def _init_ccxt(self):
         ex = ccxt.bybit({
@@ -666,36 +662,51 @@ class LiveTrader:
                 signal_obj.vwap_stack_expansion_pct = vwap_exp
                 signal_obj.vwap_stack_slope_pph = vwap_slope
 
-                # ---- Win-prob scoring (if model present) ----
-                if self.win_prob_model:
-                    try:
-                        eth_bar = await self._get_eth_macd_barometer()
-                        eth_hist = float(eth_bar.get("hist", 0.0)) if eth_bar else 0.0
+                # ---- Win-prob scoring (statsmodels or sklearn via adapter) ----
+                try:
+                    eth_bar = await self._get_eth_macd_barometer()
+                    eth_hist = float(eth_bar.get("hist", 0.0)) if eth_bar else 0.0
 
-                        model_features = [n for n in self.win_prob_model.model.exog_names if n != "const"]
-                        live_data = {
-                            "rsi_at_entry": signal_obj.rsi,
-                            "adx_at_entry": signal_obj.adx,
-                            "price_boom_pct_at_entry": signal_obj.price_boom_pct,
-                            "price_slowdown_pct_at_entry": signal_obj.price_slowdown_pct,
-                            "vwap_z_at_entry": signal_obj.vwap_z_score,
-                            "ema_spread_pct_at_entry": (
-                                (signal_obj.ema_fast - signal_obj.ema_slow) / signal_obj.ema_slow
-                                if signal_obj.ema_slow > 0 else 0.0
-                            ),
-                            "is_ema_crossed_down_at_entry": int(signal_obj.is_ema_crossed_down),
-                            "day_of_week_at_entry": int(signal_obj.day_of_week),
-                            "hour_of_day_at_entry": int(signal_obj.hour_of_day),
-                            "eth_macdhist_at_entry": eth_hist,
-                        }
-                        features_df = pd.DataFrame([live_data], index=[0])
-                        features_df = features_df.reindex(columns=model_features, fill_value=0.0).astype(float)
-                        features_df = sm.add_constant(features_df, prepend=True, has_constant="add")
-                        win_prob = float(self.win_prob_model.predict(features_df)[0])
-                        signal_obj.win_probability = max(0.0, min(1.0, win_prob))
-                    except Exception as e:
-                        LOG.warning("Failed to score signal for %s: %s", symbol, e)
+                    # Build the live feature dict once
+                    live_data = {
+                        "rsi_at_entry": float(signal_obj.rsi),
+                        "adx_at_entry": float(signal_obj.adx),
+                        "price_boom_pct_at_entry": float(signal_obj.price_boom_pct),
+                        "price_slowdown_pct_at_entry": float(signal_obj.price_slowdown_pct),
+                        "vwap_z_at_entry": float(signal_obj.vwap_z_score),
+                        "ema_spread_pct_at_entry": (
+                            (float(signal_obj.ema_fast) - float(signal_obj.ema_slow)) / float(signal_obj.ema_slow)
+                            if float(signal_obj.ema_slow) > 0.0 else 0.0
+                        ),
+                        "is_ema_crossed_down_at_entry": int(bool(signal_obj.is_ema_crossed_down)),
+                        "day_of_week_at_entry": int(signal_obj.day_of_week),
+                        "hour_of_day_at_entry": int(signal_obj.hour_of_day),
+                        "eth_macdhist_at_entry": eth_hist,
+
+                        # Include VWAP-stack features if present in your research model
+                        "vwap_stack_frac_at_entry": (
+                            float(signal_obj.vwap_stack_frac) if getattr(signal_obj, "vwap_stack_frac", None) is not None else 0.0
+                        ),
+                        "vwap_stack_expansion_pct_at_entry": (
+                            float(signal_obj.vwap_stack_expansion_pct)
+                            if getattr(signal_obj, "vwap_stack_expansion_pct", None) is not None else 0.0
+                        ),
+                        "vwap_stack_slope_pph_at_entry": (
+                            float(signal_obj.vwap_stack_slope_pph)
+                            if getattr(signal_obj, "vwap_stack_slope_pph", None) is not None else 0.0
+                        ),
+                    }
+
+                    if hasattr(self, "winprob") and self.winprob.is_loaded:
+                        win_prob = self.winprob.score(live_data)  # uses predict_proba for sklearn; adds const for statsmodels internally
+                        signal_obj.win_probability = max(0.0, min(1.0, float(win_prob)))
+                    else:
                         signal_obj.win_probability = 0.0
+
+                except Exception as e:
+                    LOG.warning("Failed to score signal for %s: %s", symbol, e)
+                    signal_obj.win_probability = 0.0
+
 
                 return signal_obj
 

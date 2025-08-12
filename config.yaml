@@ -1,6 +1,6 @@
 # ===== Risk & Sizing =====
 RISK_MODE: fixed           # fixed | percent
-RISK_USD: 10.0             # used when RISK_MODE=fixed  (your code looks for RISK_USD)
+RISK_USD: 10             # used when RISK_MODE=fixed  (your code looks for RISK_USD)
 RISK_EQUITY_PCT: 0.01      # used when RISK_MODE=percent (1% of equity)
 
 # Optional caps (if omitted, no clamping is applied by code)
