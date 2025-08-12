@@ -13,6 +13,26 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 LOG = logging.getLogger(__name__)
 
+# --- THIS IS THE BULLETPROOF FIX ---
+# A custom function to handle multiple possible date formats from Bybit
+def robust_date_parser(date_string):
+    # List of formats Bybit is known to use, in order of likelihood
+    formats_to_try = [
+        '%d/%m/%Y %H:%M',  # e.g., 12/08/2025 05:01
+        '%H:%M %Y-%m-%d',  # e.g., 02:48 2025-08-09
+        '%Y-%m-%d %H:%M:%S',# e.g., 2025-08-12 08:01:44
+    ]
+    for fmt in formats_to_try:
+        try:
+            # Return the first format that successfully parses the date
+            return pd.to_datetime(date_string, format=fmt, utc=True)
+        except (ValueError, TypeError):
+            continue
+    # If no formats work, return NaT (Not a Time) which pandas can handle
+    LOG.warning(f"Could not parse date: {date_string}. It will be marked as invalid.")
+    return pd.NaT
+# --- END OF FIX ---
+
 async def main(csv_path: str):
     load_dotenv()
     db_dsn = os.getenv("DATABASE_URL")
@@ -21,16 +41,14 @@ async def main(csv_path: str):
         return
 
     try:
-        # Load the trade history CSV from Bybit
         bybit_df = pd.read_csv(csv_path)
         
-        # --- THIS IS THE DEFINITIVE FIX ---
-        # Use format='mixed' to allow pandas to automatically infer the date format for each row.
-        # This makes the script robust to inconsistencies in the Bybit CSV export.
-        # dayfirst=True provides a hint to correctly parse ambiguous dates like '01/02/2025'.
-        bybit_df['Filled/Settlement Time(UTC+0)'] = pd.to_datetime(bybit_df['Filled/Settlement Time(UTC+0)'], format='mixed', dayfirst=True, utc=True)
-        bybit_df['Create Time'] = pd.to_datetime(bybit_df['Create Time'], format='mixed', dayfirst=True, utc=True)
-        # --- END OF FIX ---
+        # Use our new robust parser on the date columns
+        bybit_df['Filled/Settlement Time(UTC+0)'] = bybit_df['Filled/Settlement Time(UTC+0)'].apply(robust_date_parser)
+        bybit_df['Create Time'] = bybit_df['Create Time'].apply(robust_date_parser)
+        
+        # Drop any rows where the date could not be parsed
+        bybit_df.dropna(subset=['Filled/Settlement Time(UTC+0)', 'Create Time'], inplace=True)
         
         LOG.info(f"Loaded and processed {len(bybit_df)} trade records from {csv_path}")
 
@@ -48,15 +66,13 @@ async def main(csv_path: str):
         update_count = 0
         not_found_count = 0
 
-        # Use itertuples for robust access, avoiding issues with special characters in column names
-        # Column indices from your CSV: 0: Contracts, 4: Realized P&L, 7: Filled/Settlement Time, 8: Create Time
         for true_trade in tqdm(bybit_df.itertuples(index=False, name=None), total=len(bybit_df), desc="Fixing Trades from CSV"):
             try:
                 symbol = true_trade[0]
                 true_open_time = true_trade[8]
                 
                 query = """
-                    SELECT id, pnl FROM positions
+                    SELECT id, pnl, closed_at FROM positions
                     WHERE symbol = $1 AND status = 'CLOSED'
                     AND opened_at BETWEEN $2 AND $3
                 """
@@ -69,11 +85,12 @@ async def main(csv_path: str):
                     pos_id = db_match['id']
                     db_pnl = float(db_match['pnl']) if db_match['pnl'] is not None else 0.0
                     true_pnl = float(true_trade[4])
+                    true_closed_at = true_trade[7]
 
-                    if abs(db_pnl - true_pnl) > 0.01:
+                    # Check if either PnL or the close time is wrong
+                    if abs(db_pnl - true_pnl) > 0.01 or db_match['closed_at'].replace(tzinfo=timezone.utc) != true_closed_at:
                         LOG.info(f"Fixing trade {pos_id} ({symbol}): DB PnL {db_pnl:.4f} -> Exchange PnL {true_pnl:.4f}")
                         
-                        true_closed_at = true_trade[7]
                         holding_minutes = (true_closed_at - true_open_time).total_seconds() / 60
                         
                         update_query = """
