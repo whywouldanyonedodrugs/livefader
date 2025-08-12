@@ -124,43 +124,54 @@ def _load_research_pipeline(model_path: str):
     obj = joblib.load(p)
     return _unwrap_pipeline(obj)
 
+def _build_feat_dict(row: pd.Series) -> dict:
+    ema_slow = float(row.get("ema_slow_at_entry", 0.0))
+    ema_fast = float(row.get("ema_fast_at_entry", 0.0))
+    ema_spread = (ema_fast - ema_slow) / ema_slow if ema_slow > 0 else 0.0
+    return {
+        "rsi_at_entry": float(row.get("rsi_at_entry", 0.0)),
+        "adx_at_entry": float(row.get("adx_at_entry", 0.0)),
+        "price_boom_pct_at_entry": float(row.get("price_boom_pct_at_entry", 0.0)),
+        "price_slowdown_pct_at_entry": float(row.get("price_slowdown_pct_at_entry", 0.0)),
+        "vwap_z_at_entry": float(row.get("vwap_z_at_entry", 0.0)),
+        "ema_spread_pct_at_entry": float(row.get("ema_spread_pct_at_entry", ema_spread)),
+        "day_of_week_at_entry": int(row.get("day_of_week_at_entry", 0)) % 7,
+        "hour_of_day_at_entry": int(row.get("hour_of_day_at_entry", 0)) % 24,
+        "eth_macdhist_at_entry": float(row.get("eth_macdhist_at_entry", 0.0)),
+        # VWAP-stack extras (safe defaults if missing)
+        "vwap_stack_frac_at_entry": float(row.get("vwap_stack_frac_at_entry", 0.0)),
+        "vwap_stack_expansion_pct_at_entry": float(row.get("vwap_stack_expansion_pct_at_entry", 0.0)),
+        "vwap_stack_slope_pph_at_entry": float(row.get("vwap_stack_slope_pph_at_entry", 0.0)),
+    }
+
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
-    """
-    Return numpy array of win probabilities, or None on failure.
-    Works with:
-      - sklearn pipeline/estimator that has predict_proba
-      - dict/wrapper around such a pipeline
-      - statsmodels Logit results (uses .predict)
-    """
     if not model_path:
         print("No model path provided; skipping model scoring.")
         return None
 
+    # First try to score through the same adapter the live bot uses.
     try:
-        obj = _load_research_pipeline(model_path)
+        scorer = _init_scorer(model_path)  # your helper that tries WinProbScorer(path=...) and positional
+        preds = []
+        for _, row in df.iterrows():
+            try:
+                preds.append(float(scorer.score(_build_feat_dict(row))))
+            except Exception:
+                preds.append(np.nan)
+        preds = np.array(preds, dtype=float)
+        if np.isfinite(preds).any():
+            return preds
     except Exception as e:
-        print(f"Failed to load model: {e}")
+        print(f"WinProbScorer path failed: {e}")
+
+    # Fallback: try to unwrap to a pure sklearn pipeline and use predict_proba
+    try:
+        pipe = _load_research_pipeline(model_path)  # your existing joblib unwrap helper
+        X = _prep_X_for_model(df)                   # your existing column builder
+        return pipe.predict_proba(X)[:, 1].astype(float)
+    except Exception as e:
+        print(f"Direct sklearn path failed: {e}")
         return None
-
-    # Branch A: sklearn-style with predict_proba
-    if hasattr(obj, "predict_proba"):
-        try:
-            X = _prep_X_for_model(df)
-            return obj.predict_proba(X)[:, 1].astype(float)
-        except Exception as e:
-            print(f"Model predict_proba failed: {e}")
-            return None
-
-    # Branch B: statsmodels results (LogitResults / wrapper) -> .predict gives probabilities
-    if hasattr(obj, "predict") and hasattr(obj, "model"):
-        try:
-            return _statsmodels_predict(obj, df)
-        except Exception as e:
-            print(f"Statsmodels predict failed: {e}")
-            return None
-
-    print("Loaded object cannot produce probabilities (no predict_proba or statsmodels predict).")
-    return None
 
 # -----------------------
 # Pretty printing helpers
