@@ -27,8 +27,8 @@ except Exception:
 
 RESULTS_DIR = Path("results")
 
-# stub to allow unpickling if a pickle references __main__.ModelBundle
-class ModelBundle:
+# ---- stubs to make old pickles load even if module paths changed ----
+class ModelBundle:  # if a pickle references __main__.ModelBundle, unpickle won't fail
     pass
 
 def _hour_cyc(x):
@@ -38,10 +38,19 @@ def _hour_cyc(x):
     cos = _np.cos(2 * _np.pi * hour / 24.0)
     return _np.concatenate([sin, cos], axis=1)
 
-# alias used by some old pickles
-def hour_to_sin_cos(x):
+def hour_to_sin_cos(x):  # alias used by some pickles
     return _hour_cyc(x)
+# ---------------------------------------------------------------------
 
+def _is_informative(arr: np.ndarray) -> bool:
+    """True if predictions contain some spread (not all-NaN and not (near) constant)."""
+    if arr is None or len(arr) == 0:
+        return False
+    arr = np.asarray(arr, dtype=float)
+    if not np.isfinite(arr).any():
+        return False
+    lo, hi = np.nanmin(arr), np.nanmax(arr)
+    return (hi - lo) >= 1e-6
 
 def _unwrap_estimator_and_features(obj) -> Tuple[object, Optional[List[str]]]:
     """
@@ -59,7 +68,6 @@ def _unwrap_estimator_and_features(obj) -> Tuple[object, Optional[List[str]]]:
             return obj["calibrator"], feats
         if "pipeline" in obj:
             return obj["pipeline"], feats
-        # otherwise fall through to return raw dict (won't score)
 
     # dataclass / class bundle
     if hasattr(obj, "calibrator"):
@@ -72,7 +80,6 @@ def _unwrap_estimator_and_features(obj) -> Tuple[object, Optional[List[str]]]:
     # raw estimator or statsmodels results
     return obj, None
 
-
 def _statsmodels_predict(results_obj, df: pd.DataFrame) -> np.ndarray:
     """
     Build exog to match statsmodels' expected columns & constant, then call .predict().
@@ -83,11 +90,10 @@ def _statsmodels_predict(results_obj, df: pd.DataFrame) -> np.ndarray:
     names_wo_const = [n for n in exog_names if n != "const"]
     X = df.reindex(columns=names_wo_const, fill_value=0.0).astype(float)
     if sm is None:
-        raise RuntimeError("statsmodels is not available to add constant/predict.")
+        raise RuntimeError("statsmodels not available to add constant/predict.")
     X = sm.add_constant(X, prepend=True, has_constant="add")
     p = results_obj.predict(X)
     return np.asarray(p, dtype=float)
-
 
 # -----------------------
 # Research model features
@@ -107,16 +113,19 @@ _FEATURES_FOR_MODEL: List[str] = [
     "hour_of_day_at_entry",
 ]
 
-def _prep_X_for_model(df: pd.DataFrame) -> pd.DataFrame:
+def _prep_X_for_model(df: pd.DataFrame, feature_names: Optional[List[str]] = None) -> pd.DataFrame:
     """
     Build the feature frame the sklearn research pipeline expects by name.
+    If feature_names is provided by the bundle, use that exact list/order.
     """
-    needed = _FEATURES_FOR_MODEL
+    needed = list(feature_names) if feature_names else list(_FEATURES_FOR_MODEL)
     X = pd.DataFrame(index=df.index)
     for c in needed:
         X[c] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else 0.0
-    X["day_of_week_at_entry"] = X["day_of_week_at_entry"].fillna(0).clip(0,6).astype(int)
-    X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0,23).astype(int)
+    if "day_of_week_at_entry" in X.columns:
+        X["day_of_week_at_entry"] = X["day_of_week_at_entry"].fillna(0).clip(0, 6).astype(int)
+    if "hour_of_day_at_entry" in X.columns:
+        X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0, 23).astype(int)
     return X.fillna(0.0)
 
 def _load_model_object(model_path: str):
@@ -158,7 +167,6 @@ def _init_scorer(model_path: str):
     except TypeError:
         return WinProbScorer(path=model_path) # fallback signature
 
-
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
     if not model_path:
         print("No model path provided; skipping model scoring.")
@@ -175,8 +183,11 @@ def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np
             except Exception:
                 preds.append(np.nan)
         arr = np.asarray(preds, dtype=float)
-        if np.isfinite(arr).any():
+        # NEW: guard against degenerate/constant outputs; fallback to direct path
+        if _is_informative(arr):
             return arr
+        else:
+            print("Live scorer returned degenerate probabilities; falling back to pickle.")
     except Exception as e:
         print(f"WinProbScorer path failed: {e}")
 
@@ -187,12 +198,7 @@ def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np
 
         # scikit-learn estimator with probabilities (pipeline or calibrator)
         if hasattr(est, "predict_proba"):
-            if feat_names:
-                # Use the exact training feature list; fill missing with 0.0
-                X = df.reindex(columns=list(feat_names), fill_value=0.0).astype(float)
-            else:
-                # Fallback to a generic prep if feature_names were not saved
-                X = _prep_X_for_model(df)
+            X = _prep_X_for_model(df, feature_names=feat_names)
             return est.predict_proba(X)[:, 1].astype(float)
 
         # statsmodels result: build exog by exog_names (+ add constant)
@@ -206,7 +212,6 @@ def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np
     except Exception as e:
         print(f"Direct path failed: {e}")
         return None
-
 
 # -----------------------
 # Pretty printing helpers
@@ -325,7 +330,7 @@ def _ece(y: np.ndarray, p: np.ndarray, m_bins: int = 10) -> Tuple[pd.DataFrame, 
     return pd.DataFrame(rows), float(ece)
 
 def _brier(y: np.ndarray, p: np.ndarray) -> Tuple[float, float]:
-    base = float(np.mean((y - y.mean()) ** 2))  # constant-forecast baseline
+    base = float(np.mean((y - y.mean()) ** 2))  # constant-forecast baseline = p*(1-p)
     score = float(np.mean((y - p) ** 2))        # Brier score (lower is better)
     return score, base
 
@@ -553,8 +558,8 @@ def main():
     brier_tuple = None
 
     preds = score_with_model(df, args.model_path)
-    if preds is not None and np.isfinite(preds).any():
-        df["winprob_pred"] = preds
+    if preds is not None and _is_informative(preds):
+        df["winprob_pred"] = np.asarray(preds, dtype=float)
         y = df["is_win"].astype(int).values
         p = np.nan_to_num(df["winprob_pred"].values, nan=np.mean(y))
 
