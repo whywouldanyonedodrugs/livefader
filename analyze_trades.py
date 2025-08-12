@@ -22,9 +22,6 @@ RESULTS_DIR = Path("results")
 class ModelBundle:  # stub so __main__.ModelBundle exists during unpickle
     pass
 
-# --- PICKLE SHIMS: make unpickling succeed if the saved pipeline references __main__._hour_cyc ---
-# The model’s FunctionTransformer likely referenced a function called `_hour_cyc`
-# when it was trained under __main__. Re-create it here so joblib can find it.
 def _hour_cyc(x):
     import numpy as _np
     hour = _np.asarray(x).reshape(-1, 1).astype(float)
@@ -32,8 +29,7 @@ def _hour_cyc(x):
     cos = _np.cos(2 * _np.pi * hour / 24.0)
     return _np.concatenate([sin, cos], axis=1)
 
-# If some models used a different name (e.g., hour_to_sin_cos), alias it:
-def hour_to_sin_cos(x):
+def hour_to_sin_cos(x):  # alias used by some pickles
     return _hour_cyc(x)
 
 
@@ -145,26 +141,29 @@ def _build_feat_dict(row: pd.Series) -> dict:
     }
 
 def _init_scorer(model_path: str):
+    """Create WinProbScorer regardless of constructor signature."""
     if WinProbScorer is None:
-        raise RuntimeError("WinProbScorer not available")
+        raise RuntimeError("WinProbScorer not importable")
+    p = Path(model_path).expanduser().resolve()
+    if not p.exists() or p.is_dir():
+        raise FileNotFoundError(f"Model file not found or is a directory: {p}")
     try:
-        return WinProbScorer(model_path)      # positional (newer)
+        return WinProbScorer(str(p))      # new signature (positional)
     except TypeError:
-        return WinProbScorer(path=model_path) # older signature
+        return WinProbScorer(path=str(p)) # older signature (named
 
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
     if not model_path:
         print("No model path provided; skipping model scoring.")
         return None
 
-    # Path A: same adapter the live bot uses (handles both sklearn bundle and statsmodels bundle)
+    # Path A: use the same adapter the live bot uses
     try:
         scorer = _init_scorer(model_path)
         preds = []
         for _, row in df.iterrows():
-            feats = _build_feat_dict(row)   # builds ema_spread_pct, etc.
             try:
-                preds.append(float(scorer.score(feats)))
+                preds.append(float(scorer.score(_build_feat_dict(row))))
             except Exception:
                 preds.append(np.nan)
         arr = np.array(preds, dtype=float)
@@ -173,27 +172,46 @@ def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np
     except Exception as e:
         print(f"WinProbScorer path failed: {e}")
 
-    # Path B/C: load the raw object and branch on its capabilities
+    # Path B: load the pickle and unwrap
     try:
-        obj = _load_research_pipeline(model_path)  # returns dict['pipeline'], obj.pipeline, or obj itself
+        obj = joblib.load(Path(model_path).expanduser().resolve())
 
-        # B) scikit-learn estimator / Pipeline with predict_proba
-        if hasattr(obj, "predict_proba"):
+        # unwrap typical shapes
+        if isinstance(obj, dict) and "pipeline" in obj:
+            est = obj["pipeline"]
+        elif hasattr(obj, "pipeline"):
+            est = getattr(obj, "pipeline")
+        else:
+            est = obj
+
+        # B1) pure sklearn estimator/pipeline
+        if hasattr(est, "predict_proba"):
             X = _prep_X_for_model(df)
-            return obj.predict_proba(X)[:, 1].astype(float)  # Pipeline.predict_proba is the standard API. :contentReference[oaicite:3]{index=3}
+            return est.predict_proba(X)[:, 1].astype(float)
 
-        # C) statsmodels results (Logit/GLM) → use .predict(exog) with add_constant
-        #    Build exog from rows with _build_feat_dict, then align to expected exog_names (incl. const)
-        if hasattr(obj, "predict") and hasattr(getattr(obj, "model", None), "exog_names"):
-            Z = pd.DataFrame([_build_feat_dict(r) for _, r in df.iterrows()])
-            # align/score via helper that adds 'const' and respects exog_names order
-            return _statsmodels_predict(obj, Z)  # statsmodels' predict uses exog matching training design. :contentReference[oaicite:4]{index=4}
+        # B2) wrapper that has statsmodels results under .model
+        if hasattr(est, "model") and hasattr(est.model, "predict"):
+            results_obj = est  # keep same shape for _statsmodels_predict
+            X = df.reindex(columns=[n for n in results_obj.model.exog_names if n != "const"], fill_value=0.0).astype(float)
+            if sm is None:
+                raise RuntimeError("statsmodels not installed")
+            X = sm.add_constant(X, prepend=True, has_constant="add")
+            return np.asarray(results_obj.predict(X), dtype=float)
+
+        # B3) raw statsmodels results object
+        if hasattr(est, "predict") and hasattr(getattr(est, "model", None), "exog_names"):
+            results_obj = est
+            X = df.reindex(columns=[n for n in results_obj.model.exog_names if n != "const"], fill_value=0.0).astype(float)
+            if sm is None:
+                raise RuntimeError("statsmodels not installed")
+            X = sm.add_constant(X, prepend=True, has_constant="add")
+            return np.asarray(results_obj.predict(X), dtype=float)
 
         print("Loaded object cannot produce probabilities (no predict_proba or statsmodels predict).")
         return None
 
     except Exception as e:
-        print(f"Direct sklearn/statsmodels path failed: {e}")
+        print(f"Direct load path failed: {e}")
         return None
 
 
