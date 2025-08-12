@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy import stats
+from live.winprob_loader import WinProbScorer
 
 # --- Optional: statsmodels quick logit, gated by --quick-logit ---
 try:
@@ -26,6 +27,52 @@ except Exception:
     WINPROB_AVAILABLE = False
 
 RESULTS_DIR = Path("results")
+
+# -----------------------
+# Score W MODEL
+# -----------------------
+
+def _score_with_model(df: pd.DataFrame, model_path: str) -> pd.DataFrame:
+    """
+    Adds a column 'pred_winprob' using the live-compatible scorer.
+    The scorer aligns/filters features internally.
+    """
+    # Instantiate scorer: accept both positional and common kw names
+    try:
+        scorer = WinProbScorer(str(model_path))  # preferred
+    except TypeError:
+        try:
+            scorer = WinProbScorer(path=str(model_path))  # alt kw
+        except TypeError:
+            scorer = WinProbScorer()  # last resort (default internal path)
+
+    if getattr(scorer, "is_loaded", False) is False:
+        print(f"Model not loaded from {model_path}; skipping predictions.")
+        return df
+
+    preds = []
+    for _, r in df.iterrows():
+        # Build a dict the scorer can understand (names match live features)
+        live_data = {
+            "rsi_at_entry": float(r.get("rsi_at_entry", 0.0)),
+            "adx_at_entry": float(r.get("adx_at_entry", 0.0)),
+            "price_boom_pct_at_entry": float(r.get("price_boom_pct_at_entry", 0.0)),
+            "price_slowdown_pct_at_entry": float(r.get("price_slowdown_pct_at_entry", 0.0)),
+            "vwap_z_at_entry": float(r.get("vwap_z_at_entry", 0.0)),
+            "ema_spread_pct_at_entry": float(r.get("ema_spread_pct_at_entry", 0.0)),
+            "is_ema_crossed_down_at_entry": int(bool(r.get("is_ema_crossed_down_at_entry", 0))),
+            "day_of_week_at_entry": int(r.get("day_of_week_at_entry", 0)),
+            "hour_of_day_at_entry": int(r.get("hour_of_day_at_entry", 0)),
+            "eth_macdhist_at_entry": float(r.get("eth_macdhist_at_entry", 0.0)),
+            # VWAP-stack (present after your backfill)
+            "vwap_stack_frac_at_entry": float(r.get("vwap_stack_frac_at_entry", 0.0)),
+            "vwap_stack_expansion_pct_at_entry": float(r.get("vwap_stack_expansion_pct_at_entry", 0.0)),
+            "vwap_stack_slope_pph_at_entry": float(r.get("vwap_stack_slope_pph_at_entry", 0.0)),
+        }
+        preds.append(float(scorer.score(live_data)))
+    df = df.copy()
+    df["pred_winprob"] = preds
+    return df
 
 # -----------------------
 # Pretty printing helpers
@@ -423,6 +470,12 @@ def main():
         print("No rows in trade file.")
         return
     df = feature_engineering(df)
+
+    if getattr(args, "model_path", None):
+        try:
+            df = _score_with_model(df, args.model_path)
+        except Exception as e:
+            print(f"Failed to load model: {e}")
 
     # Top-line KPIs
     header("TOP-LINE KPIs")
