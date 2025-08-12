@@ -22,6 +22,21 @@ RESULTS_DIR = Path("results")
 class ModelBundle:  # stub so __main__.ModelBundle exists during unpickle
     pass
 
+# --- PICKLE SHIMS: make unpickling succeed if the saved pipeline references __main__._hour_cyc ---
+# The model’s FunctionTransformer likely referenced a function called `_hour_cyc`
+# when it was trained under __main__. Re-create it here so joblib can find it.
+def _hour_cyc(x):
+    import numpy as _np
+    hour = _np.asarray(x).reshape(-1, 1).astype(float)
+    sin = _np.sin(2 * _np.pi * hour / 24.0)
+    cos = _np.cos(2 * _np.pi * hour / 24.0)
+    return _np.concatenate([sin, cos], axis=1)
+
+# If some models used a different name (e.g., hour_to_sin_cos), alias it:
+def hour_to_sin_cos(x):
+    return _hour_cyc(x)
+
+
 # -----------------------
 # Research model features
 # -----------------------
