@@ -32,47 +32,55 @@ RESULTS_DIR = Path("results")
 # Score W MODEL
 # -----------------------
 
-def _score_with_model(df: pd.DataFrame, model_path: str) -> pd.DataFrame:
+def _init_scorer(model_path: str):
     """
-    Adds a column 'pred_winprob' using the live-compatible scorer.
-    The scorer aligns/filters features internally.
+    Hardened constructor for WinProbScorer that works across loader variants.
+    Accepts either positional path or named 'path=' depending on class signature.
     """
-    # Instantiate scorer: accept both positional and common kw names
+    p = Path(model_path).expanduser().resolve()
+    if not p.exists() or p.is_dir():
+        raise FileNotFoundError(f"Model file not found or is a directory: {p}")
     try:
-        scorer = WinProbScorer(str(model_path))  # preferred
+        return WinProbScorer(str(p))        # positional (newer/most common)
     except TypeError:
+        return WinProbScorer(path=str(p))   # fallback for older signature
+
+def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Score each trade row using the calibrated research model bundle.
+
+    Returns:
+        np.ndarray of probabilities aligned to df.index, or None if model not available.
+    """
+    if not model_path:
+        print("No model path provided; skipping model scoring.")
+        return None
+    if not WINPROB_AVAILABLE:
+        print("WinProbScorer import failed; cannot score with research model.")
+        return None
+
+    # Resolve and validate the model path
+    p = Path(model_path).expanduser().resolve()
+    if not p.exists() or p.is_dir():
+        print(f"Model file not found or is a directory: {p}")
+        return None
+
+    # Initialize scorer
+    try:
+        scorer = _init_scorer(str(p))
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        return None
+
+    # Predict with robust per-row fallback
+    preds = np.full(len(df), np.nan, dtype=float)
+    for i, (_, row) in enumerate(df.iterrows()):
         try:
-            scorer = WinProbScorer(path=str(model_path))  # alt kw
-        except TypeError:
-            scorer = WinProbScorer()  # last resort (default internal path)
+            preds[i] = float(scorer.score(_build_feat_dict(row)))
+        except Exception:
+            preds[i] = np.nan
 
-    if getattr(scorer, "is_loaded", False) is False:
-        print(f"Model not loaded from {model_path}; skipping predictions.")
-        return df
-
-    preds = []
-    for _, r in df.iterrows():
-        # Build a dict the scorer can understand (names match live features)
-        live_data = {
-            "rsi_at_entry": float(r.get("rsi_at_entry", 0.0)),
-            "adx_at_entry": float(r.get("adx_at_entry", 0.0)),
-            "price_boom_pct_at_entry": float(r.get("price_boom_pct_at_entry", 0.0)),
-            "price_slowdown_pct_at_entry": float(r.get("price_slowdown_pct_at_entry", 0.0)),
-            "vwap_z_at_entry": float(r.get("vwap_z_at_entry", 0.0)),
-            "ema_spread_pct_at_entry": float(r.get("ema_spread_pct_at_entry", 0.0)),
-            "is_ema_crossed_down_at_entry": int(bool(r.get("is_ema_crossed_down_at_entry", 0))),
-            "day_of_week_at_entry": int(r.get("day_of_week_at_entry", 0)),
-            "hour_of_day_at_entry": int(r.get("hour_of_day_at_entry", 0)),
-            "eth_macdhist_at_entry": float(r.get("eth_macdhist_at_entry", 0.0)),
-            # VWAP-stack (present after your backfill)
-            "vwap_stack_frac_at_entry": float(r.get("vwap_stack_frac_at_entry", 0.0)),
-            "vwap_stack_expansion_pct_at_entry": float(r.get("vwap_stack_expansion_pct_at_entry", 0.0)),
-            "vwap_stack_slope_pph_at_entry": float(r.get("vwap_stack_slope_pph_at_entry", 0.0)),
-        }
-        preds.append(float(scorer.score(live_data)))
-    df = df.copy()
-    df["pred_winprob"] = preds
-    return df
+    return preds
 
 # -----------------------
 # Pretty printing helpers
@@ -365,7 +373,7 @@ def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np
         print(f"Model file not found: {model_file}")
         return None
     try:
-        scorer = WinProbScorer(model_path=str(model_file))
+        scorer = _init_scorer(str(model_file))
     except Exception as e:
         print(f"Failed to load model: {e}")
         return None
