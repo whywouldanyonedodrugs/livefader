@@ -159,13 +159,12 @@ def _build_feat_dict(row: pd.Series) -> dict:
     }
 
 def _init_scorer(model_path: str):
-    """Try constructing the live adapter with either positional or named path argument."""
+    """Construct the live adapter using the current WinProbScorer API."""
     if WinProbScorer is None:
         raise RuntimeError("WinProbScorer not importable")
-    try:
-        return WinProbScorer(model_path)      # new-style ctor
-    except TypeError:
-        return WinProbScorer(path=model_path) # fallback signature
+    # WinProbScorer(paths=...) expects a Sequence[str]; wrap single path in a list.
+    return WinProbScorer(paths=[model_path])
+
 
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
     if not model_path:
