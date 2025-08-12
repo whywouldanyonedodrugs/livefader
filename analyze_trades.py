@@ -1,86 +1,78 @@
-# analyze_trades.py — upgraded, model-aware trade report
 import argparse
 from pathlib import Path
 import os
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import warnings
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from live.winprob_loader import WinProbScorer
+import joblib
+from sklearn.metrics import brier_score_loss
 
-# --- Optional: statsmodels quick logit, gated by --quick-logit ---
+# Optional: statsmodels quick logit, gated by --quick-logit
 try:
     import statsmodels.api as sm  # noqa
 except Exception:
     sm = None
 
-# --- Optional: load the calibrated research model via the live adapter ---
-WINPROB_AVAILABLE = True
-try:
-    # Adapter you added for the live bot
-    from live.winprob_loader import WinProbScorer  # noqa
-except Exception:
-    WINPROB_AVAILABLE = False
-
 RESULTS_DIR = Path("results")
 
 # -----------------------
-# Score W MODEL
+# Research model features
 # -----------------------
+_FEATURES_FOR_MODEL: List[str] = [
+    "rsi_at_entry",
+    "adx_at_entry",
+    "price_boom_pct_at_entry",
+    "price_slowdown_pct_at_entry",
+    "vwap_z_at_entry",
+    "ema_spread_pct_at_entry",
+    "eth_macdhist_at_entry",
+    "vwap_stack_frac_at_entry",
+    "vwap_stack_expansion_pct_at_entry",
+    "vwap_stack_slope_pph_at_entry",
+    "day_of_week_at_entry",
+    "hour_of_day_at_entry",
+]
 
-def _init_scorer(model_path: str):
-    """
-    Hardened constructor for WinProbScorer that works across loader variants.
-    Accepts either positional path or named 'path=' depending on class signature.
-    """
+def _prep_X_for_model(df: pd.DataFrame) -> pd.DataFrame:
+    X = pd.DataFrame(index=df.index)
+    for c in _FEATURES_FOR_MODEL:
+        X[c] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else 0.0
+    X["day_of_week_at_entry"] = X["day_of_week_at_entry"].fillna(0).clip(0, 6).astype(int)
+    X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0, 23).astype(int)
+    return X.fillna(0.0)
+
+def _load_research_pipeline(model_path: str):
     p = Path(model_path).expanduser().resolve()
-    if not p.exists() or p.is_dir():
-        raise FileNotFoundError(f"Model file not found or is a directory: {p}")
-    try:
-        return WinProbScorer(str(p))        # positional (newer/most common)
-    except TypeError:
-        return WinProbScorer(path=str(p))   # fallback for older signature
+    if not p.exists():
+        raise FileNotFoundError(f"Model file not found: {p}")
+    if not p.is_file():
+        raise IsADirectoryError(f"Expected a file, got a directory: {p}")
+    obj = joblib.load(p)
+    pipe = obj["pipeline"] if isinstance(obj, dict) and "pipeline" in obj else obj
+    if not hasattr(pipe, "predict_proba"):
+        raise TypeError("Loaded object has no predict_proba; not a sklearn probabilistic pipeline.")
+    return pipe
 
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
-    """
-    Score each trade row using the calibrated research model bundle.
-
-    Returns:
-        np.ndarray of probabilities aligned to df.index, or None if model not available.
-    """
     if not model_path:
         print("No model path provided; skipping model scoring.")
         return None
-    if not WINPROB_AVAILABLE:
-        print("WinProbScorer import failed; cannot score with research model.")
-        return None
-
-    # Resolve and validate the model path
-    p = Path(model_path).expanduser().resolve()
-    if not p.exists() or p.is_dir():
-        print(f"Model file not found or is a directory: {p}")
-        return None
-
-    # Initialize scorer
     try:
-        scorer = _init_scorer(str(p))
+        pipe = _load_research_pipeline(model_path)
     except Exception as e:
         print(f"Failed to load model: {e}")
         return None
-
-    # Predict with robust per-row fallback
-    preds = np.full(len(df), np.nan, dtype=float)
-    for i, (_, row) in enumerate(df.iterrows()):
-        try:
-            preds[i] = float(scorer.score(_build_feat_dict(row)))
-        except Exception:
-            preds[i] = np.nan
-
-    return preds
+    try:
+        X = _prep_X_for_model(df)
+        return pipe.predict_proba(X)[:, 1].astype(float)
+    except Exception as e:
+        print(f"Model predict failed: {e}")
+        return None
 
 # -----------------------
 # Pretty printing helpers
@@ -111,10 +103,11 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     # Boolean outcome
     df["is_win"] = df["net_pnl"] > 0
 
-    # Safe numerics (used by various summaries)
-    for c in ("rsi_at_entry", "adx_at_entry", "price_boom_pct_at_entry", "price_slowdown_pct_at_entry",
-              "ema_fast_at_entry", "ema_slow_at_entry", "vwap_z_at_entry", "vwap_stack_frac_at_entry",
-              "vwap_stack_expansion_pct_at_entry", "vwap_stack_slope_pph_at_entry", "holding_minutes"):
+    # Safe numerics used later
+    for c in ("rsi_at_entry","adx_at_entry","price_boom_pct_at_entry","price_slowdown_pct_at_entry",
+              "ema_fast_at_entry","ema_slow_at_entry","vwap_z_at_entry",
+              "vwap_stack_frac_at_entry","vwap_stack_expansion_pct_at_entry",
+              "vwap_stack_slope_pph_at_entry","holding_minutes"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -127,7 +120,7 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
         df["ema_spread_abs"] = df["ema_fast_at_entry"] - df["ema_slow_at_entry"]
         df["ema_spread_pct"] = df["ema_spread_abs"] / df["ema_slow_at_entry"]
 
-    # vwap_dev_pct historical aliasing
+    # Historical alias
     if "vwap_dev_pct_at_entry" in df.columns and "pct_to_vwap" not in df.columns:
         df.rename(columns={"vwap_dev_pct_at_entry": "pct_to_vwap"}, inplace=True)
 
@@ -160,12 +153,9 @@ def top_line_kpis(df: pd.DataFrame) -> pd.DataFrame:
     exp_trade = df["net_pnl"].mean()
     pf = _profit_factor(df["net_pnl"])
     hold_hours = df["holding_hours"].mean()
-
-    # Daily Sharpe/Sortino from equity snapshots (optional separate file)
-    # Here we compute simple per-trade analogs for quick at-a-glance signal quality:
     wins = df.loc[df["net_pnl"] > 0, "net_pnl"].mean()
     losses = df.loc[df["net_pnl"] < 0, "net_pnl"].mean()
-    kpis = pd.DataFrame([{
+    return pd.DataFrame([{
         "trades": n,
         "win_rate": wr,
         "expectancy": exp_trade,
@@ -174,18 +164,15 @@ def top_line_kpis(df: pd.DataFrame) -> pd.DataFrame:
         "avg_win": wins,
         "avg_loss": losses,
     }])
-    return kpis
 
 # -------------------------------------
 # Calibration, ECE and reliability bins
 # -------------------------------------
 def _ece(y: np.ndarray, p: np.ndarray, m_bins: int = 10) -> Tuple[pd.DataFrame, float]:
-    """Reliability table + Expected Calibration Error (|p - freq| weighted)."""
     y = y.astype(int)
     p = p.astype(float)
     bins = np.linspace(0.0, 1.0, m_bins + 1)
     idx = np.clip(np.digitize(p, bins) - 1, 0, m_bins - 1)
-
     rows = []
     ece = 0.0
     for b in range(m_bins):
@@ -201,27 +188,21 @@ def _ece(y: np.ndarray, p: np.ndarray, m_bins: int = 10) -> Tuple[pd.DataFrame, 
         rows.append(dict(bin=b, lower=bins[b], upper=bins[b+1], n=n_b,
                          avg_p=avg_p, win_rate=win_rate, abs_gap=abs_gap))
         ece += (n_b / len(y)) * abs_gap
-
-    table = pd.DataFrame(rows)
-    return table, float(ece)
+    return pd.DataFrame(rows), float(ece)
 
 def _brier(y: np.ndarray, p: np.ndarray) -> Tuple[float, float]:
-    """Brier and constant baseline (mean(y)) for context."""
-    base = float(np.mean((y - y.mean()) ** 2))  # baseline = uncertainty term for constant forecast
-    score = float(np.mean((y - p) ** 2))
+    base = float(np.mean((y - y.mean()) ** 2))  # constant-forecast baseline
+    score = float(np.mean((y - p) ** 2))        # Brier score (lower is better)
     return score, base
 
 def decile_lift(y: np.ndarray, p: np.ndarray) -> pd.DataFrame:
     df = pd.DataFrame({"y": y, "p": p})
-    # handle ties: drop duplicate edges if necessary
     try:
         df["decile"] = pd.qcut(df["p"], q=10, labels=False, duplicates="drop")
     except Exception:
         df["decile"] = pd.qcut(df["p"].rank(method="first"), q=10, labels=False, duplicates="drop")
     g = (df.groupby("decile")
-           .agg(n=("y", "size"),
-                avg_p=("p", "mean"),
-                win_rate=("y", "mean"))
+           .agg(n=("y", "size"), avg_p=("p", "mean"), win_rate=("y", "mean"))
            .reset_index()
            .sort_values("decile", ascending=False))
     g["lift_vs_base"] = g["win_rate"] - df["y"].mean()
@@ -247,7 +228,6 @@ def describe_categorical(df, col, win_flag="is_win"):
     if True in tab.columns:
         tab["win_rate_%"] = 100 * tab[True] / tab["All"]
     print(tab.to_string())
-    # quick effect size (Cramér's V) if table dense enough
     if len(tab) > 1 and tab.shape[0] > 2 and tab.shape[1] > 2:
         try:
             chi2 = stats.chi2_contingency(tab.iloc[:-1, :-1])[0]
@@ -328,64 +308,6 @@ def quick_logit(df: pd.DataFrame, features, enabled: bool):
     except Exception as e:
         print(f"Logistic regression failed: {e}")
 
-# -----------------------
-# Model scoring utilities
-# -----------------------
-def _build_feat_dict(row: pd.Series) -> dict:
-    """Map one trade row to the live scorer's expected raw feature names."""
-    # mirror live scoring keys; anything missing defaults to 0.0
-    def fget(name, default=0.0):
-        v = row.get(name, default)
-        try:
-            return float(v)
-        except Exception:
-            return default
-
-    return {
-        "rsi_at_entry": fget("rsi_at_entry"),
-        "adx_at_entry": fget("adx_at_entry"),
-        "price_boom_pct_at_entry": fget("price_boom_pct_at_entry"),
-        "price_slowdown_pct_at_entry": fget("price_slowdown_pct_at_entry"),
-        "vwap_z_at_entry": fget("vwap_z_at_entry"),
-        "ema_spread_pct_at_entry": (
-            (fget("ema_fast_at_entry") - fget("ema_slow_at_entry")) / fget("ema_slow_at_entry")
-            if fget("ema_slow_at_entry") > 0 else 0.0
-        ),
-        "is_ema_crossed_down_at_entry": int(bool(row.get("is_ema_crossed_down_at_entry", 0))),
-        "day_of_week_at_entry": int(row.get("day_of_week_at_entry", 0)),
-        "hour_of_day_at_entry": int(row.get("hour_of_day_at_entry", 0)),
-        "eth_macdhist_at_entry": fget("eth_macdhist_at_entry"),
-        # VWAP-stack, if present
-        "vwap_stack_frac_at_entry": fget("vwap_stack_frac_at_entry"),
-        "vwap_stack_expansion_pct_at_entry": fget("vwap_stack_expansion_pct_at_entry"),
-        "vwap_stack_slope_pph_at_entry": fget("vwap_stack_slope_pph_at_entry"),
-    }
-
-def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
-    if model_path is None:
-        print("No model path provided; skipping model scoring.")
-        return None
-    if not WINPROB_AVAILABLE:
-        print("WinProbScorer import failed; cannot score with research model.")
-        return None
-    model_file = Path(model_path)
-    if not model_file.exists():
-        print(f"Model file not found: {model_file}")
-        return None
-    try:
-        scorer = _init_scorer(str(model_file))
-    except Exception as e:
-        print(f"Failed to load model: {e}")
-        return None
-
-    preds = []
-    for _, row in df.iterrows():
-        try:
-            preds.append(float(scorer.score(_build_feat_dict(row))))
-        except Exception:
-            preds.append(np.nan)
-    return np.array(preds, dtype=float)
-
 # --------------------------
 # Markdown report generation
 # --------------------------
@@ -396,7 +318,7 @@ def _write_markdown_report(title: str,
                            rel_path: Optional[Path],
                            lift_path: Optional[Path]) -> Path:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out = RESULTS_DIR / f"report_{datetime.utcnow().strftime('%Y-%m-%d')}.md"
+    out = RESULTS_DIR / f"report_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.md"
 
     lines = [f"# {title}",
              "",
@@ -427,7 +349,7 @@ def _write_markdown_report(title: str,
 # -------------------------
 async def send_telegram_report(report_file_path: str):
     from dotenv import load_dotenv
-    import telegram  # python-telegram-bot (compatible sendDocument)
+    import telegram  # python-telegram-bot
     load_dotenv()
     token = os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TG_CHAT_ID")
@@ -442,7 +364,7 @@ async def send_telegram_report(report_file_path: str):
                 chat_id=chat_id,
                 document=document,
                 filename=os.path.basename(report_file_path),
-                caption=f"LiveFader Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
+                caption=f"LiveFader Report - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
             )
         print("Telegram report sent successfully.")
     except FileNotFoundError:
@@ -479,20 +401,18 @@ def main():
         return
     df = feature_engineering(df)
 
-    if getattr(args, "model_path", None):
-        try:
-            df = _score_with_model(df, args.model_path)
-        except Exception as e:
-            print(f"Failed to load model: {e}")
-
     # Top-line KPIs
     header("TOP-LINE KPIs")
     kpis = top_line_kpis(df)
-    print(kpis.assign(win_rate=kpis["win_rate"].map(_fmt_pct),
-                      expectancy=kpis["expectancy"].map(_fmt2),
-                      profit_factor=kpis["profit_factor"].map(lambda x: "inf" if np.isinf(x) else _fmt2(x))).to_string(index=False))
+    print(
+        kpis.assign(
+            win_rate=kpis["win_rate"].map(_fmt_pct),
+            expectancy=kpis["expectancy"].map(_fmt2),
+            profit_factor=kpis["profit_factor"].map(lambda x: "inf" if np.isinf(x) else _fmt2(x))
+        ).to_string(index=False)
+    )
 
-    # Score with calibrated model, if available
+    # Score with research model (if provided) and evaluate probability quality
     rel_path = None
     lift_path = None
     ece_val = None
@@ -504,20 +424,16 @@ def main():
         y = df["is_win"].astype(int).values
         p = np.nan_to_num(df["winprob_pred"].values, nan=np.mean(y))
 
-        # Reliability / ECE / Brier
         header("CALIBRATION & LIFT (research model)")
         rel, ece_val = _ece(y, p, m_bins=max(5, args.bins))
         print(rel.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
         brier_tuple = _brier(y, p)
         print(f"\nBrier={brier_tuple[0]:.5f}  (constant baseline={brier_tuple[1]:.5f})")
-        print(f"ECE={ece_val:.5f}")
 
-        # Decile lift
         lift = decile_lift(y, p)
         print("\nDecile lift (sorted high→low p):")
         print(lift.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
-        # Save CSVs
         _save_table(rel, "reliability_table")
         _save_table(lift, "decile_lift")
         rel_path = RESULTS_DIR / "reliability_table.csv"
@@ -534,7 +450,6 @@ def main():
                          avg_pnl=("net_pnl", "mean"),
                          profit_factor=("net_pnl", _profit_factor))
                     .reset_index())
-        # pretty print
         regime["win_rate_%"] = 100.0 * regime["win_rate"]
         print(regime[["market_regime_at_entry", "total_trades", "win_rate_%", "avg_pnl", "profit_factor"]]
               .to_string(index=False, float_format=lambda v: f"{v:.2f}"))
@@ -551,7 +466,7 @@ def main():
               .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
         _save_table(tab2, name)
 
-    # Descriptive bands (kept, but concise)
+    # Descriptive bands (concise)
     if "rsi_at_entry" in df.columns:
         df["rsi_band"] = pd.cut(df["rsi_at_entry"], bins=[0, 50, 60, 70, 80, 100],
                                 labels=["<50", "50-60", "60-70", "70-80", ">80"])
@@ -559,7 +474,6 @@ def main():
     for cont in ("pct_to_ema_fast", "ema_spread_pct", "pct_to_vwap", "vwap_z_at_entry"):
         if cont in df.columns:
             describe_continuous(df, cont)
-
     if "vwap_consolidated_at_entry" in df.columns:
         describe_categorical(df, "vwap_consolidated_at_entry")
     for cat in ("session_tag_at_entry", "holding_bucket", "day_of_week_at_entry", "hour_of_day_at_entry"):
@@ -568,7 +482,6 @@ def main():
 
     # Optional quick logit (sanity check)
     cont_cols = [c for c in df.select_dtypes(include="number").columns if c not in ["is_win", "pnl", "net_pnl"]]
-    # top by abs point-biserial (quick heuristic)
     cors = {c: stats.pointbiserialr(df["is_win"], df[c])[0]
             for c in cont_cols if df[c].notna().sum() > 5 and np.std(df[c]) > 0}
     top10 = pd.Series(cors).abs().sort_values(ascending=False).head(10).index.tolist()
