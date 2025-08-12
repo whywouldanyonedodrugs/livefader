@@ -99,33 +99,23 @@ def _statsmodels_predict(results_obj, df: pd.DataFrame) -> np.ndarray:
 # Research model features
 # -----------------------
 _FEATURES_FOR_MODEL: List[str] = [
-    "rsi_at_entry",
-    "adx_at_entry",
-    "price_boom_pct_at_entry",
-    "price_slowdown_pct_at_entry",
-    "vwap_z_at_entry",
-    "ema_spread_pct_at_entry",
-    "eth_macdhist_at_entry",
-    "vwap_stack_frac_at_entry",
-    "vwap_stack_expansion_pct_at_entry",
-    "vwap_stack_slope_pph_at_entry",
-    "day_of_week_at_entry",
-    "hour_of_day_at_entry",
+    "rsi_at_entry","adx_at_entry","atr_pct_at_entry",
+    "price_boom_pct_at_entry","price_slowdown_pct_at_entry",
+    "vwap_z_at_entry","ema_spread_pct_at_entry","is_ema_crossed_down_at_entry",
+    "day_of_week_at_entry","hour_of_day_at_entry","eth_macdhist_at_entry",
+    "vwap_stack_frac_at_entry","vwap_stack_expansion_pct_at_entry","vwap_stack_slope_pph_at_entry",
 ]
 
-def _prep_X_for_model(df: pd.DataFrame, feature_names: Optional[List[str]] = None) -> pd.DataFrame:
-    """
-    Build the feature frame the sklearn research pipeline expects by name.
-    If feature_names is provided by the bundle, use that exact list/order.
-    """
-    needed = list(feature_names) if feature_names else list(_FEATURES_FOR_MODEL)
+def _prep_X_for_model(df: pd.DataFrame) -> pd.DataFrame:
+    needed = list(_FEATURES_FOR_MODEL)
     X = pd.DataFrame(index=df.index)
     for c in needed:
         X[c] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else 0.0
-    if "day_of_week_at_entry" in X.columns:
-        X["day_of_week_at_entry"] = X["day_of_week_at_entry"].fillna(0).clip(0, 6).astype(int)
-    if "hour_of_day_at_entry" in X.columns:
-        X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0, 23).astype(int)
+    X["day_of_week_at_entry"] = X["day_of_week_at_entry"].fillna(0).clip(0, 6).astype(int)
+    X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0, 23).astype(int)
+    # boolean as {0,1} if it came in as True/False
+    if "is_ema_crossed_down_at_entry" in X.columns:
+        X["is_ema_crossed_down_at_entry"] = (X["is_ema_crossed_down_at_entry"] > 0).astype(int)
     return X.fillna(0.0)
 
 def _load_model_object(model_path: str):
@@ -143,13 +133,32 @@ def _build_feat_dict(row: pd.Series) -> dict:
     ema_slow = float(row.get("ema_slow_at_entry", 0.0))
     ema_fast = float(row.get("ema_fast_at_entry", 0.0))
     ema_spread = (ema_fast - ema_slow) / ema_slow if ema_slow > 0 else 0.0
+
+    # --- atr_pct_at_entry ---
+    if "atr_pct_at_entry" in row and pd.notna(row["atr_pct_at_entry"]):
+        atr_pct = float(row["atr_pct_at_entry"])
+    else:
+        # tolerant fallback if you only have absolute ATR + price
+        atr_abs = float(row.get("atr_at_entry", row.get("atr_abs_at_entry", 0.0)))
+        price   = float(row.get("entry_price", 0.0))
+        atr_pct = (atr_abs / price) if price > 0 else 0.0
+
+    # --- is_ema_crossed_down_at_entry ---
+    if "is_ema_crossed_down_at_entry" in row and pd.notna(row["is_ema_crossed_down_at_entry"]):
+        crossed_down = int(bool(row["is_ema_crossed_down_at_entry"]))
+    else:
+        # proxy: fast below slow → bearish condition
+        crossed_down = int(ema_fast < ema_slow)
+
     return {
         "rsi_at_entry": float(row.get("rsi_at_entry", 0.0)),
         "adx_at_entry": float(row.get("adx_at_entry", 0.0)),
+        "atr_pct_at_entry": float(atr_pct),
         "price_boom_pct_at_entry": float(row.get("price_boom_pct_at_entry", 0.0)),
         "price_slowdown_pct_at_entry": float(row.get("price_slowdown_pct_at_entry", 0.0)),
         "vwap_z_at_entry": float(row.get("vwap_z_at_entry", 0.0)),
         "ema_spread_pct_at_entry": float(row.get("ema_spread_pct_at_entry", ema_spread)),
+        "is_ema_crossed_down_at_entry": crossed_down,
         "day_of_week_at_entry": int(row.get("day_of_week_at_entry", 0)) % 7,
         "hour_of_day_at_entry": int(row.get("hour_of_day_at_entry", 0)) % 24,
         "eth_macdhist_at_entry": float(row.get("eth_macdhist_at_entry", 0.0)),
