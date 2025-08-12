@@ -1,3 +1,4 @@
+# analyze_trades.py
 import argparse
 from pathlib import Path
 import os
@@ -18,13 +19,16 @@ try:
 except Exception:
     sm = None
 
+# Optional live-time adapter (best-effort; analyzer will fall back if missing)
 try:
-    from live.winprob_loader import WinProbScorer
+    from live.winprob_loader import WinProbScorer  # type: ignore
 except Exception:
-    WinProbScorer = None
+    WinProbScorer = None  # analyzer will continue without it
 
 RESULTS_DIR = Path("results")
-class ModelBundle:  # stub so __main__.ModelBundle exists during unpickle
+
+# stub to allow unpickling if a pickle references __main__.ModelBundle
+class ModelBundle:
     pass
 
 def _hour_cyc(x):
@@ -34,20 +38,40 @@ def _hour_cyc(x):
     cos = _np.cos(2 * _np.pi * hour / 24.0)
     return _np.concatenate([sin, cos], axis=1)
 
-def hour_to_sin_cos(x):  # alias used by some pickles
+# alias used by some old pickles
+def hour_to_sin_cos(x):
     return _hour_cyc(x)
 
 
-def _unwrap_pipeline(obj):
-    """Return an estimator that can produce probabilities or a statsmodels results object."""
-    # Case A: dict bundle like {"pipeline": <sklearn Pipeline>, ...}
-    if isinstance(obj, dict) and "pipeline" in obj:
-        return obj["pipeline"]
-    # Case B: dataclass / class with .pipeline attribute (e.g., ModelBundle)
+def _unwrap_estimator_and_features(obj) -> Tuple[object, Optional[List[str]]]:
+    """
+    Return (estimator_like, feature_names_or_None) from a variety of bundle shapes:
+      - dicts: {'calibrator': CalibratedClassifierCV, 'feature_names': [...]}
+               {'pipeline': sklearn Pipeline, 'feature_names': [...]}
+      - dataclass/objects: .calibrator, .feature_names  OR .pipeline
+      - raw sklearn estimator/pipeline (has .predict_proba)
+      - statsmodels results (has .predict and .model.exog_names)
+    """
+    # dict bundle
+    if isinstance(obj, dict):
+        feats = obj.get("feature_names") or obj.get("features") or None
+        if "calibrator" in obj:
+            return obj["calibrator"], feats
+        if "pipeline" in obj:
+            return obj["pipeline"], feats
+        # otherwise fall through to return raw dict (won't score)
+
+    # dataclass / class bundle
+    if hasattr(obj, "calibrator"):
+        feats = getattr(obj, "feature_names", None)
+        return getattr(obj, "calibrator"), feats
     if hasattr(obj, "pipeline"):
-        return getattr(obj, "pipeline")
-    # Case C: raw estimator / results object
-    return obj
+        feats = getattr(obj, "feature_names", None)
+        return getattr(obj, "pipeline"), feats
+
+    # raw estimator or statsmodels results
+    return obj, None
+
 
 def _statsmodels_predict(results_obj, df: pd.DataFrame) -> np.ndarray:
     """
@@ -55,21 +79,15 @@ def _statsmodels_predict(results_obj, df: pd.DataFrame) -> np.ndarray:
     """
     if not hasattr(results_obj, "predict") or not hasattr(results_obj, "model"):
         raise TypeError("Provided statsmodels object is missing .predict or .model.")
-
-    exog_names = list(getattr(results_obj.model, "exog_names", []))  # includes 'const' if used
-    # Remove 'const' from names we build; we’ll add it explicitly below
+    exog_names = list(getattr(results_obj.model, "exog_names", []))  # includes 'const' if present
     names_wo_const = [n for n in exog_names if n != "const"]
-    # Build in the exact order required; fill missing with 0.0
     X = df.reindex(columns=names_wo_const, fill_value=0.0).astype(float)
-
-    # Add constant as statsmodels expects (prepend=True so it mirrors training)
     if sm is None:
         raise RuntimeError("statsmodels is not available to add constant/predict.")
     X = sm.add_constant(X, prepend=True, has_constant="add")
-
-    # Get probabilities
     p = results_obj.predict(X)
     return np.asarray(p, dtype=float)
+
 
 # -----------------------
 # Research model features
@@ -92,14 +110,8 @@ _FEATURES_FOR_MODEL: List[str] = [
 def _prep_X_for_model(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build the feature frame the sklearn research pipeline expects by name.
-    (Same as your version—kept here for completeness.)
     """
-    needed = [
-        "rsi_at_entry","adx_at_entry","price_boom_pct_at_entry","price_slowdown_pct_at_entry",
-        "vwap_z_at_entry","ema_spread_pct_at_entry","eth_macdhist_at_entry",
-        "vwap_stack_frac_at_entry","vwap_stack_expansion_pct_at_entry","vwap_stack_slope_pph_at_entry",
-        "day_of_week_at_entry","hour_of_day_at_entry",
-    ]
+    needed = _FEATURES_FOR_MODEL
     X = pd.DataFrame(index=df.index)
     for c in needed:
         X[c] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else 0.0
@@ -107,23 +119,16 @@ def _prep_X_for_model(df: pd.DataFrame) -> pd.DataFrame:
     X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0,23).astype(int)
     return X.fillna(0.0)
 
-def _load_research_pipeline(model_path: str):
+def _load_model_object(model_path: str):
     """
-    Loads a model saved via joblib/pickle. It may be:
-      - a dict bundle with {"pipeline": sklearn Pipeline, ...}
-      - a wrapper class with .pipeline
-      - a statsmodels results object (LogitResults[Wrapper])
-      - a bare sklearn estimator/pipeline
-    Returns the unwrapped object; scoring will branch on capabilities.
+    Load the serialized object (bundle or estimator/results) and return it as-is.
     """
     p = Path(model_path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Model file not found: {p}")
     if not p.is_file():
         raise IsADirectoryError(f"Expected a file, got a directory: {p}")
-
-    obj = joblib.load(p)
-    return _unwrap_pipeline(obj)
+    return joblib.load(p)
 
 def _build_feat_dict(row: pd.Series) -> dict:
     ema_slow = float(row.get("ema_slow_at_entry", 0.0))
@@ -139,7 +144,6 @@ def _build_feat_dict(row: pd.Series) -> dict:
         "day_of_week_at_entry": int(row.get("day_of_week_at_entry", 0)) % 7,
         "hour_of_day_at_entry": int(row.get("hour_of_day_at_entry", 0)) % 24,
         "eth_macdhist_at_entry": float(row.get("eth_macdhist_at_entry", 0.0)),
-        # VWAP-stack extras (safe defaults if missing)
         "vwap_stack_frac_at_entry": float(row.get("vwap_stack_frac_at_entry", 0.0)),
         "vwap_stack_expansion_pct_at_entry": float(row.get("vwap_stack_expansion_pct_at_entry", 0.0)),
         "vwap_stack_slope_pph_at_entry": float(row.get("vwap_stack_slope_pph_at_entry", 0.0)),
@@ -165,7 +169,7 @@ def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np
         scorer = _init_scorer(model_path)  # will raise if adapter not available
         preds = []
         for _, row in df.iterrows():
-            feat = _build_feat_dict(row)   # your existing helper
+            feat = _build_feat_dict(row)
             try:
                 preds.append(float(scorer.score(feat)))
             except Exception:
@@ -176,19 +180,29 @@ def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np
     except Exception as e:
         print(f"WinProbScorer path failed: {e}")
 
-    # Path B: load the serialized estimator directly
+    # Path B: load the serialized estimator/bundle directly
     try:
-        est = _load_research_pipeline(model_path)  # unwrap dict/.pipeline/raw
-        # scikit-learn pipeline with probabilities
+        raw = _load_model_object(model_path)
+        est, feat_names = _unwrap_estimator_and_features(raw)
+
+        # scikit-learn estimator with probabilities (pipeline or calibrator)
         if hasattr(est, "predict_proba"):
-            X = _prep_X_for_model(df)
+            if feat_names:
+                # Use the exact training feature list; fill missing with 0.0
+                X = df.reindex(columns=list(feat_names), fill_value=0.0).astype(float)
+            else:
+                # Fallback to a generic prep if feature_names were not saved
+                X = _prep_X_for_model(df)
             return est.predict_proba(X)[:, 1].astype(float)
+
         # statsmodels result: build exog by exog_names (+ add constant)
         if hasattr(est, "predict") and hasattr(est, "model") and hasattr(est.model, "exog_names"):
-            p = _statsmodels_predict(est, df)  # uses est.model.exog_names + add_constant
+            p = _statsmodels_predict(est, df)
             return np.asarray(p, dtype=float)
+
         print("Loaded object cannot produce probabilities (no predict_proba or statsmodels predict).")
         return None
+
     except Exception as e:
         print(f"Direct path failed: {e}")
         return None
