@@ -19,6 +19,8 @@ except Exception:
     sm = None
 
 RESULTS_DIR = Path("results")
+class ModelBundle:  # stub so __main__.ModelBundle exists during unpickle
+    pass
 
 # -----------------------
 # Research model features
@@ -53,6 +55,24 @@ def _load_research_pipeline(model_path: str):
     if not p.is_file():
         raise IsADirectoryError(f"Expected a file, got a directory: {p}")
     obj = joblib.load(p)
+
+    # If it’s the old wrapper:
+    if hasattr(obj, "pipeline"):        # best case: it carried an sklearn pipeline
+        return obj.pipeline
+
+    if hasattr(obj, "model"):           # statsmodels case: wrap to look like sklearn
+        import statsmodels.api as sm
+        class _StatsmodelsAdapter:
+            def __init__(self, model):
+                self.model = model
+                self._names = [n for n in getattr(model, "exog_names", []) if n != "const"]
+            def predict_proba(self, X):
+                X2 = X.reindex(columns=self._names, fill_value=0.0)
+                X2 = sm.add_constant(X2, prepend=True, has_constant="add")
+                p = self.model.predict(X2)
+                return np.column_stack([1 - p, p])
+        return _StatsmodelsAdapter(obj.model)
+
     pipe = obj["pipeline"] if isinstance(obj, dict) and "pipeline" in obj else obj
     if not hasattr(pipe, "predict_proba"):
         raise TypeError("Loaded object has no predict_proba; not a sklearn probabilistic pipeline.")
