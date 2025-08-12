@@ -37,6 +37,39 @@ def hour_to_sin_cos(x):
     return _hour_cyc(x)
 
 
+def _unwrap_pipeline(obj):
+    """Return an estimator that can produce probabilities or a statsmodels results object."""
+    # Case A: dict bundle like {"pipeline": <sklearn Pipeline>, ...}
+    if isinstance(obj, dict) and "pipeline" in obj:
+        return obj["pipeline"]
+    # Case B: dataclass / class with .pipeline attribute (e.g., ModelBundle)
+    if hasattr(obj, "pipeline"):
+        return getattr(obj, "pipeline")
+    # Case C: raw estimator / results object
+    return obj
+
+def _statsmodels_predict(results_obj, df: pd.DataFrame) -> np.ndarray:
+    """
+    Build exog to match statsmodels' expected columns & constant, then call .predict().
+    """
+    if not hasattr(results_obj, "predict") or not hasattr(results_obj, "model"):
+        raise TypeError("Provided statsmodels object is missing .predict or .model.")
+
+    exog_names = list(getattr(results_obj.model, "exog_names", []))  # includes 'const' if used
+    # Remove 'const' from names we build; we’ll add it explicitly below
+    names_wo_const = [n for n in exog_names if n != "const"]
+    # Build in the exact order required; fill missing with 0.0
+    X = df.reindex(columns=names_wo_const, fill_value=0.0).astype(float)
+
+    # Add constant as statsmodels expects (prepend=True so it mirrors training)
+    if sm is None:
+        raise RuntimeError("statsmodels is not available to add constant/predict.")
+    X = sm.add_constant(X, prepend=True, has_constant="add")
+
+    # Get probabilities
+    p = results_obj.predict(X)
+    return np.asarray(p, dtype=float)
+
 # -----------------------
 # Research model features
 # -----------------------
@@ -56,58 +89,78 @@ _FEATURES_FOR_MODEL: List[str] = [
 ]
 
 def _prep_X_for_model(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the feature frame the sklearn research pipeline expects by name.
+    (Same as your version—kept here for completeness.)
+    """
+    needed = [
+        "rsi_at_entry","adx_at_entry","price_boom_pct_at_entry","price_slowdown_pct_at_entry",
+        "vwap_z_at_entry","ema_spread_pct_at_entry","eth_macdhist_at_entry",
+        "vwap_stack_frac_at_entry","vwap_stack_expansion_pct_at_entry","vwap_stack_slope_pph_at_entry",
+        "day_of_week_at_entry","hour_of_day_at_entry",
+    ]
     X = pd.DataFrame(index=df.index)
-    for c in _FEATURES_FOR_MODEL:
+    for c in needed:
         X[c] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else 0.0
-    X["day_of_week_at_entry"] = X["day_of_week_at_entry"].fillna(0).clip(0, 6).astype(int)
-    X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0, 23).astype(int)
+    X["day_of_week_at_entry"] = X["day_of_week_at_entry"].fillna(0).clip(0,6).astype(int)
+    X["hour_of_day_at_entry"] = X["hour_of_day_at_entry"].fillna(0).clip(0,23).astype(int)
     return X.fillna(0.0)
 
 def _load_research_pipeline(model_path: str):
+    """
+    Loads a model saved via joblib/pickle. It may be:
+      - a dict bundle with {"pipeline": sklearn Pipeline, ...}
+      - a wrapper class with .pipeline
+      - a statsmodels results object (LogitResults[Wrapper])
+      - a bare sklearn estimator/pipeline
+    Returns the unwrapped object; scoring will branch on capabilities.
+    """
     p = Path(model_path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Model file not found: {p}")
     if not p.is_file():
         raise IsADirectoryError(f"Expected a file, got a directory: {p}")
+
     obj = joblib.load(p)
-
-    # If it’s the old wrapper:
-    if hasattr(obj, "pipeline"):        # best case: it carried an sklearn pipeline
-        return obj.pipeline
-
-    if hasattr(obj, "model"):           # statsmodels case: wrap to look like sklearn
-        import statsmodels.api as sm
-        class _StatsmodelsAdapter:
-            def __init__(self, model):
-                self.model = model
-                self._names = [n for n in getattr(model, "exog_names", []) if n != "const"]
-            def predict_proba(self, X):
-                X2 = X.reindex(columns=self._names, fill_value=0.0)
-                X2 = sm.add_constant(X2, prepend=True, has_constant="add")
-                p = self.model.predict(X2)
-                return np.column_stack([1 - p, p])
-        return _StatsmodelsAdapter(obj.model)
-
-    pipe = obj["pipeline"] if isinstance(obj, dict) and "pipeline" in obj else obj
-    if not hasattr(pipe, "predict_proba"):
-        raise TypeError("Loaded object has no predict_proba; not a sklearn probabilistic pipeline.")
-    return pipe
+    return _unwrap_pipeline(obj)
 
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
+    """
+    Return numpy array of win probabilities, or None on failure.
+    Works with:
+      - sklearn pipeline/estimator that has predict_proba
+      - dict/wrapper around such a pipeline
+      - statsmodels Logit results (uses .predict)
+    """
     if not model_path:
         print("No model path provided; skipping model scoring.")
         return None
+
     try:
-        pipe = _load_research_pipeline(model_path)
+        obj = _load_research_pipeline(model_path)
     except Exception as e:
         print(f"Failed to load model: {e}")
         return None
-    try:
-        X = _prep_X_for_model(df)
-        return pipe.predict_proba(X)[:, 1].astype(float)
-    except Exception as e:
-        print(f"Model predict failed: {e}")
-        return None
+
+    # Branch A: sklearn-style with predict_proba
+    if hasattr(obj, "predict_proba"):
+        try:
+            X = _prep_X_for_model(df)
+            return obj.predict_proba(X)[:, 1].astype(float)
+        except Exception as e:
+            print(f"Model predict_proba failed: {e}")
+            return None
+
+    # Branch B: statsmodels results (LogitResults / wrapper) -> .predict gives probabilities
+    if hasattr(obj, "predict") and hasattr(obj, "model"):
+        try:
+            return _statsmodels_predict(obj, df)
+        except Exception as e:
+            print(f"Statsmodels predict failed: {e}")
+            return None
+
+    print("Loaded object cannot produce probabilities (no predict_proba or statsmodels predict).")
+    return None
 
 # -----------------------
 # Pretty printing helpers
