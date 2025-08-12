@@ -18,6 +18,11 @@ try:
 except Exception:
     sm = None
 
+try:
+    from live.winprob_loader import WinProbScorer
+except Exception:
+    WinProbScorer = None
+
 RESULTS_DIR = Path("results")
 class ModelBundle:  # stub so __main__.ModelBundle exists during unpickle
     pass
@@ -141,77 +146,51 @@ def _build_feat_dict(row: pd.Series) -> dict:
     }
 
 def _init_scorer(model_path: str):
-    """Create WinProbScorer regardless of constructor signature."""
+    """Try constructing the live adapter with either positional or named path argument."""
     if WinProbScorer is None:
         raise RuntimeError("WinProbScorer not importable")
-    p = Path(model_path).expanduser().resolve()
-    if not p.exists() or p.is_dir():
-        raise FileNotFoundError(f"Model file not found or is a directory: {p}")
     try:
-        return WinProbScorer(str(p))      # new signature (positional)
+        return WinProbScorer(model_path)      # new-style ctor
     except TypeError:
-        return WinProbScorer(path=str(p)) # older signature (named
+        return WinProbScorer(path=model_path) # fallback signature
+
 
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
     if not model_path:
         print("No model path provided; skipping model scoring.")
         return None
 
-    # Path A: use the same adapter the live bot uses
+    # Path A: use the same adapter the live bot uses (best if present)
     try:
-        scorer = _init_scorer(model_path)
+        scorer = _init_scorer(model_path)  # will raise if adapter not available
         preds = []
         for _, row in df.iterrows():
+            feat = _build_feat_dict(row)   # your existing helper
             try:
-                preds.append(float(scorer.score(_build_feat_dict(row))))
+                preds.append(float(scorer.score(feat)))
             except Exception:
                 preds.append(np.nan)
-        arr = np.array(preds, dtype=float)
+        arr = np.asarray(preds, dtype=float)
         if np.isfinite(arr).any():
             return arr
     except Exception as e:
         print(f"WinProbScorer path failed: {e}")
 
-    # Path B: load the pickle and unwrap
+    # Path B: load the serialized estimator directly
     try:
-        obj = joblib.load(Path(model_path).expanduser().resolve())
-
-        # unwrap typical shapes
-        if isinstance(obj, dict) and "pipeline" in obj:
-            est = obj["pipeline"]
-        elif hasattr(obj, "pipeline"):
-            est = getattr(obj, "pipeline")
-        else:
-            est = obj
-
-        # B1) pure sklearn estimator/pipeline
+        est = _load_research_pipeline(model_path)  # unwrap dict/.pipeline/raw
+        # scikit-learn pipeline with probabilities
         if hasattr(est, "predict_proba"):
             X = _prep_X_for_model(df)
             return est.predict_proba(X)[:, 1].astype(float)
-
-        # B2) wrapper that has statsmodels results under .model
-        if hasattr(est, "model") and hasattr(est.model, "predict"):
-            results_obj = est  # keep same shape for _statsmodels_predict
-            X = df.reindex(columns=[n for n in results_obj.model.exog_names if n != "const"], fill_value=0.0).astype(float)
-            if sm is None:
-                raise RuntimeError("statsmodels not installed")
-            X = sm.add_constant(X, prepend=True, has_constant="add")
-            return np.asarray(results_obj.predict(X), dtype=float)
-
-        # B3) raw statsmodels results object
-        if hasattr(est, "predict") and hasattr(getattr(est, "model", None), "exog_names"):
-            results_obj = est
-            X = df.reindex(columns=[n for n in results_obj.model.exog_names if n != "const"], fill_value=0.0).astype(float)
-            if sm is None:
-                raise RuntimeError("statsmodels not installed")
-            X = sm.add_constant(X, prepend=True, has_constant="add")
-            return np.asarray(results_obj.predict(X), dtype=float)
-
+        # statsmodels result: build exog by exog_names (+ add constant)
+        if hasattr(est, "predict") and hasattr(est, "model") and hasattr(est.model, "exog_names"):
+            p = _statsmodels_predict(est, df)  # uses est.model.exog_names + add_constant
+            return np.asarray(p, dtype=float)
         print("Loaded object cannot produce probabilities (no predict_proba or statsmodels predict).")
         return None
-
     except Exception as e:
-        print(f"Direct load path failed: {e}")
+        print(f"Direct path failed: {e}")
         return None
 
 
