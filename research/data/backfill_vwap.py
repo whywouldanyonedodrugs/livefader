@@ -1,8 +1,8 @@
 # research/data/backfill_vwap.py
 import os, asyncio, logging, aiohttp, asyncpg, pandas as pd, numpy as np
 from datetime import timezone
-from typing import Optional, Tuple
-from live.indicators import vwap_stack_features  # reuse your implementation
+from typing import Tuple
+from live.indicators import vwap_stack_features  # your implementation
 
 LOG = logging.getLogger("backfill_vwap")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -10,16 +10,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 BYBIT_BASE = "https://api.bybit.com"
 
 def _interval_to_str(tf: str | int) -> str:
-    # bybit v5 uses minutes: "1","3","5","15","60","240","D","W","M" etc.
-    if isinstance(tf, int):
-        return str(tf)
-    return tf
+    return str(tf) if isinstance(tf, int) else tf
 
 async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int, end_ms: int) -> pd.DataFrame:
-    """
-    Pull OHLCV from Bybit v5 public API up to end_ms (inclusive).
-    Endpoint: /v5/market/kline
-    """
+    """Bybit v5 GET /v5/market/kline up to end_ms (inclusive)."""
     params = {
         "category": "linear",
         "symbol": symbol,
@@ -52,10 +46,7 @@ async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: st
     return pd.DataFrame()
 
 async def _backfill_one(pool: asyncpg.Pool, session: aiohttp.ClientSession, pid: int, symbol: str, opened_at) -> Tuple[int, bool, str]:
-    """
-    Compute VWAP-stack at entry and UPDATE that row in DB.
-    Uses its own pooled connection to avoid 'another operation is in progress'.
-    """
+    """Compute VWAP-stack at entry and UPDATE that row in DB using its own pooled connection."""
     try:
         interval = _interval_to_str(5)
         ts = pd.Timestamp(opened_at)
@@ -70,19 +61,16 @@ async def _backfill_one(pool: asyncpg.Pool, session: aiohttp.ClientSession, pid:
         if df5.empty or len(df5) < 50:
             return pid, False, "insufficient_klines"
 
-        # Compute features with your live helper
+        # ✅ Correct call signature: pass the full OHLCV DataFrame, not arrays
         feat = vwap_stack_features(
-            df5["close"].values.astype(float),
-            df5["volume"].values.astype(float),
+            df5, 
             lookback_bars=int(os.getenv("VWAP_STACK_LOOKBACK_BARS", "12")),
             band_pct=float(os.getenv("VWAP_STACK_BAND_PCT", "0.004")),
-            dt_index=df5["ts"],
         )
-        frac = float(feat.get("occupancy_frac", np.nan))
-        exp  = float(feat.get("expansion_pct", np.nan))
-        slope= float(feat.get("slope_pph", np.nan))
+        frac = float(feat.get("vwap_frac_in_band", np.nan))
+        exp  = float(feat.get("vwap_expansion_pct", np.nan))
+        slope= float(feat.get("vwap_slope_pph", np.nan))
 
-        # Write with a dedicated connection from the pool
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -105,7 +93,8 @@ async def main():
     workers = int(os.getenv("VWAP_BACKFILL_WORKERS", "8"))
 
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=max(4, workers))
-    # Fetch all rows once, then fan out
+
+    # Pull targets once
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -131,9 +120,9 @@ async def main():
         nonlocal ok_count, skip_count
         async with sem:
             pid, success, msg = await _backfill_one(pool, session, row["id"], row["symbol"], row["opened_at"])
-            LOG.info("pid=%s → %s (%s)", pid, "UPDATED" if success else "SKIPPED", msg)
-            if success: ok_count += 1
-            else: skip_count += 1
+            LOG.info("pid=%s \u2192 %s (%s)", pid, "UPDATED" if success else "SKIPPED", msg)
+            ok_count += int(success)
+            skip_count += int(not success)
 
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(*(worker(r) for r in rows))
