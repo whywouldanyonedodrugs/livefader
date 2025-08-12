@@ -11,25 +11,22 @@ BYBIT_BASE = "https://api.bybit.com"
 
 def _interval_to_str(tf: str | int) -> str:
     # bybit v5 uses minutes: "1","3","5","15","60","240","D","W","M" etc.
-    if isinstance(tf, int): 
+    if isinstance(tf, int):
         return str(tf)
-    tf = str(tf).lower()
-    if tf.endswith("m"):
-        return tf.replace("m","")
-    if tf == "4h": return "240"
-    if tf == "1h": return "60"
-    if tf == "5":  return "5"
-    return tf  # last resort
+    return tf
 
-async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval="5", limit=300, end_ms: Optional[int]=None):
+async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int, end_ms: int) -> pd.DataFrame:
+    """
+    Pull OHLCV from Bybit v5 public API up to end_ms (inclusive).
+    Endpoint: /v5/market/kline
+    """
     params = {
         "category": "linear",
         "symbol": symbol,
         "interval": interval,
         "limit": str(limit),
+        "end": str(end_ms),
     }
-    if end_ms is not None:
-        params["end"] = str(end_ms)
     url = f"{BYBIT_BASE}/v5/market/kline"
     for attempt in range(3):
         try:
@@ -40,9 +37,8 @@ async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval="5"
                 js = await r.json()
                 if js.get("retCode") != 0:
                     raise RuntimeError(f"API retCode {js.get('retCode')} :: {js.get('retMsg')}")
-                rows = js["result"]["list"]  # list of lists: [start,open,high,low,close,volume,turnover]
+                rows = js["result"]["list"]  # [start,open,high,low,close,volume,turnover]
                 rows = sorted(rows, key=lambda x: int(x[0]))
-                # to DataFrame (matching your indicator expectations)
                 df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume","turnover"])
                 df = df[["ts","open","high","low","close","volume"]].copy()
                 df["ts"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms", utc=True)
@@ -55,41 +51,61 @@ async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval="5"
             await asyncio.sleep(1.5 * (attempt + 1))
     return pd.DataFrame()
 
-async def _backfill_one(conn: asyncpg.Connection, session: aiohttp.ClientSession, pid: int, symbol: str, opened_at) -> Tuple[int, bool, str]:
+async def _backfill_one(pool: asyncpg.Pool, session: aiohttp.ClientSession, pid: int, symbol: str, opened_at) -> Tuple[int, bool, str]:
+    """
+    Compute VWAP-stack at entry and UPDATE that row in DB.
+    Uses its own pooled connection to avoid 'another operation is in progress'.
+    """
     try:
         interval = _interval_to_str(5)
-        end_ms = int(pd.Timestamp(opened_at).tz_convert(timezone.utc).timestamp() * 1000)
+        ts = pd.Timestamp(opened_at)
+        # normalize tz → UTC
+        if ts.tzinfo is None or ts.tz is None:
+            ts = ts.tz_localize(timezone.utc)
+        else:
+            ts = ts.tz_convert(timezone.utc)
+        end_ms = int(ts.timestamp() * 1000)
+
         df5 = await fetch_klines(session, symbol, interval=interval, limit=300, end_ms=end_ms)
-        if df5.empty or len(df5) < 40:
+        if df5.empty or len(df5) < 50:
             return pid, False, "insufficient_klines"
 
-        lookback = int(os.environ.get("VWAP_STACK_LOOKBACK_BARS", "12"))
-        band_pct = float(os.environ.get("VWAP_STACK_BAND_PCT", "0.004"))
-
-        feat = vwap_stack_features(df5.rename(columns={"ts":"timestamp"}), lookback_bars=lookback, band_pct=band_pct)
-        frac = float(feat.get("vwap_frac_in_band", np.nan))
-        exp  = float(feat.get("vwap_expansion_pct", np.nan))  # already percent (0.35 → 0.35%)
-        slope = float(feat.get("vwap_slope_pph", np.nan))
-
-        await conn.execute(
-            """
-            UPDATE positions
-               SET vwap_stack_frac_at_entry=$1,
-                   vwap_stack_expansion_pct_at_entry=$2,
-                   vwap_stack_slope_pph_at_entry=$3
-             WHERE id=$4
-            """,
-            frac, exp, slope, pid
+        # Compute features with your live helper
+        feat = vwap_stack_features(
+            df5["close"].values.astype(float),
+            df5["volume"].values.astype(float),
+            lookback_bars=int(os.getenv("VWAP_STACK_LOOKBACK_BARS", "12")),
+            band_pct=float(os.getenv("VWAP_STACK_BAND_PCT", "0.004")),
+            dt_index=df5["ts"],
         )
+        frac = float(feat.get("occupancy_frac", np.nan))
+        exp  = float(feat.get("expansion_pct", np.nan))
+        slope= float(feat.get("slope_pph", np.nan))
+
+        # Write with a dedicated connection from the pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE positions
+                   SET vwap_stack_frac_at_entry=$1,
+                       vwap_stack_expansion_pct_at_entry=$2,
+                       vwap_stack_slope_pph_at_entry=$3
+                 WHERE id=$4
+                """,
+                frac, exp, slope, pid
+            )
         return pid, True, "ok"
     except Exception as e:
-        return pid, False, f"error: {e}"
+        return pid, False, f"error: {e!s}"
 
 async def main():
     dsn = os.environ.get("PG_DSN")
     if not dsn:
         raise RuntimeError("Set PG_DSN to your Postgres DSN")
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
+    workers = int(os.getenv("VWAP_BACKFILL_WORKERS", "8"))
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=max(4, workers))
+    # Fetch all rows once, then fan out
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -104,15 +120,25 @@ async def main():
         )
     if not rows:
         LOG.info("Nothing to backfill. All rows already have VWAP-stack fields.")
+        await pool.close()
         return
 
-    async with aiohttp.ClientSession() as session:
-        async with pool.acquire() as conn:
-            tasks = [ _backfill_one(conn, session, r["id"], r["symbol"], r["opened_at"]) for r in rows ]
-            for fut in asyncio.as_completed(tasks):
-                pid, ok, msg = await fut
-                LOG.info("pid=%s → %s (%s)", pid, "UPDATED" if ok else "SKIPPED", msg)
+    ok_count = 0
+    skip_count = 0
+    sem = asyncio.Semaphore(workers)
 
+    async def worker(row):
+        nonlocal ok_count, skip_count
+        async with sem:
+            pid, success, msg = await _backfill_one(pool, session, row["id"], row["symbol"], row["opened_at"])
+            LOG.info("pid=%s → %s (%s)", pid, "UPDATED" if success else "SKIPPED", msg)
+            if success: ok_count += 1
+            else: skip_count += 1
+
+    async with aiohttp.ClientSession() as session:
+        await asyncio.gather(*(worker(r) for r in rows))
+
+    LOG.info("Done. UPDATED=%d  SKIPPED=%d", ok_count, skip_count)
     await pool.close()
 
 if __name__ == "__main__":
