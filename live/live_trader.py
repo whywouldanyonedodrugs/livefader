@@ -45,9 +45,13 @@ from .exchange_proxy import ExchangeProxy
 from .database import DB
 from .telegram import TelegramBot
 
-
 from pydantic import Field, Extra, ValidationError
 from pydantic_settings import BaseSettings
+
+# Shim so joblib can unpickle research ModelBundle saved elsewhere
+class ModelBundle:
+    pass
+
 
 def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
     """Calculates a Triangular Moving Average (TMA). Helper function."""
