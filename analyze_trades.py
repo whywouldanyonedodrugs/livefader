@@ -1,31 +1,180 @@
-# /opt/livefader/src/analyze_trades.py
-
+# analyze_trades.py — upgraded, model-aware trade report
 import argparse
 from pathlib import Path
-import warnings
 import os
 import asyncio
 from datetime import datetime
+import warnings
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-import telegram
-from dotenv import load_dotenv
 
+# --- Optional: statsmodels quick logit, gated by --quick-logit ---
 try:
-    import statsmodels.api as sm
-except ImportError:
+    import statsmodels.api as sm  # noqa
+except Exception:
     sm = None
-    warnings.warn("statsmodels not installed – logistic regression section will be skipped.")
 
-RESULTS_DIR = "results"
+# --- Optional: load the calibrated research model via the live adapter ---
+WINPROB_AVAILABLE = True
+try:
+    # Adapter you added for the live bot
+    from live.winprob_loader import WinProbScorer  # noqa
+except Exception:
+    WINPROB_AVAILABLE = False
 
-# --- Helper Functions ---
+RESULTS_DIR = Path("results")
+
+# -----------------------
+# Pretty printing helpers
+# -----------------------
 def header(txt: str):
     bar = "=" * 72
-    print(f"\n{bar}\n {txt.upper()}\n{bar}")
+    print(f"\n{bar}\n {txt}\n{bar}")
 
+def _fmt_pct(x: float) -> str:
+    return f"{100.0 * x:.2f}%"
+
+def _fmt2(x: float) -> str:
+    return f"{x:.2f}"
+
+# --------------------------------
+# Basic feature engineering / flags
+# --------------------------------
+def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Net PnL (fees-aware)
+    if "fees_paid" in df.columns:
+        df["fees_paid"] = pd.to_numeric(df["fees_paid"], errors="coerce").fillna(0.0)
+        df["net_pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0) - df["fees_paid"]
+    else:
+        df["net_pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
+
+    # Boolean outcome
+    df["is_win"] = df["net_pnl"] > 0
+
+    # Safe numerics (used by various summaries)
+    for c in ("rsi_at_entry", "adx_at_entry", "price_boom_pct_at_entry", "price_slowdown_pct_at_entry",
+              "ema_fast_at_entry", "ema_slow_at_entry", "vwap_z_at_entry", "vwap_stack_frac_at_entry",
+              "vwap_stack_expansion_pct_at_entry", "vwap_stack_slope_pph_at_entry", "holding_minutes"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # EMA-derived helpers
+    if {"entry_price", "ema_fast_at_entry", "ema_slow_at_entry"}.issubset(df.columns):
+        df["price_minus_ema_fast"] = df["entry_price"] - df["ema_fast_at_entry"]
+        df["price_minus_ema_slow"] = df["entry_price"] - df["ema_slow_at_entry"]
+        df["pct_to_ema_fast"] = df["price_minus_ema_fast"] / df["entry_price"]
+        df["pct_to_ema_slow"] = df["price_minus_ema_slow"] / df["entry_price"]
+        df["ema_spread_abs"] = df["ema_fast_at_entry"] - df["ema_slow_at_entry"]
+        df["ema_spread_pct"] = df["ema_spread_abs"] / df["ema_slow_at_entry"]
+
+    # vwap_dev_pct historical aliasing
+    if "vwap_dev_pct_at_entry" in df.columns and "pct_to_vwap" not in df.columns:
+        df.rename(columns={"vwap_dev_pct_at_entry": "pct_to_vwap"}, inplace=True)
+
+    # Holding time buckets
+    if "holding_minutes" in df.columns:
+        df["holding_minutes"] = df["holding_minutes"].fillna(0.0)
+        df["holding_hours"] = df["holding_minutes"] / 60.0
+        df["holding_bucket"] = pd.cut(
+            df["holding_hours"],
+            bins=[0, 1, 2, 4, 8, 24, np.inf],
+            labels=["<1 h", "1-2 h", "2-4 h", "4-8 h", "8-24 h", ">24 h"],
+        )
+    else:
+        df["holding_hours"] = np.nan
+        df["holding_bucket"] = np.nan
+
+    return df
+
+# --------------------
+# KPI & performance
+# --------------------
+def _profit_factor(pnl: pd.Series) -> float:
+    g = pnl[pnl > 0].sum()
+    l = -pnl[pnl < 0].sum()
+    return float(g / l) if l > 0 else np.inf
+
+def top_line_kpis(df: pd.DataFrame) -> pd.DataFrame:
+    n = len(df)
+    wr = df["is_win"].mean() if n else np.nan
+    exp_trade = df["net_pnl"].mean()
+    pf = _profit_factor(df["net_pnl"])
+    hold_hours = df["holding_hours"].mean()
+
+    # Daily Sharpe/Sortino from equity snapshots (optional separate file)
+    # Here we compute simple per-trade analogs for quick at-a-glance signal quality:
+    wins = df.loc[df["net_pnl"] > 0, "net_pnl"].mean()
+    losses = df.loc[df["net_pnl"] < 0, "net_pnl"].mean()
+    kpis = pd.DataFrame([{
+        "trades": n,
+        "win_rate": wr,
+        "expectancy": exp_trade,
+        "profit_factor": pf,
+        "avg_hold_hours": hold_hours,
+        "avg_win": wins,
+        "avg_loss": losses,
+    }])
+    return kpis
+
+# -------------------------------------
+# Calibration, ECE and reliability bins
+# -------------------------------------
+def _ece(y: np.ndarray, p: np.ndarray, m_bins: int = 10) -> Tuple[pd.DataFrame, float]:
+    """Reliability table + Expected Calibration Error (|p - freq| weighted)."""
+    y = y.astype(int)
+    p = p.astype(float)
+    bins = np.linspace(0.0, 1.0, m_bins + 1)
+    idx = np.clip(np.digitize(p, bins) - 1, 0, m_bins - 1)
+
+    rows = []
+    ece = 0.0
+    for b in range(m_bins):
+        mask = idx == b
+        n_b = int(mask.sum())
+        if n_b == 0:
+            rows.append(dict(bin=b, lower=bins[b], upper=bins[b+1], n=0,
+                             avg_p=np.nan, win_rate=np.nan, abs_gap=np.nan))
+            continue
+        avg_p = float(p[mask].mean())
+        win_rate = float(y[mask].mean())
+        abs_gap = abs(avg_p - win_rate)
+        rows.append(dict(bin=b, lower=bins[b], upper=bins[b+1], n=n_b,
+                         avg_p=avg_p, win_rate=win_rate, abs_gap=abs_gap))
+        ece += (n_b / len(y)) * abs_gap
+
+    table = pd.DataFrame(rows)
+    return table, float(ece)
+
+def _brier(y: np.ndarray, p: np.ndarray) -> Tuple[float, float]:
+    """Brier and constant baseline (mean(y)) for context."""
+    base = float(np.mean((y - y.mean()) ** 2))  # baseline = uncertainty term for constant forecast
+    score = float(np.mean((y - p) ** 2))
+    return score, base
+
+def decile_lift(y: np.ndarray, p: np.ndarray) -> pd.DataFrame:
+    df = pd.DataFrame({"y": y, "p": p})
+    # handle ties: drop duplicate edges if necessary
+    try:
+        df["decile"] = pd.qcut(df["p"], q=10, labels=False, duplicates="drop")
+    except Exception:
+        df["decile"] = pd.qcut(df["p"].rank(method="first"), q=10, labels=False, duplicates="drop")
+    g = (df.groupby("decile")
+           .agg(n=("y", "size"),
+                avg_p=("p", "mean"),
+                win_rate=("y", "mean"))
+           .reset_index()
+           .sort_values("decile", ascending=False))
+    g["lift_vs_base"] = g["win_rate"] - df["y"].mean()
+    return g
+
+# -----------------------
+# Descriptive breakdowns
+# -----------------------
 def describe_continuous(df, col, win_flag="is_win"):
     header(f"{col} – wins vs. losses")
     grp = df.groupby(win_flag)[col].describe()[["count", "mean", "std", "25%", "50%", "75%"]]
@@ -33,9 +182,9 @@ def describe_continuous(df, col, win_flag="is_win"):
     if df[col].notna().sum() > 10:
         try:
             r, p = stats.pointbiserialr(df[win_flag].fillna(False), df[col].fillna(0))
-            print(f"\nPoint-biserial correlation with win flag: r={r:.3f}  p={p:.4f}")
-        except ValueError:
-            print("\nCould not calculate point-biserial correlation.")
+            print(f"\nPoint-biserial corr with win flag: r={r:.3f}  p={p:.4f}")
+        except Exception:
+            pass
 
 def describe_categorical(df, col, win_flag="is_win"):
     header(f"{col} – win rate by category")
@@ -43,141 +192,29 @@ def describe_categorical(df, col, win_flag="is_win"):
     if True in tab.columns:
         tab["win_rate_%"] = 100 * tab[True] / tab["All"]
     print(tab.to_string())
+    # quick effect size (Cramér's V) if table dense enough
     if len(tab) > 1 and tab.shape[0] > 2 and tab.shape[1] > 2:
-        chi2 = stats.chi2_contingency(tab.iloc[:-1, :-1])[0]
-        n = tab["All"].iloc[-1]
-        k = min(tab.shape[0] - 1, tab.shape[1] - 1)
-        cramers_v = np.sqrt(chi2 / (n * k)) if n and k else np.nan
-        print(f"\nCramér’s V vs. win flag: {cramers_v:.3f}")
-
-def logistic_regression(df, features):
-    if sm is None: 
-        return
-    header("Quick logistic regression (wins=1)")
-    clean_df = df.dropna(subset=features + ["is_win"])
-    if len(clean_df) < 10:
-        print("Not enough data for logistic regression.")
-        return
-    X = sm.add_constant(clean_df[features])
-    y = clean_df["is_win"].astype(int)
-    try:
-        model = sm.Logit(y, X).fit(disp=False)
-        print(model.summary())
-    except Exception as e:
-        print(f"Logistic regression failed: {e}")
-
-def analyze_regime_performance(df: pd.DataFrame):
-    header("Regime-Specific Performance KPIs")
-    if "market_regime_at_entry" not in df.columns:
-        return
-    regime_groups = df.groupby("market_regime_at_entry")
-    summary = regime_groups.agg(
-        total_trades=('pnl', 'count'),
-        total_pnl=('pnl', 'sum'),
-        win_rate=('is_win', lambda x: x.mean() * 100),
-        avg_pnl=('pnl', 'mean'),
-        avg_win=('pnl', lambda x: x[x > 0].mean()),
-        avg_loss=('pnl', lambda x: x[x < 0].mean()),
-    ).fillna(0)
-    gross_profit = regime_groups['pnl'].apply(lambda x: x[x > 0].sum())
-    gross_loss = regime_groups['pnl'].apply(lambda x: abs(x[x < 0].sum()))
-    summary['profit_factor'] = (gross_profit / gross_loss).replace([np.inf, -np.inf], 0).fillna(0)
-    print(summary.to_string(float_format="%.2f"))
-
-def analyze_counterfactuals(df: pd.DataFrame):
-    header("Counterfactual 'What If' Analysis (4-Hour Look-Forward)")
-    required_cols = [
-        'exit_reason', 'is_win', 'cf_would_hit_tp_2x_atr',
-        'cf_would_hit_sl_2_5x_atr', 'cf_mae_over_atr_4h', 'cf_mfe_over_atr_4h',
-        'cf_would_hit_tp_1x_atr'
-    ]
-    if not all(col in df.columns for col in required_cols):
-        print("Counterfactual columns not found. Skipping this analysis.")
-        return
-
-    print("\n--- Analysis of TIME-EXITED Trades ---")
-    time_exits_df = df[df['exit_reason'] == 'TIME_EXIT'].copy()
-    if not time_exits_df.empty:
-        total_time_exits = len(time_exits_df)
-        would_be_winners_2x = time_exits_df['cf_would_hit_tp_2x_atr'].sum()
-        would_be_losers_2_5x = time_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
-        print(f"Total Time-Exited Trades: {total_time_exits}")
-        print(f"  - Would have become WINNERS (hit 2x ATR TP): {would_be_winners_2x} ({would_be_winners_2x/total_time_exits:.1%})")
-        print(f"  - Would have become LOSERS (hit 2.5x ATR SL): {would_be_losers_2_5x} ({would_be_losers_2_5x/total_time_exits:.1%})")
-    else:
-        print("No time-exited trades found.")
-
-    print("\n--- Analysis of STOP-LOSS Trades ---")
-    sl_exits_df = df[df['exit_reason'] == 'SL'].copy()
-    if not sl_exits_df.empty:
-        total_sl_exits = len(sl_exits_df)
-        would_have_won_1x = sl_exits_df['cf_would_hit_tp_1x_atr'].sum()
-        would_have_won_2x = sl_exits_df['cf_would_hit_tp_2x_atr'].sum()
-        print(f"Total Stop-Loss Trades: {total_sl_exits}")
-        print(f"  - Would have REVERSED TO WIN (hit 1x ATR TP): {would_have_won_1x} ({would_have_won_1x/total_sl_exits:.1%})")
-        print(f"  - Would have REVERSED TO WIN (hit 2x ATR TP): {would_have_won_2x} ({would_have_won_2x/total_sl_exits:.1%})")
-    else:
-        print("No stop-loss trades found.")
-
-    print("\n--- Analysis of TAKE-PROFIT Trades ---")
-    tp_exits_df = df[df['exit_reason'] == 'TP'].copy()
-    if not tp_exits_df.empty:
-        total_tp_exits = len(tp_exits_df)
-        would_have_lost = tp_exits_df['cf_would_hit_sl_2_5x_atr'].sum()
-        avg_ultimate_mfe = tp_exits_df['cf_mfe_over_atr_4h'].mean()
-        print(f"Total Take-Profit Trades: {total_tp_exits}")
-        print(f"  - Would have REVERSED TO LOSE (hit 2.5x ATR SL): {would_have_lost} ({would_have_lost/total_tp_exits:.1%})")
-        print(f"  - Average ultimate MFE over next 4h: {avg_ultimate_mfe:.2f}x ATR")
-    else:
-        print("No take-profit trades found.")
+        try:
+            chi2 = stats.chi2_contingency(tab.iloc[:-1, :-1])[0]
+            n = tab["All"].iloc[-1]
+            k = min(tab.shape[0] - 1, tab.shape[1] - 1)
+            cramers_v = np.sqrt(chi2 / (n * k)) if n and k else np.nan
+            print(f"\nCramér’s V vs. win flag: {cramers_v:.3f}")
+        except Exception:
+            pass
 
 def _safe_qcut(s: pd.Series, q: int):
-    # Drop duplicate edges so tied data doesn't error out. (pandas docs)  :contentReference[oaicite:6]{index=6}
     return pd.qcut(s, q, labels=False, duplicates="drop")
 
 def _save_table(df: pd.DataFrame, name: str):
     if df is None or df.empty:
         return
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    out = Path(RESULTS_DIR) / f"{name}.csv"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / f"{name}.csv"
     df.to_csv(out, index=False)
     print(f"[saved] {out}")
 
-def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # Net PnL if fees_paid exists
-    if "fees_paid" in df.columns:
-        df["fees_paid"] = pd.to_numeric(df["fees_paid"], errors="coerce").fillna(0.0)
-        df["net_pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0) - df["fees_paid"]
-    else:
-        df["net_pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
-
-    df["is_win"] = df["net_pnl"] > 0
-
-    if "slippage_usd" in df.columns and "atr" in df.columns:
-        df["slippage_abs"] = pd.to_numeric(df["slippage_usd"], errors="coerce").abs()
-        df["slippage_over_atr"] = df["slippage_abs"].divide(pd.to_numeric(df["atr"], errors="coerce")).replace([np.inf, -np.inf], np.nan)
-    else:
-        df["slippage_over_atr"] = np.nan
-
-    df["price_minus_ema_fast"] = df["entry_price"] - df["ema_fast_at_entry"]
-    df["price_minus_ema_slow"] = df["entry_price"] - df["ema_slow_at_entry"]
-    df["pct_to_ema_fast"] = df["price_minus_ema_fast"] / df["entry_price"]
-    df["pct_to_ema_slow"] = df["price_minus_ema_slow"] / df["entry_price"]
-    df["ema_spread_abs"] = df["ema_fast_at_entry"] - df["ema_slow_at_entry"]
-    df["ema_spread_pct"] = df["ema_spread_abs"] / df["ema_slow_at_entry"]
-    df.rename(columns={"vwap_dev_pct_at_entry": "pct_to_vwap"}, inplace=True)
-    df["holding_minutes"] = pd.to_numeric(df["holding_minutes"], errors="coerce").fillna(0.0)
-    df["holding_hours"] = df["holding_minutes"] / 60.0
-    df["holding_bucket"] = pd.cut(
-        df["holding_hours"],
-        bins=[0, 1, 2, 4, 8, 24, np.inf],
-        labels=["<1 h", "1-2 h", "2-4 h", "4-8 h", "8-24 h", ">24 h"],
-    )
-    return df
-
-def _vwap_quintile_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def _vwap_quintile_tables(df: pd.DataFrame) -> dict:
     out = {}
     if "vwap_stack_frac_at_entry" in df.columns:
         s = pd.to_numeric(df["vwap_stack_frac_at_entry"], errors="coerce")
@@ -201,115 +238,141 @@ def _vwap_quintile_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
                         median_net_pnl=("net_pnl","median"))
                    .reset_index())
             out["vwap_expansion_quintiles"] = g
+    if "vwap_stack_slope_pph_at_entry" in df.columns:
+        s = pd.to_numeric(df["vwap_stack_slope_pph_at_entry"], errors="coerce")
+        if s.notna().sum() >= 5:
+            df["vwap_slope_q"] = _safe_qcut(s, 5)
+            g = (df.groupby("vwap_slope_q")
+                   .agg(n=("id","size"),
+                        win_rate=("is_win","mean"),
+                        mean_net_pnl=("net_pnl","mean"),
+                        median_net_pnl=("net_pnl","median"))
+                   .reset_index())
+            out["vwap_slope_quintiles"] = g
     return out
 
-def run_analysis(df: pd.DataFrame):
-    df = feature_engineering(df)
-
-    header("Price boom / slowdown bins")
-    df["boom_bin"] = pd.qcut(df["price_boom_pct_at_entry"], q=4, labels=False, duplicates="drop")
-    df["slow_bin"] = pd.qcut(df["price_slowdown_pct_at_entry"], q=4, labels=False, duplicates="drop")
-    print(pd.crosstab(df["boom_bin"], df["slow_bin"], values=df["is_win"], aggfunc="mean"))
-
-    analyze_regime_performance(df)
-
-    df["rsi_band"] = pd.cut(df["rsi_at_entry"], bins=[0, 50, 60, 70, 80, 100], labels=["<50", "50-60", "60-70", "70-80", ">80"])
-    describe_categorical(df, "rsi_band")
-
-    describe_continuous(df, "pct_to_ema_fast")
-    describe_continuous(df, "ema_spread_pct")
-    describe_continuous(df, "pct_to_vwap")
-    describe_continuous(df, "vwap_z_at_entry")
-
-    df["z_band"] = pd.cut(
-        df["vwap_z_at_entry"],
-        bins=[-np.inf, 0, 0.5, 1.0, 1.5, 2.0, np.inf],
-        labels=["<0", "0-0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", ">2.0"],
-    )
-    describe_categorical(df, "z_band")
-
-    if "eth_macdhist_at_entry" in df.columns:
-        header("PERFORMANCE BY ETH MACD HISTOGRAM (4H)")
-        df["eth_macd_hist_band"] = pd.cut(
-            df["eth_macdhist_at_entry"],
-            bins=[-np.inf, -0.5, 0, 0.5, np.inf],
-            labels=["Strong Down", "Weak Down", "Weak Up", "Strong Up"],
-        )
-        describe_categorical(df, "eth_macd_hist_band")
-
-    if "eth_macdhist_1h_at_entry" in df.columns:
-        header("PERFORMANCE BY ETH MACD HISTOGRAM (1H)")
-        df["eth_macd_hist_1h_band"] = pd.cut(
-            df["eth_macdhist_1h_at_entry"],
-            bins=[-np.inf, -0.1, 0, 0.1, np.inf],
-            labels=["Strong Down", "Weak Down", "Weak Up", "Strong Up"],
-        )
-        describe_categorical(df, "eth_macd_hist_1h_band")
-
-    describe_continuous(df, "mae_over_atr")
-    describe_continuous(df, "mfe_over_atr")
-    describe_continuous(df, "realized_vol_during_trade")
-    describe_continuous(df, "btc_beta_during_trade")
-
-    describe_categorical(df, "session_tag_at_entry")
-    describe_categorical(df, "holding_bucket")
-    describe_categorical(df, "day_of_week_at_entry")
-    describe_categorical(df, "hour_of_day_at_entry")
-
-    if "vwap_consolidated_at_entry" in df.columns:
-        describe_categorical(df, "vwap_consolidated_at_entry")
-
-    # --- VWAP-stack quintiles (saved to results/) ---
-    header("VWAP-STACK QUINTILES (frac & expansion) – win rate and net PnL")
-    vwap_tabs = _vwap_quintile_tables(df)
-    for name, tab in vwap_tabs.items():
-        print(f"\n{name}")
-        tab2 = tab.copy()
-        tab2["win_rate_%"] = 100 * tab2["win_rate"].astype(float)
-        print(tab2[["vwap_frac_q" if "frac" in name else "vwap_exp_q", "n", "win_rate_%", "mean_net_pnl", "median_net_pnl"]].to_string(index=False))
-        _save_table(tab2, name)
-
-    header("Top 10 absolute point-biserial correlations with win flag")
-    cont_cols = [c for c in df.select_dtypes(include="number").columns if c not in ["is_win", "pnl", "net_pnl"]]
-    cors = {c: stats.pointbiserialr(df["is_win"], df[c])[0] for c in cont_cols if df[c].notna().sum() > 5 and np.std(df[c]) > 0}
-    top10 = pd.Series(cors).abs().sort_values(ascending=False).head(10)
-    print(top10.to_string())
-
-    logit_features = [col for col in top10.index.tolist() if col not in ['pnl_pct', 'mae_usd', 'mfe_usd']]
-    logistic_regression(df, logit_features)
-    analyze_counterfactuals(df)
-
-def analyze_performance_ratios(df_equity: pd.DataFrame):
-    header("Risk-Adjusted Performance Ratios (Sharpe & Sortino)")
-    if df_equity.empty or len(df_equity) < 2:
-        print("Not enough equity data to calculate performance ratios.")
+# -----------------------------
+# Optional quick logistic check
+# -----------------------------
+def quick_logit(df: pd.DataFrame, features, enabled: bool):
+    if not enabled:
         return
-    df_equity['ts'] = pd.to_datetime(df_equity['ts'])
-    df_equity = df_equity.sort_values('ts').set_index('ts')
-    daily_equity = df_equity['equity'].resample('D').last()
-    daily_returns = daily_equity.pct_change().dropna()
-    if len(daily_returns) < 2:
-        print("Not enough daily data points to calculate ratios.")
+    if sm is None:
+        warnings.warn("statsmodels not installed – skipping quick logistic regression.")
         return
-    mean_daily_return = daily_returns.mean()
-    std_dev_return = daily_returns.std()
-    downside_returns = daily_returns[daily_returns < 0]
-    downside_std = downside_returns.std()
-    annual_return = mean_daily_return * 365
-    annual_std_dev = std_dev_return * np.sqrt(365)
-    annual_downside_std = downside_std * np.sqrt(365)
-    sharpe_ratio = annual_return / annual_std_dev if annual_std_dev != 0 else 0
-    sortino_ratio = annual_return / annual_downside_std if annual_downside_std != 0 else 0
-    print(f"Total Days Analyzed:      {len(daily_returns)}")
-    print(f"Annualized Return:        {annual_return:.2%}")
-    print(f"Annualized Volatility:    {annual_std_dev:.2%}")
-    print(f"Annualized Downside Vol.: {annual_downside_std:.2%}")
-    print("-" * 40)
-    print(f"Sharpe Ratio:             {sharpe_ratio:.2f}")
-    print(f"Sortino Ratio:            {sortino_ratio:.2f}")
+    clean_df = df.dropna(subset=features + ["is_win"])
+    if len(clean_df) < 25:
+        print("Not enough data for logistic regression.")
+        return
+    header("Quick logistic regression (wins=1) — optional sanity check")
+    X = sm.add_constant(clean_df[features])
+    y = clean_df["is_win"].astype(int)
+    try:
+        model = sm.Logit(y, X).fit(disp=False)
+        print(model.summary())
+    except Exception as e:
+        print(f"Logistic regression failed: {e}")
 
-# --- Telegram Delivery Function ---
+# -----------------------
+# Model scoring utilities
+# -----------------------
+def _build_feat_dict(row: pd.Series) -> dict:
+    """Map one trade row to the live scorer's expected raw feature names."""
+    # mirror live scoring keys; anything missing defaults to 0.0
+    def fget(name, default=0.0):
+        v = row.get(name, default)
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    return {
+        "rsi_at_entry": fget("rsi_at_entry"),
+        "adx_at_entry": fget("adx_at_entry"),
+        "price_boom_pct_at_entry": fget("price_boom_pct_at_entry"),
+        "price_slowdown_pct_at_entry": fget("price_slowdown_pct_at_entry"),
+        "vwap_z_at_entry": fget("vwap_z_at_entry"),
+        "ema_spread_pct_at_entry": (
+            (fget("ema_fast_at_entry") - fget("ema_slow_at_entry")) / fget("ema_slow_at_entry")
+            if fget("ema_slow_at_entry") > 0 else 0.0
+        ),
+        "is_ema_crossed_down_at_entry": int(bool(row.get("is_ema_crossed_down_at_entry", 0))),
+        "day_of_week_at_entry": int(row.get("day_of_week_at_entry", 0)),
+        "hour_of_day_at_entry": int(row.get("hour_of_day_at_entry", 0)),
+        "eth_macdhist_at_entry": fget("eth_macdhist_at_entry"),
+        # VWAP-stack, if present
+        "vwap_stack_frac_at_entry": fget("vwap_stack_frac_at_entry"),
+        "vwap_stack_expansion_pct_at_entry": fget("vwap_stack_expansion_pct_at_entry"),
+        "vwap_stack_slope_pph_at_entry": fget("vwap_stack_slope_pph_at_entry"),
+    }
+
+def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
+    if model_path is None:
+        print("No model path provided; skipping model scoring.")
+        return None
+    if not WINPROB_AVAILABLE:
+        print("WinProbScorer import failed; cannot score with research model.")
+        return None
+    model_file = Path(model_path)
+    if not model_file.exists():
+        print(f"Model file not found: {model_file}")
+        return None
+    try:
+        scorer = WinProbScorer(model_path=str(model_file))
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        return None
+
+    preds = []
+    for _, row in df.iterrows():
+        try:
+            preds.append(float(scorer.score(_build_feat_dict(row))))
+        except Exception:
+            preds.append(np.nan)
+    return np.array(preds, dtype=float)
+
+# --------------------------
+# Markdown report generation
+# --------------------------
+def _write_markdown_report(title: str,
+                           kpis: pd.DataFrame,
+                           brier_tuple: Optional[Tuple[float, float]],
+                           ece_val: Optional[float],
+                           rel_path: Optional[Path],
+                           lift_path: Optional[Path]) -> Path:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / f"report_{datetime.utcnow().strftime('%Y-%m-%d')}.md"
+
+    lines = [f"# {title}",
+             "",
+             "## Top-line KPIs",
+             "",
+             kpis.to_string(index=False),
+             ""]
+
+    if brier_tuple is not None and ece_val is not None:
+        brier, base = brier_tuple
+        lines += [
+            "## Probability Quality",
+            "",
+            f"- Brier score (lower is better): **{brier:.5f}**  (constant baseline: {base:.5f})",
+            f"- Expected Calibration Error (ECE): **{ece_val:.5f}**",
+            f"- Reliability table: `{rel_path.name}`" if rel_path else "",
+            f"- Decile lift table: `{lift_path.name}`" if lift_path else "",
+            ""
+        ]
+
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join([ln for ln in lines if ln is not None]))
+    print(f"[saved] {out}")
+    return out
+
+# -------------------------
+# Telegram delivery (file)
+# -------------------------
 async def send_telegram_report(report_file_path: str):
+    from dotenv import load_dotenv
+    import telegram  # python-telegram-bot (compatible sendDocument)
     load_dotenv()
     token = os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TG_CHAT_ID")
@@ -323,8 +386,8 @@ async def send_telegram_report(report_file_path: str):
             await bot.send_document(
                 chat_id=chat_id,
                 document=document,
-                filename="weekly_report.txt",
-                caption=f"LiveFader Weekly Report - {datetime.now().strftime('%Y-%m-%d')}"
+                filename=os.path.basename(report_file_path),
+                caption=f"LiveFader Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
             )
         print("Telegram report sent successfully.")
     except FileNotFoundError:
@@ -332,45 +395,134 @@ async def send_telegram_report(report_file_path: str):
     except Exception as e:
         print(f"Failed to send report to Telegram: {e}")
 
-# --- Main Execution Logic ---
+# -----------------
+# Main entry point
+# -----------------
 def main():
-    parser = argparse.ArgumentParser(description="Trade analytics console report")
-    parser.add_argument("--file", default="trades.csv", help="CSV of closed trades")
-    parser.add_argument("--equity-file", default="equity_data.csv", help="CSV of equity snapshots")
-    parser.add_argument("--send-report", help="Path to the report file to be sent via Telegram")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Trade analytics console report (model-aware)")
+    ap.add_argument("--file", default="trades.csv", help="CSV of closed trades")
+    ap.add_argument("--equity-file", default="equity_data.csv", help="CSV of equity snapshots (optional)")
+    ap.add_argument("--model-path", default="win_probability_model.pkl", help="Path to calibrated research model bundle")
+    ap.add_argument("--bins", type=int, default=10, help="Bins for reliability/ECE")
+    ap.add_argument("--quick-logit", action="store_true", help="Run optional statsmodels Logit sanity check")
+    ap.add_argument("--send-report", help="Path to a file to be sent via Telegram (skip analysis)")
+    args = ap.parse_args()
 
     if args.send_report:
         asyncio.run(send_telegram_report(args.send_report))
         return
 
-    # Locate trade file
-    if args.file:
-        trade_file_path = Path(args.file)
-    else:
-        reports_dir = Path(__file__).parent / "live" / "reports"
-        try:
-            latest_report = max(reports_dir.glob("full_trade_history_*.csv"), key=os.path.getctime)
-            trade_file_path = latest_report
-            print(f"--- Found latest report file: {trade_file_path.name} ---")
-        except (ValueError, FileNotFoundError):
-            print(f"ERROR: No 'full_trade_history_*.csv' files found in {reports_dir}.")
-            print("Please run 'python live/reporter.py --full' first.")
-            return
-
-    if trade_file_path.exists():
-        df = pd.read_csv(trade_file_path)
-        if not df.empty:
-            run_analysis(df)
-    else:
+    trade_file_path = Path(args.file)
+    if not trade_file_path.exists():
         print(f"Trade file not found: {trade_file_path}")
+        return
 
-    equity_path = Path(args.equity_file)
-    if equity_path.exists():
-        df_equity = pd.read_csv(equity_path)
-        analyze_performance_ratios(df_equity)
+    # Load & engineer
+    df = pd.read_csv(trade_file_path)
+    if df.empty:
+        print("No rows in trade file.")
+        return
+    df = feature_engineering(df)
+
+    # Top-line KPIs
+    header("TOP-LINE KPIs")
+    kpis = top_line_kpis(df)
+    print(kpis.assign(win_rate=kpis["win_rate"].map(_fmt_pct),
+                      expectancy=kpis["expectancy"].map(_fmt2),
+                      profit_factor=kpis["profit_factor"].map(lambda x: "inf" if np.isinf(x) else _fmt2(x))).to_string(index=False))
+
+    # Score with calibrated model, if available
+    rel_path = None
+    lift_path = None
+    ece_val = None
+    brier_tuple = None
+
+    preds = score_with_model(df, args.model_path)
+    if preds is not None and np.isfinite(preds).any():
+        df["winprob_pred"] = preds
+        y = df["is_win"].astype(int).values
+        p = np.nan_to_num(df["winprob_pred"].values, nan=np.mean(y))
+
+        # Reliability / ECE / Brier
+        header("CALIBRATION & LIFT (research model)")
+        rel, ece_val = _ece(y, p, m_bins=max(5, args.bins))
+        print(rel.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+        brier_tuple = _brier(y, p)
+        print(f"\nBrier={brier_tuple[0]:.5f}  (constant baseline={brier_tuple[1]:.5f})")
+        print(f"ECE={ece_val:.5f}")
+
+        # Decile lift
+        lift = decile_lift(y, p)
+        print("\nDecile lift (sorted high→low p):")
+        print(lift.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+
+        # Save CSVs
+        _save_table(rel, "reliability_table")
+        _save_table(lift, "decile_lift")
+        rel_path = RESULTS_DIR / "reliability_table.csv"
+        lift_path = RESULTS_DIR / "decile_lift.csv"
     else:
-        print(f"\nEquity file not found: {equity_path}. Skipping performance ratio analysis.")
+        print("\nNo model predictions available; skipping calibration/lift sections.")
+
+    # Regime performance
+    if "market_regime_at_entry" in df.columns:
+        header("REGIME-SPECIFIC PERFORMANCE")
+        regime = (df.groupby("market_regime_at_entry")
+                    .agg(total_trades=("net_pnl", "size"),
+                         win_rate=("is_win", "mean"),
+                         avg_pnl=("net_pnl", "mean"),
+                         profit_factor=("net_pnl", _profit_factor))
+                    .reset_index())
+        # pretty print
+        regime["win_rate_%"] = 100.0 * regime["win_rate"]
+        print(regime[["market_regime_at_entry", "total_trades", "win_rate_%", "avg_pnl", "profit_factor"]]
+              .to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+        _save_table(regime, "regime_kpis")
+
+    # VWAP-stack quintiles
+    header("VWAP-STACK QUINTILES (frac, expansion, slope) — win rate & net PnL")
+    for name, tab in _vwap_quintile_tables(df).items():
+        tab2 = tab.copy()
+        tab2["win_rate_%"] = 100 * tab2["win_rate"].astype(float)
+        key_col = [c for c in ("vwap_frac_q", "vwap_exp_q", "vwap_slope_q") if c in tab2.columns][0]
+        print(f"\n{name}")
+        print(tab2[[key_col, "n", "win_rate_%", "mean_net_pnl", "median_net_pnl"]]
+              .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+        _save_table(tab2, name)
+
+    # Descriptive bands (kept, but concise)
+    if "rsi_at_entry" in df.columns:
+        df["rsi_band"] = pd.cut(df["rsi_at_entry"], bins=[0, 50, 60, 70, 80, 100],
+                                labels=["<50", "50-60", "60-70", "70-80", ">80"])
+        describe_categorical(df, "rsi_band")
+    for cont in ("pct_to_ema_fast", "ema_spread_pct", "pct_to_vwap", "vwap_z_at_entry"):
+        if cont in df.columns:
+            describe_continuous(df, cont)
+
+    if "vwap_consolidated_at_entry" in df.columns:
+        describe_categorical(df, "vwap_consolidated_at_entry")
+    for cat in ("session_tag_at_entry", "holding_bucket", "day_of_week_at_entry", "hour_of_day_at_entry"):
+        if cat in df.columns:
+            describe_categorical(df, cat)
+
+    # Optional quick logit (sanity check)
+    cont_cols = [c for c in df.select_dtypes(include="number").columns if c not in ["is_win", "pnl", "net_pnl"]]
+    # top by abs point-biserial (quick heuristic)
+    cors = {c: stats.pointbiserialr(df["is_win"], df[c])[0]
+            for c in cont_cols if df[c].notna().sum() > 5 and np.std(df[c]) > 0}
+    top10 = pd.Series(cors).abs().sort_values(ascending=False).head(10).index.tolist()
+    quick_logit(df, [c for c in top10 if c not in ("pnl_pct", "mae_usd", "mfe_usd")], args.quick_logit)
+
+    # Markdown summary
+    report_file = _write_markdown_report(
+        title="LiveFader Trade Report",
+        kpis=top_line_kpis(df),
+        brier_tuple=brier_tuple,
+        ece_val=ece_val,
+        rel_path=rel_path,
+        lift_path=lift_path
+    )
+    print("\nDone.")
 
 if __name__ == "__main__":
     main()
