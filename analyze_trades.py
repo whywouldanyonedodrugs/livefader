@@ -144,34 +144,58 @@ def _build_feat_dict(row: pd.Series) -> dict:
         "vwap_stack_slope_pph_at_entry": float(row.get("vwap_stack_slope_pph_at_entry", 0.0)),
     }
 
+def _init_scorer(model_path: str):
+    if WinProbScorer is None:
+        raise RuntimeError("WinProbScorer not available")
+    try:
+        return WinProbScorer(model_path)      # positional (newer)
+    except TypeError:
+        return WinProbScorer(path=model_path) # older signature
+
 def score_with_model(df: pd.DataFrame, model_path: Optional[str]) -> Optional[np.ndarray]:
     if not model_path:
         print("No model path provided; skipping model scoring.")
         return None
 
-    # First try to score through the same adapter the live bot uses.
+    # Path A: same adapter the live bot uses (handles both sklearn bundle and statsmodels bundle)
     try:
-        scorer = _init_scorer(model_path)  # your helper that tries WinProbScorer(path=...) and positional
+        scorer = _init_scorer(model_path)
         preds = []
         for _, row in df.iterrows():
+            feats = _build_feat_dict(row)   # builds ema_spread_pct, etc.
             try:
-                preds.append(float(scorer.score(_build_feat_dict(row))))
+                preds.append(float(scorer.score(feats)))
             except Exception:
                 preds.append(np.nan)
-        preds = np.array(preds, dtype=float)
-        if np.isfinite(preds).any():
-            return preds
+        arr = np.array(preds, dtype=float)
+        if np.isfinite(arr).any():
+            return arr
     except Exception as e:
         print(f"WinProbScorer path failed: {e}")
 
-    # Fallback: try to unwrap to a pure sklearn pipeline and use predict_proba
+    # Path B/C: load the raw object and branch on its capabilities
     try:
-        pipe = _load_research_pipeline(model_path)  # your existing joblib unwrap helper
-        X = _prep_X_for_model(df)                   # your existing column builder
-        return pipe.predict_proba(X)[:, 1].astype(float)
-    except Exception as e:
-        print(f"Direct sklearn path failed: {e}")
+        obj = _load_research_pipeline(model_path)  # returns dict['pipeline'], obj.pipeline, or obj itself
+
+        # B) scikit-learn estimator / Pipeline with predict_proba
+        if hasattr(obj, "predict_proba"):
+            X = _prep_X_for_model(df)
+            return obj.predict_proba(X)[:, 1].astype(float)  # Pipeline.predict_proba is the standard API. :contentReference[oaicite:3]{index=3}
+
+        # C) statsmodels results (Logit/GLM) → use .predict(exog) with add_constant
+        #    Build exog from rows with _build_feat_dict, then align to expected exog_names (incl. const)
+        if hasattr(obj, "predict") and hasattr(getattr(obj, "model", None), "exog_names"):
+            Z = pd.DataFrame([_build_feat_dict(r) for _, r in df.iterrows()])
+            # align/score via helper that adds 'const' and respects exog_names order
+            return _statsmodels_predict(obj, Z)  # statsmodels' predict uses exog matching training design. :contentReference[oaicite:4]{index=4}
+
+        print("Loaded object cannot produce probabilities (no predict_proba or statsmodels predict).")
         return None
+
+    except Exception as e:
+        print(f"Direct sklearn/statsmodels path failed: {e}")
+        return None
+
 
 # -----------------------
 # Pretty printing helpers
