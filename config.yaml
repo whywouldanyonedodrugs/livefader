@@ -30,10 +30,11 @@ VWAP_STACK_FRAC_WEIGHT: 0.6
 VWAP_STACK_EXP_WEIGHT: 0.4
 
 # ETH MACD barometer
-ETH_BAROMETER_ENABLED: true
 ETH_MACD_HIST_CUTOFF_POS: 0.0   # threshold for “unfavorable”
-ETH_UNFAV_SIZE_MULT: 0.1        # risk multiplier when unfavorable
-# (Note: keys UNFAVORABLE_MODE/UNFAVORABLE_RISK_RESIZE_FACTOR from config.py are NOT used by live sizing right now.)
+# --- ETH MACD BAROMETER FILTER (NEW) ---
+ETH_BAROMETER_ENABLED: true
+UNFAVORABLE_MODE: "RESIZE"
+UNFAVORABLE_RISK_RESIZE_FACTOR: 0.1  
 
 # ===== Stops / Targets =====
 SL_ATR_MULT: 1.8
