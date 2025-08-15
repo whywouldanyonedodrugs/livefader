@@ -494,6 +494,76 @@ class LiveTrader:
 
 
     # --- NEW, CORRECTED HELPER METHODS ---
+    async def _find_order_by_cid(self, symbol: str, cid: str) -> Optional[dict]:
+        """
+        Robust lookup of an order by clientOrderId (orderLinkId on Bybit).
+        1) Try closed orders (2y history) filtered by orderLinkId
+        2) Fallback to open/recent orders (rare race)
+        """
+        # 1) Closed orders – supports orderLinkId and long history
+        try:
+            closed = await self.exchange.fetch_closed_orders(
+                symbol,
+                params={"category": "linear", "orderLinkId": cid, "limit": 50},
+            )
+            for o in closed or []:
+                if o.get("clientOrderId") == cid:
+                    return o
+        except Exception:
+            pass
+
+        # 2) Open orders (if an order is still open/racing)
+        try:
+            open_ = await self.exchange.fetch_open_orders(
+                symbol,
+                params={"category": "linear", "orderLinkId": cid},
+            )
+            for o in open_ or []:
+                if o.get("clientOrderId") == cid:
+                    return o
+        except Exception:
+            pass
+
+        return None
+
+
+    async def _find_exit_fill_by_cid(self, symbol: str, cid: str, side: str) -> Tuple[Optional[float], float]:
+        """
+        Returns (avg_exit_price, total_qty) using the order itself if available,
+        otherwise aggregates trade executions filtered by orderLinkId.
+        """
+        # Prefer the order object (has avgPrice / cumExecQty when closed)
+        order = await self._find_order_by_cid(symbol, cid)
+        if order:
+            px = float(order.get("average") or order.get("price") or 0.0)
+            qty = float(order.get("filled") or order.get("amount") or 0.0)
+            if px > 0 and qty > 0:
+                return px, qty
+
+        # Fallback: Trade History filtered by orderLinkId (Bybit supports this)
+        try:
+            trades = await self.exchange.fetch_my_trades(
+                symbol,
+                params={"category": "linear", "orderLinkId": cid, "limit": 100},
+            )
+            # Aggregate weighted avg of fills that match the closing side
+            need_side = "buy" if side.lower() == "short" else "sell"
+            tot_notional, tot_qty = 0.0, 0.0
+            for t in trades or []:
+                if (t.get("side") or "").lower() == need_side:
+                    q = float(t.get("amount") or 0.0)
+                    p = float(t.get("price") or 0.0)
+                    tot_notional += p * q
+                    tot_qty += q
+            if tot_qty > 0:
+                return (tot_notional / tot_qty), tot_qty
+        except Exception:
+            pass
+
+        return None, 0.0
+
+
+
     async def _fetch_by_cid(self, cid: str, symbol: str):
         """Fetches an order using the robust generic fetch_order method."""
         return await self.exchange.fetch_order(
@@ -1361,14 +1431,10 @@ class LiveTrader:
             closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
 
         if closing_order_cid:
-            try:
-                order = await self._fetch_by_cid(closing_order_cid, symbol)
-                if order and (order.get("average") or order.get("price")):
-                    exit_price = float(order.get("average") or order.get("price"))
-                    exit_qty = float(order.get("filled") or 0) or 0.0
-                    closing_order_type = inferred_exit_reason
-            except Exception as e:
-                LOG.warning("Fetch by CID %s for %s failed (will fallback to trades): %s", closing_order_cid, symbol, e)
+            px, qty = await self._find_exit_fill_by_cid(symbol, closing_order_cid, side)
+            if px:
+                exit_price, exit_qty = px, qty or float(pos.get("size") or 0.0)
+                closing_order_type = inferred_exit_reason or closing_order_type
 
         # 2) Robust fallback → own trades (ground truth if order history window missed)
         if not exit_price:
