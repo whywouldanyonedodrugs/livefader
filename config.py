@@ -41,7 +41,7 @@ PRICE_SLOWDOWN_PCT      = 0.01
 
 # ── risk sizing ────────────────────────────────────────────────────────────
 RISK_MODE          = "FIXED"     # or "FIXED"
-FIXED_RISK_USDT    = 10.0
+FIXED_RISK_USDT    = 20.0
 
 RISK_PCT           = 0.05         # 0.5 %
 SLIPPAGE_BUFFER_PCT = 0.0005
