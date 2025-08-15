@@ -1348,105 +1348,90 @@ class LiveTrader:
         entry_price = float(pos["entry_price"])
         size = float(pos["size"])
         side = (pos.get("side") or "short").lower()  # "short" or "long"
-        side_mult = -1.0 if side == "short" else 1.0
 
         closed_at = datetime.now(timezone.utc)
-        exit_price, exit_qty, closing_order_type = None, 0.0, inferred_exit_reason or "UNKNOWN"
+        exit_price, exit_qty = None, 0.0
+        closing_order_type = inferred_exit_reason or "UNKNOWN"
 
-        # --- 1) Identify closing order CID by reason (optional, best-effort) ---
+        # 1) Try to tie to a specific closing order (best-effort)
         closing_order_cid = None
         if inferred_exit_reason == "TP":
             closing_order_cid = pos.get("tp_final_cid") or pos.get("tp2_cid") or pos.get("tp1_cid")
         elif inferred_exit_reason == "SL":
             closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
 
-        # --- 2) Try to fetch a concrete exit order price (last chunk) ---
         if closing_order_cid:
             try:
                 order = await self._fetch_by_cid(closing_order_cid, symbol)
                 if order and (order.get("average") or order.get("price")):
                     exit_price = float(order.get("average") or order.get("price"))
-                    exit_qty = float(order.get("filled", 0) or 0)
+                    exit_qty = float(order.get("filled") or 0) or 0.0
                     closing_order_type = inferred_exit_reason
             except Exception as e:
-                LOG.warning("Could not fetch closing order by CID %s for %s: %s", closing_order_cid, symbol, e)
+                LOG.warning("Fetch by CID %s for %s failed (will fallback to trades): %s", closing_order_cid, symbol, e)
 
-        # --- 3) Robust fallback: use recent trade(s) as ground truth for the last chunk ---
+        # 2) Robust fallback → own trades (ground truth if order history window missed)
         if not exit_price:
             try:
-                await asyncio.sleep(1.5)  # let exchange settle fills
+                await asyncio.sleep(1.5)
                 my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
-                # If SHORT, the final close is a BUY; if LONG, it's a SELL
                 close_side = "buy" if side == "short" else "sell"
-                closing_trade = next((t for t in reversed(my_trades) if (t.get("side") or "").lower() == close_side), None)
+                closing_trade = next((t for t in reversed(my_trades) if str(t.get("side", "")).lower() == close_side), None)
                 if closing_trade:
                     exit_price = float(closing_trade["price"])
                     exit_qty = float(closing_trade.get("amount") or 0)
                     if closing_order_type == "UNKNOWN":
                         closing_order_type = "FALLBACK_FILL"
                 else:
-                    LOG.error("CRITICAL: No closing trade found for %s. Using entry price as fallback.", symbol)
+                    LOG.error("CRITICAL: No closing trade found for %s; fallback to entry price.", symbol)
                     exit_price, exit_qty = entry_price, size
             except Exception as e:
                 LOG.error("CRITICAL: fetch_my_trades fallback failed for %s: %s. Using entry price.", symbol, e)
                 exit_price, exit_qty = entry_price, size
 
-        # Record the last known fill (does not double-count; we aggregate below)
+        # 3) Persist this last observed fill (won’t double-count; we aggregate below)
         try:
             await self.db.add_fill(pid, closing_order_type, float(exit_price), float(exit_qty), closed_at)
         except Exception as e:
             LOG.warning("Could not persist closing fill for %s: %s", symbol, e)
 
-        # --- 4) Aggregate PnL correctly from ALL fills (handles TP1/TP2/trailing) ---
-        # Assumption: entries were recorded as one SELL fill (short) or one BUY fill (long) at entry.
-        # Exits are recorded as BUY fills (short) or SELL fills (long).
-        rows = await self.db.pool.fetch("SELECT kind, price, qty FROM fills WHERE position_id=$1 ORDER BY ts ASC", pid)
+        # 4) Aggregate PnL from ALL fills (TP1/TP2/trailing supported)
+        rows = await self.db.pool.fetch(
+            "SELECT fill_type AS kind, price, qty FROM fills WHERE position_id=$1 ORDER BY ts ASC",
+            pid
+        )
 
-        # Compute weighted prices by side:
-        # For SHORT:  entry is SELL (we opened size at entry_price), exits are BUYs at various prices.
-        # PnL_short = Σ (entry_price * qty_entry) - Σ (exit_price * qty_exit)
-        # For LONG:   PnL_long  = Σ (exit_price * qty_exit) - Σ (entry_price * qty_entry)
-        entry_notional = 0.0
-        exit_notional = 0.0
-        entry_qty = 0.0
-        exit_qty_sum = 0.0
-
+        entry_notional = exit_notional = entry_qty = exit_qty_sum = 0.0
         for r in rows:
             px = float(r["price"] or 0.0)
             q  = float(r["qty"] or 0.0)
             k  = (r["kind"] or "").upper()
-
-            # Heuristic: anything starting with "TP", "SL", "TIME_EXIT", "FALLBACK" treated as exit.
-            is_exit_kind = (k.startswith("TP") or k.startswith("SL") or "TIME_EXIT" in k or "FALLBACK" in k)
-            if is_exit_kind:
+            is_exit = (k.startswith("TP") or k.startswith("SL") or "TIME_EXIT" in k or "FALLBACK" in k)
+            if is_exit:
                 exit_notional += px * q
                 exit_qty_sum  += q
             else:
-                # treat as entry (you likely recorded a single fill when position opened)
                 entry_notional += px * q
                 entry_qty      += q
 
-        # If entry fills weren’t recorded, fall back to position snapshot
-        if entry_qty <= 0.0:
+        if entry_qty <= 0.0:  # safety fallback
             entry_notional = entry_price * size
             entry_qty = size
-
-        # Sanity: ensure we closed roughly the whole size
         if abs(exit_qty_sum - entry_qty) > 1e-8:
-            LOG.warning("Position %s fills mismatch: exit_qty %.6f != entry_qty %.6f", symbol, exit_qty_sum, entry_qty)
+            LOG.warning("Position %s fills mismatch: exit_qty %.6f vs entry_qty %.6f", symbol, exit_qty_sum, entry_qty)
 
         if side == "short":
             total_pnl = entry_notional - exit_notional
-            avg_exit_price = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
-            pnl_pct = (entry_price / avg_exit_price - 1.0) * 100.0 if avg_exit_price > 0 else 0.0
+            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
+            pnl_pct = (entry_price / avg_exit - 1.0) * 100.0 if avg_exit > 0 else 0.0
         else:
             total_pnl = exit_notional - entry_notional
-            avg_exit_price = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
-            pnl_pct = (avg_exit_price / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
+            pnl_pct = (avg_exit / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
 
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
 
-        # --- 5) Post-trade analytics (your original logic, kept) ---
+        # 5) Post-trade analytics (unchanged)
         mae_usd = mfe_usd = mae_over_atr = mfe_over_atr = 0.0
         realized_vol_during_trade = btc_beta_during_trade = 0.0
         try:
@@ -1463,20 +1448,18 @@ class LiveTrader:
                     else:
                         mae_usd = max(0.0, (entry_price - df["l"].min()) * entry_qty)
                         mfe_usd = max(0.0, (df["h"].max() - entry_price) * entry_qty)
-
-                    asset_returns = df["c"].pct_change().dropna()
-                    if not asset_returns.empty:
-                        realized_vol_during_trade = asset_returns.std() * (365 * 24 * 60) ** 0.5
-
-                    benchmark_symbol = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
-                    if symbol != benchmark_symbol:
-                        btc_ohlcv = await self.exchange.fetch_ohlcv(benchmark_symbol, "1m", since=since_ts)
+                    asset_rets = df["c"].pct_change().dropna()
+                    if not asset_rets.empty:
+                        realized_vol_during_trade = asset_rets.std() * (365 * 24 * 60) ** 0.5
+                    bench = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
+                    if symbol != bench:
+                        btc_ohlcv = await self.exchange.fetch_ohlcv(bench, "1m", since=since_ts)
                         if btc_ohlcv:
                             bdf = pd.DataFrame(btc_ohlcv, columns=["ts","o","h","l","c","v"])
                             bdf["ts"] = pd.to_datetime(bdf["ts"], unit="ms", utc=True)
                             bdf = bdf[bdf["ts"] <= closed_at]
                             if not bdf.empty:
-                                comb = pd.concat([asset_returns.rename("asset"),
+                                comb = pd.concat([asset_rets.rename("asset"),
                                                 bdf["c"].pct_change().rename("btc")], axis=1).dropna()
                                 if len(comb) > 5 and comb["btc"].var() > 0:
                                     btc_beta_during_trade = comb["asset"].cov(comb["btc"]) / comb["btc"].var()
@@ -1488,11 +1471,11 @@ class LiveTrader:
         except Exception as e:
             LOG.warning("Post-trade metrics failed for %s: %s", symbol, e)
 
-        # --- 6) Cleanup + persist ---
+        # 6) Cleanup + persist
         try:
             await self.exchange.cancel_all_orders(symbol, params={"category": "linear"})
         except Exception as e:
-            LOG.warning("Final cleanup for position %d (%s) failed: %s", pid, symbol, e)
+            LOG.warning("Final cleanup for %d (%s) failed: %s", pid, symbol, e)
 
         await self.db.update_position(
             pid, status="CLOSED", closed_at=closed_at, pnl=total_pnl,
@@ -1561,67 +1544,50 @@ class LiveTrader:
 
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
-            symbol = pos["symbol"]
-            size = float(pos["size"])
-            entry_price = float(pos["entry_price"])
-            
-            try:
-                # 1. Cancel any other open orders (like SL/TP) for this position
-                await self.exchange.cancel_all_orders(symbol)
-                
-                # 2. Send the market order to close the position
-                await self.exchange.create_market_order(symbol, "buy", size, params={'reduceOnly': True})
-                LOG.info(f"Force-closing {symbol} (pid {pid}) with a market order due to: {tag}")
+        symbol = pos["symbol"]
+        size = float(pos["size"])
+        entry_price = float(pos["entry_price"])
 
-            except Exception as e:
-                LOG.warning("Force-close order issue on %s: %s", symbol, e)
-
-            # --- THIS IS THE CRITICAL FIX ---
-            # 3. Wait a moment for the trade to register on the exchange
-            await asyncio.sleep(2) # 2-second buffer
-
-            # 4. Fetch the actual fill price from our trade history
-            exit_price = None
-            try:
-                # Fetch our most recent trades for this symbol
-                my_trades = await self.exchange.fetch_my_trades(symbol, limit=5)
-                # The closing trade is the most recent 'buy' order
-                closing_trade = next((t for t in reversed(my_trades) if t.get('side') == 'buy'), None)
-                
-                if closing_trade:
-                    exit_price = float(closing_trade['price'])
-                    LOG.info(f"Confirmed force-close fill price for {symbol} at {exit_price}")
-                else:
-                    LOG.warning(f"Could not confirm fill price for force-close of {symbol} via fetch_my_trades. Falling back to ticker.")
-            except Exception as e:
-                LOG.error(f"Error fetching fill price for force-close of {symbol}: {e}")
-
-            # 5. Last resort fallback (should rarely be used now)
-            if not exit_price:
-                exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
-
-            # 6. Calculate PnL with the accurate price
-            pnl = (entry_price - exit_price) * size
-            closed_at = datetime.now(timezone.utc)
-            holding_minutes = (closed_at - pos["opened_at"]).total_seconds() / 60 if pos.get("opened_at") else 0.0
-            
-            # 7. Update the database with all the correct information
-            await self.db.update_position(
-                pid, 
-                status="CLOSED", 
-                closed_at=closed_at, 
-                pnl=pnl,
-                exit_reason=tag, # Use the tag (e.g., "TIME_EXIT") as the reason
-                holding_minutes=holding_minutes
+        try:
+            # Cancel all linear orders (TP/SL/conditional) cleanly on Bybit V5
+            await self.exchange.cancel_all_orders(symbol, params={"category": "linear"})
+            # Market close (short → buy; long → sell). Here we’re short-only.
+            await self.exchange.create_market_order(
+                symbol, "buy", size, params={"reduceOnly": True, "category": "linear"}
             )
-            # --- END OF FIX ---
-            
-            await self.db.add_fill(pid, tag, exit_price, size, closed_at)
-            await self.risk.on_trade_close(pnl, self.tg)
-            self.last_exit[symbol] = closed_at
-            self.open_positions.pop(pid, None)
-            
-            await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
+            LOG.info("Force-closing %s (pid %d) with market order due to: %s", symbol, pid, tag)
+        except Exception as e:
+            LOG.warning("Force-close order issue on %s: %s", symbol, e)
+
+        await asyncio.sleep(2)
+
+        exit_price = None
+        try:
+            my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
+            closing_trade = next((t for t in reversed(my_trades) if str(t.get("side","")).lower() == "buy"), None)
+            if closing_trade:
+                exit_price = float(closing_trade["price"])
+                LOG.info("Confirmed force-close fill for %s at %.8f", symbol, exit_price)
+        except Exception as e:
+            LOG.error("Error fetching fill price for force-close of %s: %s", symbol, e)
+
+        if not exit_price:
+            exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
+
+        pnl = (entry_price - exit_price) * size
+        closed_at = datetime.now(timezone.utc)
+        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
+
+        await self.db.update_position(
+            pid, status="CLOSED", closed_at=closed_at, pnl=pnl,
+            exit_reason=tag, holding_minutes=holding_minutes
+        )
+        await self.db.add_fill(pid, tag, exit_price, size, closed_at)
+        await self.risk.on_trade_close(pnl, self.tg)
+        self.last_exit[symbol] = closed_at
+        self.open_positions.pop(pid, None)
+        await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
+
 
     async def _main_signal_loop(self):
         LOG.info("Starting main signal scan loop.")
@@ -1744,7 +1710,7 @@ class LiveTrader:
             await self.tg.send("⏸ Paused")
 
         elif root == "/report" and len(parts) == 2:
-            period = parts[1].lower() # e.g., 'daily', 'weekly', '6h'
+            period = parts[1].lower() # e.g., 'daily', 'weekly', '6h'...
             if period in ['6h', 'daily', 'weekly', 'monthly']:
                 await self.tg.send(f"Generating on-demand '{period}' report...")
                 summary_text = await self._generate_summary_report(period)
