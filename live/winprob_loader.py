@@ -1,52 +1,135 @@
 # live/winprob_loader.py
 from __future__ import annotations
+"""
+Win-probability loader + scorer.
 
-import joblib
+Supported artifacts:
+  1) Scikit-learn pipeline/estimator with predict_proba (recommended; may be a CalibratedClassifierCV).
+  2) Legacy dict bundle: {"pipeline": estimator, "features": [...]}
+  3) Statsmodels results object (has .model.exog_names and .predict).
+
+Notes:
+- We align incoming feature dicts to the pipeline's expected feature names via
+  `feature_names_in_` when available (sklearn estimators/pipelines commonly set it
+  once fit with a DataFrame). If not available, we pass columns as-is.  # see sklearn docs
+- For statsmodels we add an explicit constant using `sm.add_constant` before predict.  # statsmodels predict + add_constant
+"""
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence
 
+import joblib
 import numpy as np
 import pandas as pd
 
 LOG = logging.getLogger("winprob")
 
+
 @dataclass
 class _Loaded:
-    kind: str                          # "statsmodels" | "sklearn_bundle" | "sklearn_dict" | "sklearn_estimator"
+    kind: str                   # "sklearn" | "sklearn_dict" | "statsmodels"
     model: Any
-    features: Sequence[str]
-    path: Optional[Path] = None        # <— new: remember which file we loaded
+    features: Sequence[str]     # expected raw feature names (preprocessing inputs)
+    path: Optional[Path]
+
 
 class WinProbScorer:
-    """
-    Loads a win-probability model from disk and scores a single feature dict.
-    Supports:
-      1) statsmodels results (expects .model.exog_names and .predict)
-      2) research ModelBundle (with .feature_names and .calibrator.predict_proba)
-      3) legacy sklearn dict {"pipeline": estimator, "features": [...]}
-    """
     def __init__(self, paths: Optional[Sequence[str]] = None):
-        # Default search order: joblib (statsmodels), then research pkl, then any leftover pkl
+        """
+        Search (in order) for a compatible artifact and load it.
+        """
         self.paths = [Path(p) for p in (paths or [
-            "win_probability_model.joblib",
             "win_probability_model.pkl",
+            "win_probability_model.joblib",
         ])]
         self._loaded: Optional[_Loaded] = None
+
+        # diagnostics
+        self._last_input_df: Optional[pd.DataFrame] = None
+        self._last_raw: Optional[float] = None
+
         self._try_load_any()
+
+    # ---------------------------- Public API ----------------------------
 
     @property
     def is_loaded(self) -> bool:
         return self._loaded is not None
 
     @property
+    def kind(self) -> str:
+        return self._loaded.kind if self._loaded else "none"
+
+    @property
     def expected_features(self) -> Sequence[str]:
         return self._loaded.features if self._loaded else []
 
     @property
-    def kind(self) -> str:             # <— new: expose kind for logging in live_trader
-        return self._loaded.kind if self._loaded else "none"
+    def path(self) -> Optional[str]:
+        return str(self._loaded.path) if self._loaded and self._loaded.path else None
+
+    def score(self, feat_dict: dict) -> float:
+        """
+        Return calibrated P(win) in [0,1] for a single example.
+        Safe on missing/extra keys: missing→0.0 (for numeric inputs).
+        """
+        if not self._loaded:
+            return 0.0
+
+        model = self._loaded.model
+        kind = self._loaded.kind
+        cols = list(self._loaded.features) if self._loaded.features else None
+
+        X = pd.DataFrame([feat_dict], index=[0])
+        self._last_input_df = X.copy()
+
+        # Align columns for sklearn if we know the inputs; fill missing with 0.0
+        if kind.startswith("sklearn") and cols:
+            X = X.reindex(columns=cols, fill_value=0.0)
+
+        try:
+            if kind == "statsmodels":
+                # add explicit constant for statsmodels design matrix
+                import statsmodels.api as sm
+                Xc = sm.add_constant(X.reindex(columns=cols, fill_value=0.0) if cols else X,
+                                     has_constant="add", prepend=True)
+                pred = model.predict(Xc)
+                p = float(pred.iloc[0] if hasattr(pred, "iloc") else pred[0])
+                self._last_raw = p
+            else:
+                # sklearn path (pipeline or estimator with predict_proba)
+                proba = model.predict_proba(X)[:, 1]
+                p = float(proba[0])
+                self._last_raw = p
+        except Exception as e:
+            LOG.warning("WinProb scoring failed: %s", e)
+            return 0.0
+
+        # clamp to [0,1]
+        return float(max(0.0, min(1.0, p)))
+
+    def diag(self) -> str:
+        """
+        JSON diagnostics: artifact kind/path, expected vs input columns, last raw output.
+        Handy to attach to a Telegram command (/wpdiag).
+        """
+        exp = list(self.expected_features) if self.is_loaded else None
+        inp_cols = list(self._last_input_df.columns) if self._last_input_df is not None else None
+        missing = [c for c in (exp or []) if inp_cols is not None and c not in inp_cols]
+        return json.dumps({
+            "is_loaded": self.is_loaded,
+            "kind": self.kind,
+            "path": self.path,
+            "expected_features_count": len(exp or []),
+            "expected_features_sample": (exp or [])[:12],
+            "input_columns": inp_cols,
+            "missing_expected": missing,
+            "last_raw": (None if self._last_raw is None else float(self._last_raw)),
+        }, indent=2)
+
+    # --------------------------- Loading logic --------------------------
 
     def _try_load_any(self):
         for p in self.paths:
@@ -54,77 +137,75 @@ class WinProbScorer:
                 continue
             try:
                 obj = joblib.load(p)
-                loaded = self._coerce(obj)
+                loaded = self._coerce(obj, p)
                 if loaded:
                     self._loaded = loaded
-                    LOG.info(                       # <— one-line, clear startup message
-                        "WinProb model loaded: kind=%s file=%s features=%d",
-                        loaded.kind, p.name, len(loaded.features)
-                    )
+                    LOG.info("WinProb loaded: kind=%s file=%s features=%d",
+                             loaded.kind, p.name, len(loaded.features))
                     return
             except Exception as e:
-                LOG.warning("Failed to load model %s: %s", p, e)
-        LOG.warning("No compatible win-probability model found. Sizing will use wp=0.0.")
+                LOG.warning("Failed to load %s: %s", p, e)
+        LOG.warning("No compatible win-probability model found. wp defaults to 0.0")
 
-    def _coerce(self, obj: Any) -> Optional[_Loaded]:
-        # 1) statsmodels results
-        try:
-            import statsmodels.api as sm  # noqa: F401 (import to ensure dep exists)
-            if hasattr(obj, "model") and hasattr(obj, "predict"):
-                exog = getattr(obj.model, "exog_names", None)
-                if isinstance(exog, (list, tuple)) and "const" in exog:
-                    feats = [c for c in exog if c != "const"]
-                    return _Loaded(kind="statsmodels", model=obj, features=feats)
-        except Exception:
-            pass
-
-        # 2) research ModelBundle (dataclass with .feature_names and .calibrator)
-        if hasattr(obj, "feature_names") and hasattr(obj, "calibrator"):
-            cal = getattr(obj, "calibrator")
-            if hasattr(cal, "predict_proba"):
-                feats = list(getattr(obj, "feature_names"))
-                return _Loaded(kind="sklearn_bundle", model=cal, features=feats)
-
-        # 3) legacy sklearn dict {"pipeline": estimator, "features": [...]}
-        if isinstance(obj, dict) and "pipeline" in obj and "features" in obj:
-            est = obj["pipeline"]
-            feats = list(obj["features"])
-            if hasattr(est, "predict_proba"):
-                return _Loaded(kind="sklearn_dict", model=est, features=feats)
-
-        # 4) plain sklearn estimator with feature names
+    def _coerce(self, obj: Any, path: Path) -> Optional[_Loaded]:
+        """
+        Try to interpret the loaded object in known formats.
+        Discovery order prefers sklearn, then dict bundle, then statsmodels.
+        """
+        # --- 1) Plain sklearn estimator/pipeline with predict_proba ---
         if hasattr(obj, "predict_proba"):
-            feats = getattr(obj, "feature_names_in_", None)
-            if feats is not None:
-                return _Loaded(kind="sklearn_estimator", model=obj, features=list(feats))
+            feats = self._discover_features_from_sklearn(obj)
+            return _Loaded(kind="sklearn", model=obj, features=feats, path=path)
+
+        # --- 2) Legacy dict bundle {"pipeline": estimator, "features": [...] } ---
+        if isinstance(obj, dict) and "pipeline" in obj:
+            est = obj["pipeline"]
+            if hasattr(est, "predict_proba"):
+                feats = list(obj.get("features") or []) or self._discover_features_from_sklearn(est)
+                return _Loaded(kind="sklearn_dict", model=est, features=feats, path=path)
+
+        # --- 3) Statsmodels results wrapper (has .model and .predict) ---
+        if hasattr(obj, "model") and hasattr(obj, "predict"):
+            try:
+                exog = getattr(obj.model, "exog_names", None)
+                if isinstance(exog, (list, tuple)):
+                    feats = [c for c in exog if c != "const"]
+                    return _Loaded(kind="statsmodels", model=obj, features=feats, path=path)
+            except Exception:
+                pass
 
         return None
 
-    def score(self, features: dict) -> float:
-        """Return calibrated P(win) in [0,1] for a single example."""
-        if not self._loaded:
-            return 0.0
+    def _discover_features_from_sklearn(self, est: Any) -> list[str]:
+        """
+        Best-effort to recover the input feature names a fitted sklearn pipeline/estimator expects.
+        Tries, in order:
+          - estimator.feature_names_in_
+          - pipeline.named_steps['preprocess'].feature_names_in_
+        Returns [] if not discoverable (we'll feed columns as-is).
+        """
+        feats = []
+        # 1) direct attribute on the estimator/pipeline
+        for attr in ("feature_names_in_",):
+            if hasattr(est, attr):
+                try:
+                    vals = list(getattr(est, attr))
+                    if vals:
+                        feats = [str(v) for v in vals]
+                        return feats
+                except Exception:
+                    pass
 
-        kind = self._loaded.kind
-        model = self._loaded.model
-        cols = list(self._loaded.features)
-
-        X = pd.DataFrame([features], index=[0])
-        X = X.reindex(columns=cols, fill_value=0.0)
-
+        # 2) look into a common 'preprocess' step (ColumnTransformer)
         try:
-            if kind == "statsmodels":
-                import statsmodels.api as sm
-                Xc = sm.add_constant(X.astype(float), prepend=True, has_constant="add")
-                p = float(model.predict(Xc)[0])
+            steps = getattr(est, "named_steps", {}) or {}
+            preprocess = steps.get("preprocess")
+            if preprocess is not None and hasattr(preprocess, "feature_names_in_"):
+                vals = list(getattr(preprocess, "feature_names_in_"))
+                if vals:
+                    feats = [str(v) for v in vals]
+                    return feats
+        except Exception:
+            pass
 
-            else:
-                # sklearn flavors
-                p = float(model.predict_proba(X)[:, 1][0])
-
-        except Exception as e:
-            LOG.warning("WinProb scoring failed (%s); returning 0.0", e)
-            return 0.0
-
-        # clamp
-        return max(0.0, min(1.0, p))
+        return feats
