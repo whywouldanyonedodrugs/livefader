@@ -374,6 +374,23 @@ class LiveTrader:
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")        
 
+    async def _score_winprob(self, sig: Signal) -> float:
+        """Return calibrated P(win) in [0,1]; robust to loader kinds."""
+        if not getattr(self, "winprob", None) or not self.winprob.is_loaded:
+            return 0.0
+        try:
+            eth = await self._get_eth_macd_barometer()
+            eth_hist = float(eth.get("hist", 0.0)) if eth else 0.0
+            feats = self._build_live_wp_features(sig, eth_hist)
+            p = float(self.winprob.score(feats))
+            # guardrails: NaN/inf → 0
+            if not (0.0 <= p <= 1.0) or not np.isfinite(p):
+                return 0.0
+            return p
+        except Exception as e:
+            LOG.warning("WinProb scoring failed: %s", e)
+            return 0.0
+
     def _init_ccxt(self):
         ex = ccxt.bybit({
             "apiKey": self.settings.bybit_api_key,
@@ -614,12 +631,18 @@ class LiveTrader:
     async def _scan_symbol_for_signal(self, symbol: str, market_regime: str, eth_macd: Optional[dict]) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
-            # ---- Timeframes & OHLCV fetch ----
+            # ---- Timeframes & OHLCV fetch (robust defaults) ----
             base_tf = self.cfg.get('TIMEFRAME', '5m')
             ema_tf  = self.cfg.get('EMA_TIMEFRAME', '4h')
             rsi_tf  = self.cfg.get('RSI_TIMEFRAME', '1h')
-            atr_tf  = self.cfg.get('ADX_TIMEFRAME', '1h')
-            required_tfs = {base_tf, ema_tf, rsi_tf, atr_tf, '1d'}
+
+            # Allow separate ATR timeframe/period; fall back to ADX settings if absent
+            atr_tf      = self.cfg.get('ATR_TIMEFRAME', self.cfg.get('ADX_TIMEFRAME', '1h'))
+            atr_period  = int(self.cfg.get('ATR_PERIOD',  self.cfg.get('ADX_PERIOD', 14)))
+            adx_tf      = self.cfg.get('ADX_TIMEFRAME', '1h')
+            adx_period  = int(self.cfg.get('ADX_PERIOD', 14))
+
+            required_tfs = {base_tf, ema_tf, rsi_tf, atr_tf, adx_tf, '1d'}
 
             async with self.api_semaphore:
                 tasks = {tf: self.exchange.fetch_ohlcv(symbol, tf, limit=500) for tf in required_tfs}
@@ -635,13 +658,13 @@ class LiveTrader:
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
                 df.set_index('timestamp', inplace=True)
 
-                # Stale/illiquid check on the most recent 100 completed bars
-                recent_candles = df.tail(100)
-                if not recent_candles.empty:
-                    zero_volume_pct = (recent_candles['volume'] == 0).sum() / len(recent_candles)
-                    if zero_volume_pct > 0.25:
-                        LOG.warning("DATA_ERROR for %s on %s: Detected stale data (%.0f%% zero volume). Skipping.",
-                                    symbol, tf, zero_volume_pct * 100)
+                # Stale/illiquid check on most recent 100 completed bars
+                recent = df.tail(100)
+                if not recent.empty:
+                    zero_vol_pct = (recent['volume'] == 0).sum() / len(recent)
+                    if zero_vol_pct > 0.25:
+                        LOG.warning("DATA_ERROR %s %s: %.0f%% zero-vol bars → skip.",
+                                    symbol, tf, zero_vol_pct * 100)
                         return None
 
                 # Drop the last (possibly incomplete) bar
@@ -655,18 +678,20 @@ class LiveTrader:
             df5 = dfs[base_tf]
 
             # ---- Indicators aligned to base_tf index ----
-            df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
-            df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
-            df5['rsi']      = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
-            df5['atr']      = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
-            df5['adx']      = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
+            df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], int(self.cfg.get('EMA_FAST_PERIOD', 20))).reindex(df5.index, method='ffill')
+            df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], int(self.cfg.get('EMA_SLOW_PERIOD', 200))).reindex(df5.index, method='ffill')
+            df5['rsi']      = ta.rsi(dfs[rsi_tf]['close'], int(self.cfg.get('RSI_PERIOD', 14))).reindex(df5.index, method='ffill')
+            df5['atr']      = ta.atr(dfs[atr_tf], atr_period).reindex(df5.index, method='ffill')
+            df5['adx']      = ta.adx(dfs[adx_tf], adx_period).reindex(df5.index, method='ffill')
 
-            # ---- VWAP-stack features (safe; no signal_obj here) ----
+            # ---- VWAP-stack features ----
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
             band_pct = float(self.cfg.get("VWAP_STACK_BAND_PCT", 0.004))
             try:
-                vw = vwap_stack_features(df5[['open','high','low','close','volume']].copy(),
-                                        lookback_bars=lookback, band_pct=band_pct)
+                vw = vwap_stack_features(
+                    df5[['open','high','low','close','volume']].copy(),
+                    lookback_bars=lookback, band_pct=band_pct
+                )
                 vwap_frac  = float(vw.get("vwap_frac_in_band", 0.0))
                 vwap_exp   = float(vw.get("vwap_expansion_pct", 0.0))
                 vwap_slope = float(vw.get("vwap_slope_pph", 0.0))
@@ -674,18 +699,19 @@ class LiveTrader:
                 LOG.error("VWAP-stack calc failed for %s: %s", symbol, e)
                 vwap_frac = vwap_exp = vwap_slope = 0.0
 
-            # ---- Boom/slowdown & GAP VWAP (existing logic) ----
-            tf_minutes = 5  # base_tf is '5m' in your config
-            boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
-            slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
+            # ---- Boom/slowdown & legacy VWAP consolidation ----
+            tf_minutes = 5  # base_tf default is '5m'
+            boom_bars = int((int(self.cfg.get('PRICE_BOOM_PERIOD_H', 24)) * 60) / tf_minutes)
+            slowdown_bars = int((int(self.cfg.get('PRICE_SLOWDOWN_PERIOD_H', 4)) * 60) / tf_minutes)
             df5['price_boom_ago'] = df5['close'].shift(boom_bars)
             df5['price_slowdown_ago'] = df5['close'].shift(slowdown_bars)
 
             df1d = dfs['1d']
-            ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1) \
-                    if len(df1d) > cfg.STRUCTURAL_TREND_DAYS else 0.0
+            structural_days = int(self.cfg.get("STRUCTURAL_TREND_DAYS", 30))
+            ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-structural_days] - 1) \
+                    if len(df1d) > structural_days else 0.0
 
-            vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
+            vwap_bars = int((int(self.cfg.get('GAP_VWAP_HOURS', 2)) * 60) / tf_minutes)
             vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
             vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
             df5['vwap'] = vwap_num / vwap_den
@@ -693,130 +719,141 @@ class LiveTrader:
             df5['vwap_dev_pct'] = vwap_dev_raw / df5['vwap']
             df5['price_std'] = df5['close'].rolling(vwap_bars).std()
             df5['vwap_z_score'] = vwap_dev_raw / df5['price_std']
-            df5['vwap_ok'] = df5['vwap_dev_pct'].abs() <= cfg.GAP_MAX_DEV_PCT
-            df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
+            df5['vwap_ok'] = df5['vwap_dev_pct'].abs() <= float(self.cfg.get('GAP_MAX_DEV_PCT', 1.0))
+            df5['vwap_consolidated'] = df5['vwap_ok'].rolling(int(self.cfg.get('GAP_MIN_BARS', 3))).min().fillna(0).astype(bool)
 
             df5.dropna(inplace=True)
             if df5.empty:
                 return None
 
             last = df5.iloc[-1]
-            is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
+            is_ema_crossed_down = bool(last['ema_fast'] < last['ema_slow'])
+
             now_utc = datetime.now(timezone.utc)
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
-            price_boom = boom_ret_pct > cfg.PRICE_BOOM_PCT
-            price_slowdown = slowdown_ret_pct < cfg.PRICE_SLOWDOWN_PCT
-            atr_pct = (last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0
+            price_boom = bool(boom_ret_pct > float(self.cfg.get('PRICE_BOOM_PCT', 0.15)))
+            price_slowdown = bool(slowdown_ret_pct < float(self.cfg.get('PRICE_SLOWDOWN_PCT', 0.01)))
+            # Keep as FRACTION (not %) to avoid saturating calibrator
+            atr_frac = (float(last['atr']) / float(last['close'])) if last['close'] > 0 else 0.0
+
             listing_age_days = (now_utc.date() - self._listing_dates_cache[symbol]).days if symbol in self._listing_dates_cache else -1
-            hour_of_day = now_utc.hour
-            day_of_week = now_utc.weekday()
+            hour_of_day = int(now_utc.hour)
+            day_of_week = int(now_utc.weekday())
             session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
             ema_down = True
             ema_log_msg = " DISABLED"
-            if self.cfg.get("EMA_FILTER_ENABLED", True):
+            if bool(self.cfg.get("EMA_FILTER_ENABLED", False)):
                 ema_down = is_ema_crossed_down
-                ema_log_msg = f"{'✅' if ema_down else '❌'} (Fast: {last['ema_fast']:.4f} < Slow: {last['ema_slow']:.4f})"
+                ema_log_msg = f"{'✅' if ema_down else '❌'} (Fast {last['ema_fast']:.4f} < Slow {last['ema_slow']:.4f})"
 
             trend_log_msg = " DISABLED"
-            if self.cfg.get("STRUCTURAL_TREND_FILTER_ENABLED", True):
-                trend_ok = ret_30d <= self.cfg.get("STRUCTURAL_TREND_RET_PCT", 0.01)
+            if bool(self.cfg.get("STRUCTURAL_TREND_FILTER_ENABLED", False)):
+                trend_ok = ret_30d <= float(self.cfg.get("STRUCTURAL_TREND_RET_PCT", 0.01))
                 trend_log_msg = f"{'✅' if trend_ok else '❌'} (Return: {ret_30d:+.2%})"
 
             vwap_log_msg = " DISABLED"
-            if self.cfg.get("GAP_FILTER_ENABLED", True):
+            if bool(self.cfg.get("GAP_FILTER_ENABLED", False)):
                 vwap_dev_pct = last.get('vwap_dev_pct', float('nan'))
                 vwap_dev_str = f"{vwap_dev_pct:.2%}" if pd.notna(vwap_dev_pct) else "N/A"
-                current_dev_ok = last.get('vwap_ok', False)
-                vwap_log_msg = f"{'✅' if last['vwap_consolidated'] else '❌'} (Streak Failed) | Current Dev: {'✅' if current_dev_ok else '❌'} ({vwap_dev_str})"
+                current_dev_ok = bool(last.get('vwap_ok', False))
+                vwap_log_msg = f"{'✅' if last['vwap_consolidated'] else '❌'} (Streak) | Dev: {'✅' if current_dev_ok else '❌'} ({vwap_dev_str})"
 
             LOG.debug(
                 f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
-                f"  [Base Timeframe: {base_tf}]\n"
-                f"  - Price Boom     (>{cfg.PRICE_BOOM_PCT:.0%}, {cfg.PRICE_BOOM_PERIOD_H}h): {'✅' if price_boom else '❌'} ({boom_ret_pct:+.2%})\n"
-                f"  - Price Slowdown (<{cfg.PRICE_SLOWDOWN_PCT:.0%}, {cfg.PRICE_SLOWDOWN_PERIOD_H}h): {'✅' if price_slowdown else '❌'} ({slowdown_ret_pct:+.2%})\n"
+                f"  [Base TF: {base_tf}]\n"
+                f"  - Price Boom     (>{float(self.cfg.get('PRICE_BOOM_PCT', 0.15)):.0%}, {int(self.cfg.get('PRICE_BOOM_PERIOD_H', 24))}h): "
+                f"{'✅' if price_boom else '❌'} ({boom_ret_pct:+.2%})\n"
+                f"  - Price Slowdown (<{float(self.cfg.get('PRICE_SLOWDOWN_PCT', 0.01)):.0%}, {int(self.cfg.get('PRICE_SLOWDOWN_PERIOD_H', 4))}h): "
+                f"{'✅' if price_slowdown else '❌'} ({slowdown_ret_pct:+.2%})\n"
                 f"  - EMA Trend Down ({ema_tf}):      {ema_log_msg}\n"
                 f"  --------------------------------------------------\n"
-                f"  - RSI ({rsi_tf}):                 {last['rsi']:.2f} (Veto: {not (cfg.RSI_ENTRY_MIN <= last['rsi'] <= cfg.RSI_ENTRY_MAX)})\n"
+                f"  - RSI ({rsi_tf}):                 {float(last['rsi']):.2f} "
+                f"(Veto: {not (int(self.cfg.get('RSI_ENTRY_MIN', 30)) <= float(last['rsi']) <= int(self.cfg.get('RSI_ENTRY_MAX', 70)))})\n"
                 f"  - 30d Trend Filter:        {trend_log_msg}\n"
                 f"  - VWAP Consolidated:       {vwap_log_msg}\n"
-                f"  - ATR ({atr_tf}):                 {last['atr']:.6f}\n"
+                f"  - ATR ({atr_tf}):                 {float(last['atr']):.6f}\n"
                 f"  - VWAP stack: frac={vwap_frac:.2f}, exp={vwap_exp*100:.2f}%, slope_pph={vwap_slope:.4f}\n"
                 f"====================================================\n"
             )
 
             # ---- Entry gate ----
-            if price_boom and price_slowdown and ema_down:
-                LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, last['close'])
+            if not (price_boom and price_slowdown and ema_down):
+                return None
 
-                signal_obj = Signal(
-                    symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
-                    rsi=float(last['rsi']), adx=float(last['adx']), atr_pct=atr_pct,
-                    market_regime=market_regime, price_boom_pct=boom_ret_pct,
-                    price_slowdown_pct=slowdown_ret_pct, vwap_dev_pct=float(last.get('vwap_dev_pct', 0.0)),
-                    vwap_z_score=float(last.get('vwap_z_score', 0.0)), ret_30d=ret_30d,
-                    ema_fast=float(last['ema_fast']), ema_slow=float(last['ema_slow']),
-                    listing_age_days=listing_age_days, session_tag=session_tag,
-                    day_of_week=day_of_week, hour_of_day=hour_of_day,
-                    vwap_consolidated=bool(last.get('vwap_consolidated', False)),
-                    is_ema_crossed_down=bool(is_ema_crossed_down)
-                )
+            LOG.info("SIGNAL FOUND for %s at price %.4f", symbol, float(last['close']))
 
-                # attach VWAP-stack diagnostics to the signal (used later for sizing + DB)
-                signal_obj.vwap_stack_frac = vwap_frac
-                signal_obj.vwap_stack_expansion_pct = vwap_exp
-                signal_obj.vwap_stack_slope_pph = vwap_slope
+            signal_obj = Signal(
+                symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
+                rsi=float(last['rsi']), adx=float(last['adx']), atr_pct=atr_frac,  # store FRACTION
+                market_regime=market_regime, price_boom_pct=float(boom_ret_pct),
+                price_slowdown_pct=float(slowdown_ret_pct), vwap_dev_pct=float(last.get('vwap_dev_pct', 0.0)),
+                vwap_z_score=float(last.get('vwap_z_score', 0.0)), ret_30d=float(ret_30d),
+                ema_fast=float(last['ema_fast']), ema_slow=float(last['ema_slow']),
+                listing_age_days=int(listing_age_days), session_tag=session_tag,
+                day_of_week=int(day_of_week), hour_of_day=int(hour_of_day),
+                vwap_consolidated=bool(last.get('vwap_consolidated', False)),
+                is_ema_crossed_down=bool(is_ema_crossed_down)
+            )
 
-                # ---- Win-prob scoring (statsmodels or sklearn via adapter) ----
-                try:
-                    eth_bar = await self._get_eth_macd_barometer()
-                    eth_hist = float(eth_bar.get("hist", 0.0)) if eth_bar else 0.0
+            # Attach VWAP-stack diagnostics to the signal (used for sizing + DB)
+            signal_obj.vwap_stack_frac = vwap_frac
+            signal_obj.vwap_stack_expansion_pct = vwap_exp
+            signal_obj.vwap_stack_slope_pph = vwap_slope
 
-                    # Build the live feature dict once
-                    live_data = {
-                        "rsi_at_entry": float(signal_obj.rsi),
-                        "adx_at_entry": float(signal_obj.adx),
-                        "price_boom_pct_at_entry": float(signal_obj.price_boom_pct),
-                        "price_slowdown_pct_at_entry": float(signal_obj.price_slowdown_pct),
-                        "vwap_z_at_entry": float(signal_obj.vwap_z_score),
-                        "ema_spread_pct_at_entry": (
-                            (float(signal_obj.ema_fast) - float(signal_obj.ema_slow)) / float(signal_obj.ema_slow)
-                            if float(signal_obj.ema_slow) > 0.0 else 0.0
-                        ),
-                        "is_ema_crossed_down_at_entry": int(bool(signal_obj.is_ema_crossed_down)),
-                        "day_of_week_at_entry": int(signal_obj.day_of_week),
-                        "hour_of_day_at_entry": int(signal_obj.hour_of_day),
-                        "eth_macdhist_at_entry": eth_hist,
+            # ---- Win-prob scoring (statsmodels or sklearn via adapter) ----
+            try:
+                eth_hist = float(eth_macd.get("hist", 0.0)) if eth_macd else 0.0
 
-                        # Include VWAP-stack features if present in your research model
-                        "vwap_stack_frac_at_entry": (
-                            float(signal_obj.vwap_stack_frac) if getattr(signal_obj, "vwap_stack_frac", None) is not None else 0.0
-                        ),
-                        "vwap_stack_expansion_pct_at_entry": (
-                            float(signal_obj.vwap_stack_expansion_pct)
-                            if getattr(signal_obj, "vwap_stack_expansion_pct", None) is not None else 0.0
-                        ),
-                        "vwap_stack_slope_pph_at_entry": (
-                            float(signal_obj.vwap_stack_slope_pph)
-                            if getattr(signal_obj, "vwap_stack_slope_pph", None) is not None else 0.0
-                        ),
-                    }
+                # Build the live feature dict once (raw inputs expected by the research pipeline)
+                live_data = {
+                    "rsi_at_entry": float(signal_obj.rsi),
+                    "adx_at_entry": float(signal_obj.adx),
+                    "price_boom_pct_at_entry": float(signal_obj.price_boom_pct),
+                    "price_slowdown_pct_at_entry": float(signal_obj.price_slowdown_pct),
+                    "vwap_z_at_entry": float(signal_obj.vwap_z_score),
+                    "ema_spread_pct_at_entry": (
+                        (float(signal_obj.ema_fast) - float(signal_obj.ema_slow)) / float(signal_obj.ema_slow)
+                        if float(signal_obj.ema_slow) > 0.0 else 0.0
+                    ),
+                    "is_ema_crossed_down_at_entry": int(bool(signal_obj.is_ema_crossed_down)),  # force {0,1}
+                    "day_of_week_at_entry": int(signal_obj.day_of_week),
+                    "hour_of_day_at_entry": int(signal_obj.hour_of_day),
+                    "eth_macdhist_at_entry": eth_hist,
 
-                    if hasattr(self, "winprob") and self.winprob.is_loaded:
-                        win_prob = self.winprob.score(live_data)  # uses predict_proba for sklearn; adds const for statsmodels internally
-                        signal_obj.win_probability = max(0.0, min(1.0, float(win_prob)))
-                    else:
-                        signal_obj.win_probability = 0.0
+                    # VWAP-stack features (only used if present in the model)
+                    "vwap_stack_frac_at_entry": float(getattr(signal_obj, "vwap_stack_frac", 0.0) or 0.0),
+                    "vwap_stack_expansion_pct_at_entry": float(getattr(signal_obj, "vwap_stack_expansion_pct", 0.0) or 0.0),
+                    "vwap_stack_slope_pph_at_entry": float(getattr(signal_obj, "vwap_stack_slope_pph", 0.0) or 0.0),
+                }
 
-                except Exception as e:
-                    LOG.warning("Failed to score signal for %s: %s", symbol, e)
+                # If model is loaded, verify coverage vs expected features before scoring
+                if hasattr(self, "winprob") and self.winprob.is_loaded:
+                    expected = set(self.winprob.expected_features)
+                    missing = list(sorted(expected - set(live_data.keys())))
+                    extra   = list(sorted(set(live_data.keys()) - expected))
+                    if missing:
+                        LOG.warning("WinProb: %d/%d expected features missing; top: %s",
+                                    len(missing), len(expected), ", ".join(missing[:5]))
+                    if extra:
+                        LOG.debug("WinProb: %d extra features provided; ignoring: %s",
+                                len(extra), ", ".join(extra[:5]))
+
+                    wp = float(self.winprob.score(live_data))
+
+                    # Guard against *piecewise-constant* isotonic plateaus that can look “stuck”
+                    # (normal for isotonic calibration: stepwise mapping). If you see constant wp,
+                    # check missing features and model freshness. See sklearn docs. :contentReference[oaicite:0]{index=0}
+                    signal_obj.win_probability = max(0.0, min(1.0, wp))
+                else:
                     signal_obj.win_probability = 0.0
 
+            except Exception as e:
+                LOG.warning("Failed to score signal for %s: %s", symbol, e)
+                signal_obj.win_probability = 0.0
 
-                return signal_obj
-
-            return None
+            return signal_obj
 
         except ccxt.BadSymbol:
             LOG.warning("Could not scan %s: Invalid symbol on exchange.", symbol)
